@@ -14,6 +14,8 @@ dist-ssr
 
 # WorkBuddy 项目数据（会话记录、工作日志）
 .workbuddy/
+# ZCode 会话产物（计划文件等）
+.zcode/
 Thumbs.db
 
 # Editor directories and files

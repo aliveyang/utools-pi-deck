@@ -42,7 +42,9 @@ export function usePiEnv({ getCwd, showToast, getLean }) {
   async function refreshModels() {
     try {
       let list = null
-      if (window.piBridge && window.piBridge.refreshModels) list = window.piBridge.refreshModels()
+      // 优先异步版本：同步 execFile 会阻塞 UI ~1.5s（preload 内与渲染层同线程）
+      if (window.piBridge && window.piBridge.listModelsAsync) list = await window.piBridge.listModelsAsync()
+      else if (window.piBridge && window.piBridge.refreshModels) list = window.piBridge.refreshModels()
       else if (window.piBridge && window.piBridge.listModels) list = window.piBridge.listModels()
       if (list) { models.value = list; writeCache('models', list) }
       await loadDefaults(true)

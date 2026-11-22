@@ -10,6 +10,12 @@ export function formatText(text) {
       codeBlocks.push(code)
       return `\u0000CODE${codeBlocks.length - 1}\u0000`
     })
+  // 行内代码同样抽占位符：否则内部的 **、[链接](url) 等会被后续规则二次渲染
+  const inlineCodes = []
+  s = s.replace(/`([^`]+)`/g, (_, code) => {
+    inlineCodes.push(code)
+    return `\u0001IC${inlineCodes.length - 1}\u0001`
+  })
   // 链接 [text](url)：仅 http/https，URL 内禁止引号以防属性注入
   s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)"]+)\)/g,
     (_, t, url) => `<a href="${url}" class="md-link" rel="noopener">${t}</a>`)
@@ -24,12 +30,13 @@ export function formatText(text) {
     return `<ol>${items}</ol>`
   })
   s = s
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/^### (.+)$/gm, '<h3>$1</h3>')
     .replace(/^## (.+)$/gm, '<h2>$1</h2>')
     .replace(/^# (.+)$/gm, '<h1>$1</h1>')
     .replace(/\n/g, '<br>')
-  // 还原代码块（保留原始换行，不再转 <br>）
-  return s.replace(/\u0000CODE(\d+)\u0000/g, (_, i) => `<pre><code>${codeBlocks[+i] || ''}</code></pre>`)
+  // 还原代码块（保留原始换行，不再转 <br>）与行内代码
+  return s
+    .replace(/\u0000CODE(\d+)\u0000/g, (_, i) => `<pre><code>${codeBlocks[+i] || ''}</code></pre>`)
+    .replace(/\u0001IC(\d+)\u0001/g, (_, i) => `<code>${inlineCodes[+i] || ''}</code>`)
 }

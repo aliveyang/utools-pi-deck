@@ -148,8 +148,8 @@ export function newGroup() {
   }
 }
 
-// 迁移：补 kind/lean/tool；从 perm+lean 推断精细结构
-function migrateGroups(groups) {
+// 迁移：补 kind/lean/tool；从 perm+lean 推断精细结构（导出供单元测试）
+export function migrateGroups(groups) {
   const out = (groups || []).map(g => {
     const kind = g.kind || (g.id === 'chat' ? 'chat' : g.id === 'translate' ? 'translate' : g.id === 'agent' ? 'agent' : 'custom')
     let lean = g.lean || {}

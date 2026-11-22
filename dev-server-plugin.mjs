@@ -9,9 +9,11 @@ const { execFileSync } = require('node:child_process')
 
 function readJson(req) {
   return new Promise(resolve => {
-    let d = ''
     const MAX = 8 * 1024 * 1024   // 8MB：容纳长 prompt + 引用文件，超限截断
-    req.on('data', c => { if (d.length < MAX) d += c })
+    let size = 0
+    let d = ''
+    const ts = core.makeTextStream()   // 跨 chunk UTF-8 安全
+    req.on('data', c => { size += c.length; if (size <= MAX) d += ts.push(c) })
     req.on('end', () => { try { resolve(JSON.parse(d || '{}')) } catch (_) { resolve({}) } })
   })
 }
@@ -24,9 +26,13 @@ export function piDevApi() {
       server.middlewares.use('/__pideck/api', async (req, res) => {
         const url = new URL(req.url, 'http://localhost')
         const p = url.pathname.replace(/^\//, '')
-        // dev-only 安全：仅允许本机来源
+        // dev-only 安全：仅允许本机来源（Origin 校验浏览器请求）+ Host 校验（防 DNS rebinding）
         const origin = req.headers.origin || ''
-        if (origin && !/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+        if (origin && !/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(origin)) {
+          res.statusCode = 403; res.end('forbidden'); return
+        }
+        const host = String(req.headers.host || '').toLowerCase()
+        if (host && !/^(localhost|127\.0\.0\.1|\[::1\]|::1)(:\d+)?$/.test(host)) {
           res.statusCode = 403; res.end('forbidden'); return
         }
 

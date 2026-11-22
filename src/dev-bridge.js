@@ -65,8 +65,20 @@ function syncGet(path) {
 
 let homedir = (syncGet('/homedir') || {}).homedir || ''
 
+// dev 侧生效目录计算（纯计算，无落盘副作用），effectiveCwd/resolveCwd 共用
+function devCwd(p) {
+  const dir = p || ''
+  const base = homedir || ''
+  if (!dir && base) {
+    const sep = base.includes('\\') ? '\\' : '/'
+    return base.replace(/[\\/]+$/, '') + sep + 'MyPiDeck'
+  }
+  return dir || base
+}
+
 function listModelsAsync() {
-  return fetch(BASE + '/models').then(r => r.json())
+  // 与 preload.listModelsAsync 对齐：强制绕过 dev-server 的 60s TTL 缓存
+  return fetch(BASE + '/models?force=1').then(r => r.json())
 }
 
 window.piBridge = {
@@ -75,15 +87,8 @@ window.piBridge = {
   saveImage,
   pickFolder: () => null,
   validateCwd: p => !!(p),
-  effectiveCwd: p => {
-    const dir = p || ''
-    const base = homedir || ''
-    if (!dir && base) {
-      const sep = base.includes('\\') ? '\\' : '/'
-      return base.replace(/[\\/]+$/, '') + sep + 'MyPiDeck'
-    }
-    return dir || base
-  },
+  effectiveCwd: devCwd,
+  resolveCwd: devCwd,
   listSkills: cwd => syncGet('/skills?cwd=' + encodeURIComponent(cwd || '')) || [],
   listModels: () => syncGet('/models') || [],
   listModelsAsync,

@@ -47,6 +47,7 @@ function ensure(cwd, flags) {
   })
   const e = {
     child, cwd: key, alive: true, ready: false, lastUsed: Date.now(),
+    sessionId: '',   // 当前进程内对话所属的 PiDeck 会话（用于切换时隔离上下文）
     buf: '', decoder: new StringDecoder('utf8'),
     pending: new Map(), listeners: new Set(),
   }
@@ -74,7 +75,15 @@ function ensure(cwd, flags) {
     }
   })
   child.stderr.on('data', () => {})
-  const die = () => { e.alive = false; e.ready = false; processes.delete(key) }
+  const die = () => {
+    e.alive = false; e.ready = false
+    // 仅当 map 里还是本条目时才移除：延迟 kill 期间同 key 可能已重建新进程
+    if (processes.get(key) === e) processes.delete(key)
+    // 挂起中的 RPC 命令立即拒绝，不等 60s 超时；监听器一并清理
+    for (const p of e.pending.values()) { try { p.reject(new Error('RPC 进程已退出')) } catch (_) {} }
+    e.pending.clear()
+    e.listeners.clear()
+  }
   child.on('error', die)
   child.on('exit', die)
 
@@ -103,6 +112,13 @@ function prompt(cwd, opts, handlers) {
   if (!entry) return Promise.reject(new Error('RPC 未预热'))
 
   const applyCfg = async () => {
+    // PiDeck 会话切换时先重置进程内对话（实测 pi RPC 进程内多轮共享上下文，
+    // 不隔离会导致不同会话互相串上下文）；进程回收后上下文不续接，由设置页披露
+    // 重置失败不吞错：隔离无法保证时不应发送 prompt，直接走 onError（下次 prompt 会重试）
+    if ((entry.sessionId || '') !== (opts.sessionId || '')) {
+      await send(entry, { type: 'new_session' })
+      entry.sessionId = opts.sessionId || ''
+    }
     if (opts.model) await send(entry, { type: 'set_model', model: opts.model }).catch(() => {})
     if (opts.thinking) await send(entry, { type: 'set_thinking_level', level: opts.thinking }).catch(() => {})
   }
@@ -152,8 +168,20 @@ function prompt(cwd, opts, handlers) {
     .then(() => {})
     .catch(err => {
       entry.listeners.delete(listener)
+      clearTimeout(watchdog)
       handlers.onError && handlers.onError(String(err.message || err))
     })
+
+  // 进程中途退出：立即报错收口，不等 15 分钟 watchdog
+  const onExit = () => {
+    if (!settled) {
+      settled = true
+      clearTimeout(watchdog)
+      entry.listeners.delete(listener)
+      handlers.onError && handlers.onError('RPC 进程已退出，本次回答中断')
+    }
+  }
+  entry.child.once('exit', onExit)
 
   return {
     cancel: () => {
@@ -189,6 +217,8 @@ function cleanupIdle() {
   for (const [cwd, e] of processes) {
     if (e.alive && now - e.lastUsed > IDLE_TTL) {
       try { e.child.stdin.end() } catch (_) {}
+      // 对齐 stop/evict：stdin 关闭后 3s 仍不退出则强杀，避免孤儿进程滞留
+      setTimeout(() => { try { e.child.kill() } catch (_) {} }, 3000)
       processes.delete(cwd)
     }
   }

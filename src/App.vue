@@ -89,6 +89,15 @@ function toggleSendKey() {
   setSendKeyMode(sendKeyMode.value === 'enter' ? 'ctrl' : 'enter')
 }
 
+// 后台预热 RPC 长驻进程（配置启用时）；关窗/重新进入时由 handleEnter 再次预热
+function maybePrewarmRpc() {
+  if (engine.value !== 'rpc' || !window.piBridge || !window.piBridge.prewarmRpc) return
+  rpcStatus.value = 'warming'
+  prewarmActive().then(ok => {
+    rpcStatus.value = ok ? 'ready' : 'failed'
+  })
+}
+
 // 空态：按分组给一句定位 + 三条可直接点的示例
 const EMPTY_COPY = {
   chat: { desc: '纯文本对话，不带工具和项目规范', chips: ['解释这段代码', '给这个函数起个名字', '把这段话写得更简洁'] },
@@ -251,6 +260,10 @@ onMounted(async () => {
   window.utools && window.utools.onPluginOut && window.utools.onPluginOut(() => {
     clearTimeout(draftTimer)
     saveCurrentDraft()
+    // 关窗时停掉长驻 RPC 进程，避免后台滞留（运行中不停，防止打断生成）
+    if (!running.value && window.piBridge && window.piBridge.stopRpc) {
+      try { window.piBridge.stopRpc() } catch (_) {}
+    }
   })
   nextTick(() => inputEl.value && inputEl.value.focus())
   // 读取运行引擎配置
@@ -264,12 +277,7 @@ onMounted(async () => {
     loadSkillsAsync()
     if (window.piBridge && window.piBridge.resolvePi) piStatus.value = window.piBridge.resolvePi()
     // 打开时后台预热 RPC 长驻进程（配置启用时）
-    if (engine.value === 'rpc' && window.piBridge && window.piBridge.prewarmRpc) {
-      rpcStatus.value = 'warming'
-      prewarmActive().then(ok => {
-        rpcStatus.value = ok ? 'ready' : 'failed'
-      })
-    }
+    maybePrewarmRpc()
     detectContext()
     loadDefaults()
     loadEnv()
@@ -380,7 +388,11 @@ function handleEnter(action) {
   const payload = action.payload
   // uTools 窗口复用，重新进入不会重新 mount：这里必须显式回到新对话态
   // 否则上次会话（含图片消息）还挂在 currentSession 上，看起来像没换对话
-  if (!running.value) { refreshSessions(); resetPaging(); closeHistory() }
+  if (!running.value) {
+    refreshSessions(); resetPaging(); closeHistory()
+    // 关窗时 RPC 进程可能已被 stopRpc 清掉：重新进入时按当前引擎重预热
+    maybePrewarmRpc()
+  }
   inputText.value = ''
   const drafts = loadDrafts(); drafts[activeId.value] = ''; saveDrafts(drafts)
   errorMsg.value = ''
@@ -607,10 +619,11 @@ async function send() {
   const g = snapshotConfig(activeGroup.value)
   updateSession(session.id, { config: { ...g } })
 
-  let files = [...outFiles]
+  // 局部命名 sendFiles：避免遮蔽外层 @ 文件菜单的 files ref
+  let sendFiles = [...outFiles]
   const imagePaths = []
   for (const img of outImages) {
-    try { const p = window.piBridge.saveImage(img.dataUrl); imagePaths.push(p); files.push(p) }
+    try { const p = window.piBridge.saveImage(img.dataUrl); imagePaths.push(p); sendFiles.push(p) }
     catch (e) { errorMsg.value = String(e.message || e); return }
   }
   // 提示词：分组前缀 + 翻译目标语言 + 用户输入
@@ -645,7 +658,7 @@ async function send() {
   try {
     runHandle = window.piBridge.run(
       {
-        prompt, model: g.model || '', thinking: g.thinking || '', cwd: g.cwd || '', files,
+        prompt, model: g.model || '', thinking: g.thinking || '', cwd: g.cwd || '', files: sendFiles,
         sessionId: session.piSessionId,
         tool: g.tool,
         ...(g.lean || {}),
@@ -689,8 +702,10 @@ function refreshSessionsKeep() {
 function cancel() {
   cancelled = true
   // 先 finalize（此时 currentAssistant 仍在，能正确标记 aborted），再 kill 子进程
+  // 注意：finalize 会把 runHandle 置空，必须先缓存句柄，否则 RPC 模式的 cancel 永远走不到
+  const handle = runHandle
   finalize(true, '')
-  if (runHandle && runHandle.cancel) { try { runHandle.cancel() } catch (_) {} }
+  if (handle && handle.cancel) { try { handle.cancel() } catch (_) {} }
   else if (window.piBridge && window.piBridge.cancel) window.piBridge.cancel()
   showToast('已停止')
 }
@@ -1327,11 +1342,11 @@ function pickCwd() {
             <div class="engine-row">
               <label class="engine-opt">
                 <input type="radio" name="engine" value="json" :checked="engine === 'json'" @change="setEngine('json')" />
-                <span>单次调用 <small>稳定，每次启动约 1.5s</small></span>
+                <span>单次调用 <small>稳定，每次启动约 1.5s；上下文由 pi 落盘，可跨次续接</small></span>
               </label>
               <label class="engine-opt">
                 <input type="radio" name="engine" value="rpc" :checked="engine === 'rpc'" @change="setEngine('rpc')" />
-                <span>长驻预热 <small>更快，打开即后台预热</small></span>
+                <span>长驻预热 <small>更快，打开即预热；上下文仅存内存，进程回收或切换会话后从新开始</small></span>
               </label>
             </div>
             <div class="field-label">默认工作目录</div>

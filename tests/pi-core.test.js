@@ -1,0 +1,229 @@
+import { describe, it, expect, beforeAll } from 'vitest'
+import { mkdtempSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+
+// findPiCli/findNode 依赖文件系统探测：用运行时 tmp 假 cli.js + 当前 node 注入环境变量，
+// 使 buildArgs 等纯逻辑不依赖真实 pi 安装（fixture 留在系统临时目录，不做清理）
+const fixtureDir = mkdtempSync(join(tmpdir(), 'pideck-test-'))
+const fakeCli = join(fixtureDir, 'cli.js')
+writeFileSync(fakeCli, '// fake pi cli for tests\n')
+process.env.PIDECK_PI_CLI = fakeCli
+process.env.PIDECK_NODE = process.execPath
+
+const core = await import('../shared/pi-core.cjs')
+
+// 构造完整精细工具对象（与 groups.js makeTool 产物形状一致）
+function tool(over = {}) {
+  return {
+    list: ['read', 'grep', 'find', 'ls'],
+    mcp: 'off', mcpServers: '', ext: false,
+    skills: 'off', skillPaths: [],
+    context: false, templates: false, trust: false,
+    ...over,
+  }
+}
+
+describe('buildPermArgs 权限档位 → pi argv', () => {
+  it('纯文本档：-nt 且全关', () => {
+    expect(core.buildPermArgs(tool({ list: [] }))).toEqual([
+      '-nt', '--no-mcp', '-ne', '-ns', '-nc', '-np', '--no-approve',
+    ])
+  })
+
+  it('只读档：--tools 白名单，无写执行工具', () => {
+    expect(core.buildPermArgs(tool())).toEqual([
+      '--tools', 'read,grep,find,ls', '--no-mcp', '-ne', '-ns', '-nc', '-np', '--no-approve',
+    ])
+  })
+
+  it('完整档：全工具 + MCP/扩展/规范全开（ext=true 无 -ne）', () => {
+    expect(core.buildPermArgs(tool({
+      list: ['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash', 'powershell'],
+      mcp: 'all', ext: true, skills: 'all', context: true, templates: true,
+    }))).toEqual([
+      '--tools', 'read,grep,find,ls,edit,write,bash,powershell', '--no-approve',
+    ])
+  })
+
+  it('MCP 指定 server：白名单追加 mcp__srv__*，ext 关时 builtin:mcp 挂回', () => {
+    expect(core.buildPermArgs(tool({
+      list: ['read'], mcp: 'servers', mcpServers: 'a, b', skills: 'all',
+    }))).toEqual([
+      '--tools', 'read,mcp__a__*,mcp__b__*', '-ne', '-e', 'builtin:mcp', '-nc', '-np', '--no-approve',
+    ])
+  })
+
+  it('MCP 指定但没填 server 名：按关闭处理，不放行全部', () => {
+    const args = core.buildPermArgs(tool({ mcp: 'servers', mcpServers: '  ' }))
+    expect(args).toContain('--no-mcp')
+    expect(args.join(' ')).not.toContain('mcp__')
+  })
+
+  it('技能指定：-ns 后按目录显式 --skill', () => {
+    expect(core.buildPermArgs(tool({ skills: 'some', skillPaths: ['/p1', '/p2'] }))).toEqual([
+      '--tools', 'read,grep,find,ls', '--no-mcp', '-ne',
+      '-ns', '--skill', '/p1', '--skill', '/p2',
+      '-nc', '-np', '--no-approve',
+    ])
+  })
+
+  it('trust=true → --approve', () => {
+    expect(core.buildPermArgs(tool({ trust: true }))).toContain('--approve')
+    expect(core.buildPermArgs(tool({ trust: true }))).not.toContain('--no-approve')
+  })
+})
+
+describe('normalizeTool 旧数据（perm+lean 布尔）映射', () => {
+  it('perm=read + noMcp/noSkills → mcp/skills 关闭', () => {
+    const t = core.normalizeTool(undefined, { perm: 'read', noMcp: true, noSkills: true })
+    expect(t.list).toEqual(['read', 'grep', 'find', 'ls'])
+    expect(t.mcp).toBe('off')
+    expect(t.skills).toBe('off')
+    expect(t.context).toBe(true)   // 未勾 noContextFiles
+  })
+
+  it('无 perm 且 noTools → 纯文本', () => {
+    const t = core.normalizeTool(undefined, { noTools: true })
+    expect(t.list).toEqual([])
+  })
+
+  it('list 内非法工具名被过滤', () => {
+    const t = core.normalizeTool(tool({ list: ['read', 'rm-rf', 'bash'] }), {})
+    expect(t.list).toEqual(['read', 'bash'])
+  })
+})
+
+describe('buildArgs spawn 参数', () => {
+  it('基础结构：cli 在首、--no-session 紧随模式、-- 后置参数收尾', () => {
+    const args = core.buildArgs({ prompt: 'hi' })
+    expect(args[0]).toBe(fakeCli)
+    expect(args.slice(1, 4)).toEqual(['--mode', 'json', '--no-session'])
+    expect(args[args.length - 1]).toBe('hi')
+    expect(args).toContain('--')
+  })
+
+  it('sessionId 替代 --no-session', () => {
+    const args = core.buildArgs({ prompt: 'x', sessionId: 'pideck-abc123' })
+    expect(args).toContain('--session-id')
+    expect(args[args.indexOf('--session-id') + 1]).toBe('pideck-abc123')
+    expect(args).not.toContain('--no-session')
+  })
+
+  it('选项值以 - 开头时被丢弃（防参数注入）', () => {
+    const args = core.buildArgs({ prompt: 'x', model: '--danger', sessionId: '-evil' })
+    expect(args).not.toContain('--danger')
+    expect(args).not.toContain('-evil')
+    expect(args).toContain('--no-session')
+  })
+
+  it('files 前缀 @ 且位于 -- 之后，prompt 最后', () => {
+    const args = core.buildArgs({ prompt: 'do it', files: ['a.txt', 'b.png'] })
+    const i = args.indexOf('--')
+    expect(args.slice(i + 1)).toEqual(['@a.txt', '@b.png', 'do it'])
+  })
+
+  it('systemPrompt 透传', () => {
+    const args = core.buildArgs({ prompt: 'x', systemPrompt: 'SP' })
+    expect(args[args.indexOf('--system-prompt') + 1]).toBe('SP')
+  })
+})
+
+describe('makeTextStream / pushChunk 跨 chunk UTF-8', () => {
+  it('makeTextStream：多字节字符跨 chunk 不乱码', () => {
+    const ts = core.makeTextStream()
+    // "中" = e4 b8 ad，人为从字节中间切开
+    const a = Buffer.concat([Buffer.from('err: '), Buffer.from([0xe4])])
+    const b = Buffer.concat([Buffer.from([0xb8, 0xad]), Buffer.from('文 ok')])
+    expect(ts.push(a) + ts.push(b)).toBe('err: 中文 ok')
+  })
+
+  it('pushChunk：JSONL 按 \n 切分、容忍 \\r、跳过坏行', () => {
+    const buf = core.makeLineBuffer()
+    const recs = []
+    core.pushChunk(buf, Buffer.from('{"a":1}\r\nbad\n{"b":2}\n'), r => recs.push(r))
+    expect(recs).toEqual([{ a: 1 }, { b: 2 }])
+  })
+
+  it('pushChunk：多字节字符跨 chunk 不丢记录', () => {
+    const buf = core.makeLineBuffer()
+    const recs = []
+    // "中" = e4 b8 ad 从字节中间切开；"文" = e6 96 87 完整落在第二个 chunk
+    const head = Buffer.concat([Buffer.from('{"t":"'), Buffer.from([0xe4])])
+    const tail = Buffer.concat([Buffer.from([0xb8, 0xad, 0xe6, 0x96, 0x87]), Buffer.from('"}\n')])
+    core.pushChunk(buf, head, r => recs.push(r))
+    core.pushChunk(buf, tail, r => recs.push(r))
+    expect(recs).toEqual([{ t: '中文' }])
+  })
+})
+
+describe('mapPiEvent 事件映射', () => {
+  it('text_delta → onText；tool start/end → onTool', () => {
+    const calls = { text: [], tool: [] }
+    const settled = core.mapPiEvent(
+      { type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'hi' } },
+      { onText: d => calls.text.push(d) },
+    )
+    expect(settled).toBe(false)
+    expect(calls.text).toEqual(['hi'])
+
+    core.mapPiEvent({ type: 'tool_execution_start', toolName: 'read', args: { p: 1 }, toolCallId: 't1' },
+      { onTool: (...a) => calls.tool.push(a) })
+    core.mapPiEvent({ type: 'tool_execution_end', toolName: 'read', result: 'ok', toolCallId: 't1' },
+      { onTool: (...a) => calls.tool.push(a) })
+    expect(calls.tool).toEqual([
+      ['start', 'read', { p: 1 }, 't1'],
+      ['end', 'read', 'ok', 't1'],
+    ])
+  })
+
+  it('agent_settled → 返回 true', () => {
+    expect(core.mapPiEvent({ type: 'agent_settled' }, {})).toBe(true)
+    expect(core.mapPiEvent({ type: 'message_update' }, {})).toBe(false)
+  })
+})
+
+describe('deletePiSession 会话文件清理（root 注入）', () => {
+  let root
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), 'pideck-sess-'))
+    const dir = join(root, 'C--Users-x')
+    mkdirSync(dir)
+    writeFileSync(join(dir, '20260101_000000_pideck-abc123.jsonl'), '')
+    writeFileSync(join(dir, '20260101_000000_pideck-zzz999.jsonl'), '')
+    writeFileSync(join(dir, 'unrelated.jsonl'), '')
+  })
+
+  it('合法 id：精确删除同后缀文件，其余保留', () => {
+    const r = core.deletePiSession('pideck-abc123', root)
+    expect(r.ok).toBe(true)
+    expect(r.removed).toBe(1)
+    const left = readdirSync(join(root, 'C--Users-x'))
+    expect(left).toContain('20260101_000000_pideck-zzz999.jsonl')
+    expect(left).toContain('unrelated.jsonl')
+    expect(existsSync(join(root, 'C--Users-x', '20260101_000000_pideck-abc123.jsonl'))).toBe(false)
+  })
+
+  it('非法 id 一律拒绝', () => {
+    expect(core.deletePiSession('../evil', root).ok).toBe(false)
+    expect(core.deletePiSession('notpideck-abc', root).ok).toBe(false)
+    expect(core.deletePiSession('', root).ok).toBe(false)
+  })
+
+  it('不存在的 id：ok 但 removed=0', () => {
+    const r = core.deletePiSession('pideck-nothing', root)
+    expect(r).toEqual({ ok: true, removed: 0 })
+  })
+})
+
+describe('resolveCwd / effectiveCwd', () => {
+  it('resolveCwd：有效目录原样返回，无效回退 ~/MyPiDeck（不建目录）', () => {
+    expect(core.resolveCwd(fixtureDir)).toBe(fixtureDir)
+    expect(core.resolveCwd('')).toBe(join(core.os.homedir(), 'MyPiDeck'))
+    expect(core.resolveCwd('Z:\\__pideck_no_such__')).toBe(join(core.os.homedir(), 'MyPiDeck'))
+  })
+
+  it('effectiveCwd：有效目录原样返回（不触碰真实 HOME，避免 mkdir 污染）', () => {
+    expect(core.effectiveCwd(fixtureDir)).toBe(fixtureDir)
+  })
+})

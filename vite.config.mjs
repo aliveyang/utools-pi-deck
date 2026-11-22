@@ -37,9 +37,12 @@ function copyCore() {
         const src = jsMatch[1]
         html = html.replace(jsMatch[0], '')
         html = html.replace('</body>', () => `  <script src="${src}"></script>\n  </body>`)
+      } else {
+        console.warn('[pideck-copy-core] 未在 dist/index.html 匹配到脚本标签，跳过改写（请检查 Vite 输出格式是否变化）')
       }
       if (cssMatch) {
         const href = cssMatch[1]
+        // 等价重写：实际作用是剥掉 Vite 默认加的 crossorigin 属性（file:// 下可能被拦）
         html = html.replace(cssMatch[0], () => `<link rel="stylesheet" href="${href}">`)
       }
       // 兜底占位：Vue 挂载会覆盖；若一直显示说明脚本未执行（便于诊断）

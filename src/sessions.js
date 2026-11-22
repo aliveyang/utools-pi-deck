@@ -37,12 +37,14 @@ function migrateLegacy() {
 }
 
 // 枚举存储后端里所有单会话 key（索引丢失时用于重建）
+// 注意：allDocs 在 utools.db 上（dbStorage 只有 getItem/setItem/removeItem），
+// dbStorage 底层即 db，键即文档 _id，按前缀过滤枚举
 function listItemIds() {
   const ids = []
   try {
-    const db = window.utools && window.utools.dbStorage
+    const db = window.utools && window.utools.db
     if (db && typeof db.allDocs === 'function') {
-      for (const d of (db.allDocs() || [])) {
+      for (const d of (db.allDocs(ITEM_PREFIX) || [])) {
         const k = d && (d._id || d.id)
         if (typeof k === 'string' && k.startsWith(ITEM_PREFIX)) ids.push(k.slice(ITEM_PREFIX.length))
       }

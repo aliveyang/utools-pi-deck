@@ -33,7 +33,7 @@ if (!core) {
     openExternal: () => false, openPath: () => false,
     run: () => { throw new Error('pi-core 加载失败：' + coreErr) },
     cancel: () => {}, saveImage: () => { throw new Error('pi-core 加载失败') },
-    pickFolder: () => null, validateCwd: () => false, effectiveCwd: p => p || os.homedir(),
+    pickFolder: () => null, validateCwd: () => false, effectiveCwd: p => p || os.homedir(), resolveCwd: p => p || os.homedir(),
     homedir: () => os.homedir(),
   }
 } else {
@@ -67,8 +67,10 @@ function saveConfig(patch) {
 
 const resolvePi = core.resolvePi
 const effectiveCwd = core.effectiveCwd
+const resolveCwd = core.resolveCwd
 const validateCwd = core.validateCwd
 const makeLineBuffer = core.makeLineBuffer
+const makeTextStream = core.makeTextStream
 const pushChunk = core.pushChunk
 
 // ---------- 图片落盘 ----------
@@ -151,20 +153,25 @@ function run(opts, handlers) {
   // 禁工具的纯文本分组：必须替换 system prompt，否则模型输出原始工具调用标记
   if (core.permFlags(opts.perm, opts).noTools && !opts.systemPrompt) opts = { ...opts, systemPrompt: core.LEAN_SYSTEM_PROMPT }
   const cfg = loadConfig()
-  // RPC 引擎：已预热则走长驻进程（零冷启动）；否则回退 JSON 模式
-  if (cfg.engine === 'rpc' && rpcEngine && rpcEngine.isReady(opts.cwd, opts)) {
-    let rpcHandle
-    try {
-      rpcHandle = rpcEngine.prompt(opts.cwd, opts, {
-        ...handlers,
-        onDone: payload => { handlers.onDone && handlers.onDone(payload) },
-      })
-      return {
-        cancel: () => { if (rpcHandle && rpcHandle.cancel) rpcHandle.cancel() },
-        mode: 'rpc',
+  // RPC 引擎：已预热则走长驻进程（零冷启动）；否则回退 JSON 模式并懒预热供后续消息使用
+  if (cfg.engine === 'rpc' && rpcEngine) {
+    if (!rpcEngine.isReady(opts.cwd, opts)) {
+      // 懒预热：本条回退 JSON，后台建立长驻进程，下一条消息起零冷启动
+      try { rpcEngine.prewarm(opts.cwd, opts).catch(() => {}) } catch (_) {}
+    } else {
+      let rpcHandle
+      try {
+        rpcHandle = rpcEngine.prompt(opts.cwd, opts, {
+          ...handlers,
+          onDone: payload => { handlers.onDone && handlers.onDone(payload) },
+        })
+        return {
+          cancel: () => { if (rpcHandle && rpcHandle.cancel) rpcHandle.cancel() },
+          mode: 'rpc',
+        }
+      } catch (_) {
+        // RPC 不可用，静默回退 JSON
       }
-    } catch (_) {
-      // RPC 不可用，静默回退 JSON
     }
   }
 
@@ -196,8 +203,9 @@ function run(opts, handlers) {
   })
 
   let stderr = ''
+  const errStream = makeTextStream()
   child.stderr.on('data', c => {
-    if (stderr.length < 16000) stderr += c.toString('utf8').slice(0, 8000)
+    if (stderr.length < 16000) stderr += errStream.push(c).slice(0, 8000)
   })
 
   const release = () => {
@@ -285,6 +293,7 @@ window.piBridge = {
   pickFolder,
   validateCwd,
   effectiveCwd,
+  resolveCwd,
   listSkills: core.listSkills,
   listModels: core.listModels,
   listModelsAsync,

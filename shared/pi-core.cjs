@@ -120,6 +120,13 @@ function pushChunk(buf, chunk, onRecord) {
   }
 }
 
+// ---------- 非 JSONL 场景的解码流（stderr / dev 请求体等，跨 chunk UTF-8 安全） ----------
+// 注意必须把原始 Buffer 交给 StringDecoder：先 toString 会把不完整字节序列损坏成替换符
+function makeTextStream() {
+  const dec = new StringDecoder('utf8')
+  return { push: chunk => dec.write(chunk) }
+}
+
 // ---------- 目录/路径 ----------
 function validateCwd(p) {
   return !!(p && fs.existsSync(p) && fs.statSync(p).isDirectory())
@@ -130,8 +137,15 @@ function defaultWorkspace() {
   try { fs.mkdirSync(dir, { recursive: true }) } catch (_) {}
   return dir
 }
+// 纯计算生效目录（无 mkdir 副作用），供 UI 展示用
+function resolveCwd(p) {
+  return (p && validateCwd(p)) ? p : path.join(os.homedir(), 'MyPiDeck')
+}
 function effectiveCwd(p) {
-  return (p && validateCwd(p)) ? p : defaultWorkspace()
+  const dir = resolveCwd(p)
+  // 只有兜底到默认工作区时才落盘创建；有效入参目录必然已存在
+  if (!fs.existsSync(dir)) defaultWorkspace()
+  return dir
 }
 
 // ---------- 技能扫描 ----------
@@ -162,8 +176,14 @@ function parseSkillMd(file) {
   } catch (_) { return null }
 }
 
-function scanSkillsDir(dir, out, seen) {
+function scanSkillsDir(dir, out, seen, visited) {
   if (!dir) return
+  if (!visited) visited = new Set()
+  // 技能目录多为符号链接：按真实路径记 visited，防止链接成环导致无限递归
+  let real = dir
+  try { real = fs.realpathSync(dir) } catch (_) {}
+  if (visited.has(real)) return
+  visited.add(real)
   try { if (!fs.statSync(dir).isDirectory()) return } catch (_) { return }
   let entries
   try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch (_) { return }
@@ -171,7 +191,7 @@ function scanSkillsDir(dir, out, seen) {
   if (direct && !seen.has(direct.name)) { out.push(direct); seen.add(direct.name) }
   for (const e of entries) {
     if (e.name.startsWith('.')) continue
-    if (e.isDirectory() || e.isSymbolicLink()) scanSkillsDir(path.join(dir, e.name), out, seen)
+    if (e.isDirectory() || e.isSymbolicLink()) scanSkillsDir(path.join(dir, e.name), out, seen, visited)
   }
 }
 
@@ -396,11 +416,11 @@ function getDefaults(cwd) {
 }
 
 // 删除 pi 侧会话文件：~/.pi/agent/sessions/<cwd编码>/<时间戳>_<sessionId>.jsonl
-// 仅接受 pideck- 前缀的合法 id，避免误删其他会话
-function deletePiSession(sessionId) {
+// 仅接受 pideck- 前缀的合法 id，避免误删其他会话；root 仅供测试注入
+function deletePiSession(sessionId, root) {
   const id = String(sessionId || '')
   if (!/^pideck-[a-z0-9]{4,40}$/i.test(id)) return { ok: false, removed: 0, error: 'sessionId 格式不合法' }
-  const root = path.join(os.homedir(), '.pi', 'agent', 'sessions')
+  root = root || path.join(os.homedir(), '.pi', 'agent', 'sessions')
   if (!fs.existsSync(root)) return { ok: true, removed: 0 }
   const suffix = `_${id}.jsonl`
   let removed = 0
@@ -515,7 +535,7 @@ function detectContextFiles(cwd) {
 
 module.exports = {
   resolvePi,
-  makeLineBuffer, pushChunk, validateCwd, effectiveCwd, defaultWorkspace,
+  makeLineBuffer, pushChunk, makeTextStream, validateCwd, effectiveCwd, resolveCwd, defaultWorkspace,
   parseSkillMd, scanSkillsDir, listSkills, listModels, listFiles, buildArgs, buildPermArgs, normalizeTool, permFlags, PRESET_LISTS, TOOL_NAMES, detectContextFiles, LEAN_SYSTEM_PROMPT, getDefaults, deletePiSession, getEnv, mapPiEvent,
   os, path, fs,
 }

@@ -38,8 +38,10 @@ export function usePrefs({ showToast, onCwdChange }) {
 
   function displayCwd(cwd) {
     const dir = cwd || defaultCwd.value
-    if (!window.piBridge || !window.piBridge.effectiveCwd) return dir || '~'
-    return window.piBridge.effectiveCwd(dir)
+    if (!window.piBridge) return dir || '~'
+    // 展示用纯计算路径（resolveCwd），避免仅渲染就触发默认工作区 ~/MyPiDeck 落盘创建
+    if (window.piBridge.resolveCwd) return window.piBridge.resolveCwd(dir)
+    return window.piBridge.effectiveCwd ? window.piBridge.effectiveCwd(dir) : (dir || '~')
   }
 
   // 两套界面：console = 顶栏 + 转录式；classic = 左侧栏 + 气泡
