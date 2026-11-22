@@ -92,20 +92,28 @@ function toggleSendKey() {
 // 空态：按分组给一句定位 + 三条可直接点的示例
 const EMPTY_COPY = {
   chat: { desc: '纯文本对话，不带工具和项目规范', chips: ['解释这段代码', '给这个函数起个名字', '把这段话写得更简洁'] },
-  translate: { desc: '把内容翻译成目标语言，只输出译文', chips: ['把上面的话翻译成英文', '这段英文翻译成中文', '润色成地道的英文'] },
+  translate: { desc: '把内容翻译成目标语言，只输出译文', chips: ['把下面内容翻译成目标语言：\n', '翻译下面这段话：\n'] },
   agent: { desc: '带工具的完整智能体，可读写文件、执行命令', chips: ['看看这个项目的结构', '帮我定位这个报错', '写个脚本整理下载目录'] },
 }
 const emptyCopy = computed(() => {
   const g = activeGroup.value || {}
   const base = EMPTY_COPY[g.kind] || EMPTY_COPY.chat
   if (g.kind === 'translate' && g.targetLang) {
-    return { desc: `把内容翻译成${g.targetLang}，只输出译文`, chips: base.chips }
+    return {
+      desc: `把内容翻译成${g.targetLang}，只输出译文`,
+      chips: [`把下面内容翻译成${g.targetLang}：\n`, '翻译下面这段话：\n'],
+    }
   }
   return base
 })
 function fillChip(text) {
   inputText.value = text
-  nextTick(() => inputEl.value && inputEl.value.focus())
+  nextTick(() => {
+    const el = inputEl.value
+    if (!el) return
+    el.focus()
+    el.selectionStart = el.selectionEnd = text.length
+  })
 }
 
 const modelReadout = computed(() => {
