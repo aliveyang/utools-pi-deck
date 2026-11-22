@@ -1,0 +1,58 @@
+{
+  "main": "index.html",
+  "preload": "preload.js",
+  "logo": "logo.png",
+  "features": [
+    {
+      "code": "chat",
+      "description": "PiDeck - 快速对话",
+      "cmds": [
+        "pi",
+        "pideck",
+        "PiDeck",
+        {
+          "type": "over",
+          "label": "PiDeck 对话",
+          "maxLength": 20000
+        },
+        {
+          "type": "img",
+          "label": "PiDeck 识图"
+        },
+        {
+          "type": "files",
+          "fileType": "file",
+          "extensions": ["png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "txt", "md", "pdf"],
+          "maxLength": 5,
+          "label": "PiDeck 处理文件"
+        }
+      ]
+    },
+    {
+      "code": "translate",
+      "description": "PiDeck - 快速翻译",
+      "cmds": [
+        "翻译",
+        "translate",
+        {
+          "type": "over",
+          "label": "PiDeck 翻译",
+          "maxLength": 20000
+        }
+      ]
+    },
+    {
+      "code": "agent",
+      "description": "PiDeck - 智能体（完整工具能力）",
+      "cmds": [
+        "智能体",
+        "agent",
+        {
+          "type": "over",
+          "label": "PiDeck 智能体",
+          "maxLength": 20000
+        }
+      ]
+    }
+  ]
+}

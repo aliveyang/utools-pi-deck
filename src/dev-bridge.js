@@ -1,0 +1,114 @@
+// dev 模式 piBridge：通过本地 vite API 调用真实 pi CLI（无 uTools 时）
+const BASE = '/__pideck/api'
+
+function saveImage() {
+  throw new Error('dev 预览模式不支持图片落盘，请在 uTools 中测试图片功能')
+}
+
+let activeCtrl = null
+function run(opts, handlers) {
+  const ctrl = new AbortController()
+  activeCtrl = ctrl
+  fetch(BASE + '/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(opts),
+    signal: ctrl.signal,
+  }).then(async res => {
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = '', doneFired = false
+    const finish = data => { if (!doneFired) { doneFired = true; handlers.onDone && handlers.onDone(data) } }
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let sep
+      while ((sep = buf.indexOf('\n\n')) !== -1) {
+        const chunk = buf.slice(0, sep); buf = buf.slice(sep + 2)
+        const line = chunk.split('\n').find(l => l.startsWith('data: '))
+        if (!line) continue
+        let msg
+        try { msg = JSON.parse(line.slice(6)) } catch (_) { continue }
+        switch (msg.type) {
+          case 'event': handlers.onEvent && handlers.onEvent(msg.data); break
+          case 'text': handlers.onText && handlers.onText(msg.data); break
+          case 'thinking': handlers.onThinking && handlers.onThinking(msg.data); break
+          case 'usage': handlers.onUsage && handlers.onUsage(msg.data); break
+          case 'stderr': console.warn('[pi]', msg.data); break
+          case 'tool_start': handlers.onTool && handlers.onTool('start', msg.data.name, msg.data.args, msg.data.id); break
+          case 'tool_end': handlers.onTool && handlers.onTool('end', msg.data.name, msg.data.result, msg.data.id); break
+          case 'error': handlers.onError && handlers.onError(msg.data); break
+          case 'done': finish(msg.data); break
+          case 'close':
+            if (!doneFired) { if (msg.data && msg.data.code !== 0) handlers.onError && handlers.onError('pi 退出 code ' + msg.data.code); else finish({}) }
+            break
+        }
+      }
+    }
+    if (!doneFired) finish({})
+  }).catch(err => {
+    if (err.name === 'AbortError') return
+    handlers.onError && handlers.onError(String(err.message || err))
+  })
+  return { cancel: () => ctrl.abort() }
+}
+
+function syncGet(path) {
+  try {
+    const x = new XMLHttpRequest()
+    x.open('GET', BASE + path, false)
+    x.send()
+    return x.status === 200 ? JSON.parse(x.responseText) : null
+  } catch (_) { return null }
+}
+
+let homedir = (syncGet('/homedir') || {}).homedir || ''
+
+function listModelsAsync() {
+  return fetch(BASE + '/models').then(r => r.json())
+}
+
+window.piBridge = {
+  run,
+  cancel: () => { if (activeCtrl) activeCtrl.abort() },
+  saveImage,
+  pickFolder: () => null,
+  validateCwd: p => !!(p),
+  effectiveCwd: p => {
+    const dir = p || ''
+    const base = homedir || ''
+    if (!dir && base) {
+      const sep = base.includes('\\') ? '\\' : '/'
+      return base.replace(/[\\/]+$/, '') + sep + 'MyPiDeck'
+    }
+    return dir || base
+  },
+  listSkills: cwd => syncGet('/skills?cwd=' + encodeURIComponent(cwd || '')) || [],
+  listModels: () => syncGet('/models') || [],
+  listModelsAsync,
+  refreshModels: () => syncGet('/models?force=1') || [],
+  listFiles: (cwd, query) => syncGet('/files?cwd=' + encodeURIComponent(cwd || '') + '&q=' + encodeURIComponent(query || '')) || [],
+  detectContextFiles: cwd => syncGet('/context?cwd=' + encodeURIComponent(cwd || '')) || [],
+  getDefaults: async cwd => {
+    try { return await fetch(BASE + '/defaults?cwd=' + encodeURIComponent(cwd || '')).then(r => r.json()) }
+    catch (_) { return {} }
+  },
+  deletePiSession: id => {
+    try { return syncGet('/delete-session?id=' + encodeURIComponent(id || '')) || { ok: false } }
+    catch (_) { return { ok: false } }
+  },
+  getEnv: () => {
+    try { return syncGet('/env') || {} } catch (_) { return {} }
+  },
+  openPath: () => false,   // 浏览器预览无法打开系统文件管理器
+  saveTextFile: () => ({ ok: false, unsupported: true }),   // 走前端 Blob 降级
+  openExternal: url => { try { window.open(url, '_blank'); return true } catch (_) { return false } },
+  // dev 模式不启用 RPC（走 dev-server JSON），保留接口形状一致
+  getConfig: () => ({ engine: 'json' }),
+  setConfig: () => ({}),
+  prewarmRpc: () => Promise.resolve(false),
+  stopRpc: () => {},
+  resolvePi: () => syncGet('/resolve') || { ok: false, error: 'dev API 不可用' },
+  homedir: () => homedir,
+}
