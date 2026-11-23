@@ -5,16 +5,23 @@ import { spawn } from 'node:child_process'
 const require = createRequire(import.meta.url)
 const core = require('./shared/pi-core.cjs')
 
-const { execFileSync } = require('node:child_process')
-
 function readJson(req) {
   return new Promise(resolve => {
-    const MAX = 8 * 1024 * 1024   // 8MB：容纳长 prompt + 引用文件，超限截断
+    const MAX = 8 * 1024 * 1024   // 8MB：容纳长 prompt + 引用文件
     let size = 0
     let d = ''
+    let tooLarge = false
     const ts = core.makeTextStream()   // 跨 chunk UTF-8 安全
-    req.on('data', c => { size += c.length; if (size <= MAX) d += ts.push(c) })
-    req.on('end', () => { try { resolve(JSON.parse(d || '{}')) } catch (_) { resolve({}) } })
+    req.on('data', c => {
+      size += c.length
+      if (size > MAX) { tooLarge = true; return }
+      d += ts.push(c)
+    })
+    req.on('end', () => {
+      if (tooLarge) return resolve({ __tooLarge: true })
+      d += ts.end()
+      try { resolve(JSON.parse(d || '{}')) } catch (_) { resolve({}) }
+    })
   })
 }
 
@@ -76,6 +83,7 @@ export function piDevApi() {
           return
         }
         if (p === 'delete-session') {
+          if (req.method !== 'POST') { res.statusCode = 405; res.end('method not allowed'); return }
           res.setHeader('Content-Type', 'application/json')
           try { res.end(JSON.stringify(core.deletePiSession(url.searchParams.get('id')))) }
           catch (e) { res.end(JSON.stringify({ ok: false, error: String(e.message || e) })) }
@@ -88,7 +96,9 @@ export function piDevApi() {
           return
         }
         if (p === 'run') {
-          const body = await readJson(req)
+          if (req.method !== 'POST') { res.statusCode = 405; res.end('method not allowed'); return }
+          let body = await readJson(req)
+          if (body && body.__tooLarge) { res.statusCode = 413; res.end('payload too large'); return }
           res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
           res.setHeader('Cache-Control', 'no-cache')
           res.setHeader('Connection', 'keep-alive')
@@ -96,8 +106,8 @@ export function piDevApi() {
 
           let node, args
           try {
-            // 禁工具的纯文本分组：替换 system prompt，避免模型输出原始工具调用标记
-            if (core.permFlags(body.perm, body).noTools && !body.systemPrompt) body.systemPrompt = core.LEAN_SYSTEM_PROMPT
+            // 禁工具且无 MCP/扩展的纯文本分组：替换 system prompt，避免模型输出原始工具调用标记
+            body = core.applyLeanSystemPrompt(body)
             node = core.resolvePi().node; args = core.buildArgs(body)
           }
           catch (e) { send('error', e.message); res.end(); return }
@@ -106,6 +116,8 @@ export function piDevApi() {
             cwd: core.effectiveCwd(body.cwd), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
           })
           const buf = core.makeLineBuffer()
+          const errStream = core.makeTextStream()
+          let stderrBuf = ''
           let doneFired = false
           const finish = data => { if (!doneFired) { doneFired = true; send('done', data) } }
           child.stdout.on('data', chunk => {
@@ -121,17 +133,42 @@ export function piDevApi() {
               if (settled) finish({ aborted: false })
             })
           })
-          child.stderr.on('data', c => send('stderr', c.toString('utf8').slice(0, 500)))
+          child.stderr.on('data', c => {
+            const s = errStream.push(c)
+            if (s) {
+              stderrBuf = (stderrBuf + s).slice(-1200)
+              send('stderr', s.slice(0, 500))
+            }
+          })
+          const timer = setTimeout(() => {
+            if (!doneFired) {
+              doneFired = true
+              send('error', 'pi 运行超时（15 分钟）')
+            }
+            try { child.kill() } catch (_) {}
+          }, 15 * 60 * 1000)
+          child.on('error', err => {
+            clearTimeout(timer)
+            if (!doneFired) {
+              doneFired = true
+              send('error', String((err && err.message) || err))
+            }
+            res.end()
+          })
           child.on('close', code => {
-            if (!doneFired) finish({ aborted: false, code })
+            clearTimeout(timer)
+            stderrBuf = (stderrBuf + errStream.end()).slice(-1200)
+            if (!doneFired) {
+              if (code === 0) finish({ aborted: false, code })
+              else {
+                doneFired = true
+                const msg = stderrBuf.trim()
+                send('error', msg ? `pi 退出（code ${code}）：${msg}` : `pi 退出（code ${code}）`)
+              }
+            }
             send('close', { code })
             res.end()
           })
-          const timer = setTimeout(() => {
-            try { child.kill() } catch (_) {}
-            send('error', 'pi 运行超时（15 分钟）')
-          }, 15 * 60 * 1000)
-          child.on('close', () => clearTimeout(timer))
           req.on('close', () => { try { child.kill() } catch (_) {} })
           return
         }

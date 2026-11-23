@@ -186,6 +186,7 @@ code, kbd, pre { font-family: var(--mono); }
   width: 72px; height: 72px; object-fit: cover; cursor: zoom-in;
   border: 1px solid var(--line-2); border-radius: 6px;
 }
+.msg-files { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
 .lightbox {
   position: fixed; inset: 0; z-index: 30; background: rgba(12, 14, 18, .88);
   display: flex; align-items: center; justify-content: center; padding: 24px;

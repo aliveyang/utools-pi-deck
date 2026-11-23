@@ -45,17 +45,28 @@ function findPiCli() {
     '/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js',
     '/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js',
   ].filter(Boolean)
-  // PATH 兜底：where / which pi
+  // PATH 兜底：where / which pi（兼容 Windows npm shim 与 macOS/Linux 符号链接）
   if (!candidates.some(p => fs.existsSync(p))) {
+    const relCli = path.join('node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'bundle', 'cli.js')
     for (const cmd of ['where', 'which']) {
       try {
-        const out = execFileSync(cmd, ['pi'], { encoding: 'utf8', windowsHide: true, timeout: 5000 }).trim().split(/\r?\n/)[0]
-        if (out && fs.existsSync(out)) {
-          // pi shim → 解析到真实 cli.js
+        const lines = execFileSync(cmd, ['pi'], { encoding: 'utf8', windowsHide: true, timeout: 5000 })
+          .trim().split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+        for (const out of lines) {
+          if (!fs.existsSync(out)) continue
+          try {
+            const real = fs.realpathSync(out)
+            if (/\.(js|mjs|cjs)$/i.test(real) && fs.existsSync(real)) candidates.push(real)
+          } catch (_) {}
           const shimDir = path.dirname(out)
-          const candidate = path.join(shimDir, 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'bundle', 'cli.js')
-          if (fs.existsSync(candidate)) { candidates.push(candidate); break }
+          for (const candidate of [
+            path.join(shimDir, relCli),
+            path.join(shimDir, '..', 'lib', relCli),
+          ]) {
+            if (fs.existsSync(candidate)) candidates.push(candidate)
+          }
         }
+        if (candidates.some(p => fs.existsSync(p))) break
       } catch (_) {}
     }
   }
@@ -124,7 +135,7 @@ function pushChunk(buf, chunk, onRecord) {
 // 注意必须把原始 Buffer 交给 StringDecoder：先 toString 会把不完整字节序列损坏成替换符
 function makeTextStream() {
   const dec = new StringDecoder('utf8')
-  return { push: chunk => dec.write(chunk) }
+  return { push: chunk => dec.write(chunk), end: () => dec.end() }
 }
 
 // ---------- 目录/路径 ----------
@@ -213,16 +224,20 @@ function listSkills(cwd) {
 let _modelsCache = null
 let _modelsAt = 0
 const MODELS_TTL = 60 * 1000
-function listModels(force) {
-  if (!force && _modelsCache && Date.now() - _modelsAt < MODELS_TTL) return _modelsCache
-  const { node, cli } = resolvePi()
-  const out = execFileSync(node, [cli, '--list-models'], { encoding: 'utf8', windowsHide: true, timeout: 30000 })
+function parseModelsOutput(stdout) {
   const models = []
-  for (const line of out.split(/\r?\n/)) {
+  for (const line of String(stdout || '').split(/\r?\n/)) {
     if (!line.trim() || /^provider\s+model/i.test(line)) continue
     const parts = line.trim().split(/\s{2,}|\s+/)
     if (parts.length >= 2) models.push({ provider: parts[0], model: parts[1], display: `${parts[0]}/${parts[1]}` })
   }
+  return models
+}
+function listModels(force) {
+  if (!force && _modelsCache && Date.now() - _modelsAt < MODELS_TTL) return _modelsCache
+  const { node, cli } = resolvePi()
+  const out = execFileSync(node, [cli, '--list-models'], { encoding: 'utf8', windowsHide: true, timeout: 30000 })
+  const models = parseModelsOutput(out)
   _modelsCache = models
   _modelsAt = Date.now()
   return models
@@ -234,18 +249,28 @@ function listFiles(cwd, query) {
   const out = []
   const q = (query || '').toLowerCase()
   const skip = new Set(['node_modules', '.git', 'dist', 'build', '.cache', '.venv', '__pycache__'])
+  const visited = new Set()
   function walk(dir, depth, prefix) {
     if (depth > 3 || out.length >= 200) return
+    let real = dir
+    try { real = fs.realpathSync(dir) } catch (_) {}
+    if (visited.has(real)) return
+    visited.add(real)
     let entries
     try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch (_) { return }
     for (const e of entries) {
       if (e.name.startsWith('.') || skip.has(e.name)) continue
       const rel = prefix ? `${prefix}/${e.name}` : e.name
+      const full = path.join(dir, e.name)
+      let isDir = e.isDirectory()
+      if (!isDir && e.isSymbolicLink()) {
+        try { isDir = fs.statSync(full).isDirectory() } catch (_) { continue }
+      }
       if (q && !rel.toLowerCase().includes(q)) {
-        if (e.isDirectory() || e.isSymbolicLink()) walk(path.join(dir, e.name), depth + 1, rel)
+        if (isDir) walk(full, depth + 1, rel)
         continue
       }
-      if (e.isDirectory() || e.isSymbolicLink()) { out.push({ path: rel, dir: true }); walk(path.join(dir, e.name), depth + 1, rel) }
+      if (isDir) { out.push({ path: rel, dir: true }); walk(full, depth + 1, rel) }
       else out.push({ path: rel, dir: false })
     }
   }
@@ -312,7 +337,11 @@ function buildPermArgs(tool, opts) {
   const mcpOff = t.mcp === 'off' || (t.mcp === 'servers' && !servers.length)
   const list = t.list.slice()
   if (!list.length) {
-    args.push('-nt')
+    if (t.mcp === 'servers' && servers.length) {
+      args.push('--tools', servers.map(x => 'mcp__' + x + '__*').join(','))
+    } else {
+      args.push('-nt')
+    }
   } else {
     let allow = list.join(',')
     if (t.mcp === 'servers' && servers.length) allow += ',' + servers.map(x => 'mcp__' + x + '__*').join(',')
@@ -339,7 +368,14 @@ function buildPermArgs(tool, opts) {
 // 兼容旧调用：只关心"有没有工具"（纯文本要替换 system prompt）
 function permFlags(perm, opts) {
   const t = normalizeTool(opts && opts.tool, { ...(opts || {}), perm })
-  return { noTools: !t.list.length }
+  const servers = String(t.mcpServers || '').split(',').map(x => x.trim()).filter(Boolean)
+  const mcpOff = t.mcp === 'off' || (t.mcp === 'servers' && !servers.length)
+  return { noTools: !t.list.length && mcpOff && !t.ext }
+}
+
+function applyLeanSystemPrompt(opts) {
+  const o = opts || {}
+  return (permFlags(o.perm, o).noTools && !o.systemPrompt) ? { ...o, systemPrompt: LEAN_SYSTEM_PROMPT } : o
 }
 
 // ---------- spawn 参数构造（统一 argv 规则） ----------
@@ -383,9 +419,11 @@ function getDefaults(cwd) {
     let buf = ''
     const dec = new StringDecoder('utf8')
     let done = false
+    let timeout = null
     const finish = data => {
       if (done) return
       done = true
+      if (timeout) clearTimeout(timeout)
       try { child.stdin.end() } catch (_) {}
       setTimeout(() => { try { child.kill() } catch (_) {} }, 500)
       resolve(data)
@@ -411,7 +449,7 @@ function getDefaults(cwd) {
     child.on('error', e => finish({ error: String(e.message || e) }))
     child.on('exit', () => { if (!done) finish({ error: 'pi 进程退出' }) })
     try { child.stdin.write(JSON.stringify({ id: 'def1', type: 'get_state' }) + '\n') } catch (_) {}
-    setTimeout(() => { if (!done) finish({ error: '获取默认配置超时' }) }, 20000)
+    timeout = setTimeout(() => { if (!done) finish({ error: '获取默认配置超时' }) }, 20000)
   })
 }
 
@@ -536,6 +574,6 @@ function detectContextFiles(cwd) {
 module.exports = {
   resolvePi,
   makeLineBuffer, pushChunk, makeTextStream, validateCwd, effectiveCwd, resolveCwd, defaultWorkspace,
-  parseSkillMd, scanSkillsDir, listSkills, listModels, listFiles, buildArgs, buildPermArgs, normalizeTool, permFlags, PRESET_LISTS, TOOL_NAMES, detectContextFiles, LEAN_SYSTEM_PROMPT, getDefaults, deletePiSession, getEnv, mapPiEvent,
+  parseSkillMd, scanSkillsDir, listSkills, parseModelsOutput, listModels, listFiles, buildArgs, buildPermArgs, normalizeTool, permFlags, applyLeanSystemPrompt, PRESET_LISTS, TOOL_NAMES, detectContextFiles, LEAN_SYSTEM_PROMPT, getDefaults, deletePiSession, getEnv, mapPiEvent,
   os, path, fs,
 }

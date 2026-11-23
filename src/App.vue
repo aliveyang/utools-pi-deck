@@ -1,12 +1,15 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import { loadGroups, saveGroups, loadActiveId, saveActiveId, loadDrafts, saveDrafts, newGroup, PRESET_LIST, PRESET_LABEL, TOOL_PRESETS, TOOL_NAMES, presetOf } from './groups.js'
+import { loadGroups, saveGroups, loadActiveId, saveActiveId, loadDrafts, saveDrafts, PRESET_LABEL, TOOL_PRESETS, presetOf } from './groups.js'
 import { readCache, read, write } from './storage.js'
 import Icon from './components/Icon.vue'
 import TurnList from './components/TurnList.vue'
+import EnvBanner from './components/EnvBanner.vue'
+import HistoryDrawer from './components/HistoryDrawer.vue'
+import SettingsModal from './components/SettingsModal.vue'
 import {
   listSessions, getSession, createSession, updateSession, deleteSession,
-  titleFromText, exportMarkdown,
+  titleFromText, exportMarkdown, relTime,
 } from './sessions.js'
 import { useToast } from './composables/useToast.js'
 import { usePrefs } from './composables/usePrefs.js'
@@ -41,7 +44,7 @@ const running = ref(false)
 const runPhase = ref('')        // spawning | connecting | generating
 const errorMsg = ref('')
 const showSettings = ref(false)
-const settingsTab = ref('general')
+const settingsModalEl = ref(null)
 const chatEl = ref(null)
 const inputEl = ref(null)
 const sideSearchEl = ref(null)
@@ -51,8 +54,6 @@ function closePreview() { previewImage.value = '' }
 
 // 历史滑出面板
 const showHistory = ref(false)
-const historySearchEl = ref(null)
-const historyIndex = ref(0)
 const sessionSearch = ref('')
 
 // 输入候选菜单（技能 / 文件）
@@ -66,25 +67,37 @@ const menuIndex = ref(0)
 const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || '')
 const historyKey = isMac ? '⌘K' : 'Ctrl K'
 
+function effectiveGroupCwd(g) {
+  return (g && g.cwd) || defaultCwd.value || ''
+}
+
 // ---- 组合式模块 ----
 const { toast, showToast, copyText } = useToast()
 const {
   defaultCwd, setDefaultCwd, commitDefaultCwd, pickDefaultCwd,
   sendKeyMode, setSendKeyMode, displayCwd, fmtSize,
-  layout, setLayout, toggleLayout,
-} = usePrefs({ showToast, onCwdChange: () => detectContext() })
+  layout, setLayout,
+} = usePrefs({
+  showToast,
+  onCwdChange: () => {
+    detectContext()
+    loadSkillsAsync()
+    files.value = []
+    if (engine.value === 'rpc') maybePrewarmRpc()
+  },
+})
 const {
-  models, skills, piStatus, engine, rpcStatus, contextFiles, defaults, envInfo, showEnvHelp,
+  models, skills, piStatus, engine, contextFiles, defaults, envInfo, showEnvHelp,
   loadDefaults, detectContext, loadModelsAsync, refreshModels, loadSkillsAsync,
-  loadEnv, recheckEnv, prewarmActive, setEngine, openPath, openExternal, ctxLabel,
+  loadEnv, recheckEnv, prewarmActive, setEngine, openPath, openExternal,
 } = usePiEnv({
-  getCwd: () => activeGroup.value && activeGroup.value.cwd,
+  getCwd: () => effectiveGroupCwd(activeGroup.value),
   // 预热进程按分组的工具权限区分（不同配置不能复用同一进程）
   getLean: () => ({ tool: toolForSend(activeGroup.value) }),
   showToast,
 })
 
-const sendKeyChip = computed(() => sendKeyMode.value === 'enter' ? 'Enter' : 'Ctrl+↵')
+const sendKeyChip = computed(() => sendKeyMode.value === 'enter' ? 'Enter' : (isMac ? '⌘+↵' : 'Ctrl+↵'))
 function toggleSendKey() {
   setSendKeyMode(sendKeyMode.value === 'enter' ? 'ctrl' : 'enter')
 }
@@ -92,17 +105,14 @@ function toggleSendKey() {
 // 后台预热 RPC 长驻进程（配置启用时）；关窗/重新进入时由 handleEnter 再次预热
 function maybePrewarmRpc() {
   if (engine.value !== 'rpc' || !window.piBridge || !window.piBridge.prewarmRpc) return
-  rpcStatus.value = 'warming'
-  prewarmActive().then(ok => {
-    rpcStatus.value = ok ? 'ready' : 'failed'
-  })
+  prewarmActive().catch(() => {})
 }
 
-// 空态：按分组给一句定位 + 三条可直接点的示例
+// 空态：按分组给一句定位 + 可直接点的示例
 const EMPTY_COPY = {
   chat: { desc: '纯文本对话，不带工具和项目规范', chips: ['解释这段代码', '给这个函数起个名字', '把这段话写得更简洁'] },
   translate: { desc: '把内容翻译成目标语言，只输出译文', chips: ['把下面内容翻译成目标语言：\n', '翻译下面这段话：\n'] },
-  agent: { desc: '带工具的完整智能体，可读写文件、执行命令', chips: ['看看这个项目的结构', '帮我定位这个报错', '写个脚本整理下载目录'] },
+  agent: { desc: '默认只读工具，可在分组设置中按需放开编辑与命令执行', chips: ['看看这个项目的结构', '帮我定位这个报错', '写个脚本整理下载目录'] },
 }
 const emptyCopy = computed(() => {
   const g = activeGroup.value || {}
@@ -125,6 +135,9 @@ function fillChip(text) {
   })
 }
 
+const THINKING_LABELS = {
+  off: '不思考', minimal: '极简', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高',
+}
 const modelReadout = computed(() => {
   const g = activeGroup.value || {}
   if (g.model) return String(g.model).split('/').pop()
@@ -210,18 +223,10 @@ function onEsc() {
   if (previewImage.value) { closePreview(); return }
   if (showSkillMenu.value || showFileMenu.value) { closeMenus(); return }
   if (showHistory.value) { closeHistory(); return }
-  if (editing.value) { editing.value = null; return }
-  if (showSettings.value) { closeSettings(); return }
-}
-
-const TARGET_LANGS = ['', '英文', '中文', '日文', '韩文', '法文', '德文', '西班牙文', '俄文']
-const THINKING_LEVELS = ['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
-const THINKING_LABELS = {
-  off: '不思考', minimal: '极简', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高',
-}
-function thinkingLabel(lv) {
-  if (!lv) return defaultThinkingLabel()
-  return THINKING_LABELS[lv] ? `${THINKING_LABELS[lv]}（${lv}）` : lv
+  if (showSettings.value) {
+    if (!(settingsModalEl.value && settingsModalEl.value.handleEsc())) closeSettings()
+    return
+  }
 }
 
 const filteredSkills = computed(() => {
@@ -307,74 +312,19 @@ function onGlobalKey(e) {
   }
 }
 
-// ---- 历史面板 ----
 function openHistory() {
   if (!sessions.value.length) { showToast('还没有对话'); return }
   showHistory.value = true
-  sessionSearch.value = ''
-  historyIndex.value = 0
-  nextTick(() => historySearchEl.value && historySearchEl.value.focus())
 }
 function closeHistory() { showHistory.value = false }
-watch(sessionSearch, () => { historyIndex.value = 0 })
 
-const groupedSessions = computed(() => {
-  const list = filteredSessions.value
-  const now = new Date()
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
-  const buckets = [
-    { label: '今天', items: [] },
-    { label: '昨天', items: [] },
-    { label: '更早', items: [] },
-  ]
-  for (const s of list) {
-    const t = s.updatedAt || 0
-    if (t >= startOfToday) buckets[0].items.push(s)
-    else if (t >= startOfToday - 86400000) buckets[1].items.push(s)
-    else buckets[2].items.push(s)
-  }
-  return buckets.filter(b => b.items.length)
-})
-function relTime(ts) {
-  if (!ts) return ''
-  const diff = Date.now() - ts
-  if (diff < 60000) return '刚刚'
-  if (diff < 3600000) return `${Math.floor(diff / 60000)} 分钟前`
-  const now = new Date(), t = new Date(ts)
-  if (now.toDateString() === t.toDateString()) return `${Math.floor(diff / 3600000)} 小时前`
-  const y = new Date(now.getTime() - 86400000)
-  if (y.toDateString() === t.toDateString()) return '昨天'
-  return `${t.getMonth() + 1} 月 ${t.getDate()} 日`
-}
-function moveHistory(delta) {
-  const n = filteredSessions.value.length
-  if (!n) return
-  historyIndex.value = Math.min(n - 1, Math.max(0, historyIndex.value + delta))
-  nextTick(() => {
-    const el = document.querySelector('.h-row.focus')
-    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' })
-  })
-}
-function openHistoryActive() {
-  const s = filteredSessions.value[historyIndex.value]
-  if (s) loadSession(s.id)
-}
-function isFocusedSession(s) {
-  const cur = filteredSessions.value[historyIndex.value]
-  return !!(cur && cur.id === s.id)
-}
-
-const INSTALL_CMDS = {
-  pi: 'npm i -g @earendil-works/pi-coding-agent',
-}
-function installCmd(kind) { return INSTALL_CMDS[kind] || '' }
 function copyCmd(text) { copyText(text) }
 // 外链统一走系统浏览器（uTools 内 target=_blank 常被拦）
 function openLink(url) { openExternal(url) }
 
 function refreshFiles() {
   if (!window.piBridge || !window.piBridge.listFiles) return
-  try { files.value = window.piBridge.listFiles(activeGroup.value && activeGroup.value.cwd) || [] } catch (_) { files.value = [] }
+  try { files.value = window.piBridge.listFiles(effectiveGroupCwd(activeGroup.value)) || [] } catch (_) { files.value = [] }
 }
 function refreshSessions() {
   // 每次打开默认新建对话（不续接上次），历史仍可点开
@@ -383,22 +333,15 @@ function refreshSessions() {
 }
 
 function handleEnter(action) {
+  if (running.value) {
+    showToast('当前回答生成中，请先停止')
+    return
+  }
   const code = String(action.code || '')
   const type = String(action.type || '')
   const payload = action.payload
-  // uTools 窗口复用，重新进入不会重新 mount：这里必须显式回到新对话态
-  // 否则上次会话（含图片消息）还挂在 currentSession 上，看起来像没换对话
-  if (!running.value) {
-    refreshSessions(); resetPaging(); closeHistory()
-    // 关窗时 RPC 进程可能已被 stopRpc 清掉：重新进入时按当前引擎重预热
-    maybePrewarmRpc()
-  }
-  inputText.value = ''
-  const drafts = loadDrafts(); drafts[activeId.value] = ''; saveDrafts(drafts)
-  errorMsg.value = ''
-  closePreview()
-  images.value = []
-  attachedFiles.value = []
+
+  // 先切分组，再清空输入与目标分组草稿（避免先清旧分组、切入后再把目标分组草稿恢复出来）
   if (code === 'translate') {
     const t = groups.value.find(g => g.kind === 'translate' || g.id === 'translate' || g.name === '翻译')
     if (t) selectGroup(t.id)
@@ -410,7 +353,22 @@ function handleEnter(action) {
     const t = groups.value.find(g => g.kind === 'agent' || g.id === 'agent')
     if (t) selectGroup(t.id)
   }
-  if ((type === 'over' || type === 'regex' || type === 'text') && typeof payload === 'string') inputText.value = payload
+
+  // uTools 窗口复用，重新进入不会重新 mount：显式回到新对话态
+  refreshSessions()
+  resetPaging()
+  closeHistory()
+  maybePrewarmRpc()
+
+  inputText.value = ''
+  const drafts = loadDrafts(); drafts[activeId.value] = ''; saveDrafts(drafts)
+  errorMsg.value = ''
+  closePreview()
+  images.value = []
+  attachedFiles.value = []
+
+  // uTools 中 type === 'text' 的 payload 是触发关键词本身（如 "pi"/"翻译"），仅 over/regex 才是匹配文本
+  if ((type === 'over' || type === 'regex') && typeof payload === 'string') inputText.value = payload
   if (type === 'img' && payload) {
     const dataUrl = typeof payload === 'string'
       ? (payload.startsWith('data:') ? payload : payload.startsWith('file:') || /^[A-Za-z]:[\\/]/.test(payload) ? '' : 'data:image/png;base64,' + payload)
@@ -430,9 +388,11 @@ function selectGroup(id) {
   saveCurrentDraft()          // 先用【旧 id】保存当前草稿
   activeId.value = id         // 再切换
   loadSkillsAsync()           // 异步，不阻塞切换
+  detectContext()
   files.value = []            // @ 文件改为懒加载，清空旧的
   refreshSessions()
   restoreDraft()              // 最后恢复【新 id】的草稿
+  if (engine.value === 'rpc') maybePrewarmRpc()
 }
 // activeId 持久化统一由 watch 处理，避免重复写
 watch(activeId, id => saveActiveId(id))
@@ -467,16 +427,15 @@ function loadSession(id) {
 function snapshotConfig(g) {
   return {
     prompt: g.prompt || '', model: g.model || '', thinking: g.thinking || '',
-    cwd: g.cwd || defaultCwd.value || '', targetLang: g.targetLang || '', lean: { ...(g.lean || {}) },
+    cwd: effectiveGroupCwd(g), targetLang: g.targetLang || '',
     tool: toolForSend(g),
   }
 }
 function newChat() {
   if (running.value) return
   saveCurrentDraft()
-  const s = createSession(activeId.value, snapshotConfig(activeGroup.value))
-  currentSession.value = s
-  sessions.value = listSessions(activeId.value)
+  // 懒创建：仅清空到新对话空态，首条消息发送时再落盘创建会话
+  currentSession.value = null
   resetPaging()
   inputText.value = ''
   images.value = []
@@ -486,6 +445,7 @@ function newChat() {
   nextTick(() => inputEl.value && inputEl.value.focus())
 }
 function removeSession(id) {
+  if (running.value) { showToast('请先停止当前回答'); return }
   const s = getSession(id)
   if (!s) return
   deleteSession(id)
@@ -541,14 +501,14 @@ function readImageFile(file) {
   const MAX = 20 * 1024 * 1024
   if (file.size > MAX) { showToast(`图片过大（${(file.size / 1048576).toFixed(1)}MB），上限 20MB`); return }
   // FileReader 异步：粘贴后立刻发送必须等读完成，否则这一轮发出去的是空图
-  const read = new Promise(resolve => {
+  const readTask = new Promise(resolve => {
     const reader = new FileReader()
     reader.onload = () => { addImage(reader.result); resolve() }
     reader.onerror = () => { showToast('图片读取失败'); resolve() }
     reader.readAsDataURL(file)
   })
-  pendingImageReads.push(read)
-  read.finally(() => { pendingImageReads = pendingImageReads.filter(p => p !== read) })
+  pendingImageReads.push(readTask)
+  readTask.finally(() => { pendingImageReads = pendingImageReads.filter(p => p !== readTask) })
 }
 function removeImage(i) { images.value.splice(i, 1) }
 function removeFile(i) { attachedFiles.value.splice(i, 1) }
@@ -594,6 +554,20 @@ function insertFile(f) {
   nextTick(() => { el.focus(); el.selectionStart = el.selectionEnd = pos })
 }
 
+function truncateToolResult(val) {
+  if (val == null) return val
+  const MAX = 16000
+  if (typeof val === 'string') return val.length > MAX ? val.slice(0, MAX) + '\n…（输出过长已截断）' : val
+  try {
+    const s = JSON.stringify(val)
+    if (s.length <= MAX) return val
+    return s.slice(0, MAX) + '\n…（输出过长已截断）'
+  } catch (_) {
+    const s = String(val)
+    return s.length > MAX ? s.slice(0, MAX) + '\n…（输出过长已截断）' : s
+  }
+}
+
 // 调用 pi
 let sending = false
 async function send() {
@@ -609,15 +583,9 @@ async function send() {
     return
   }
   const userText = inputText.value.trim()
-  // newChat() 会清空输入框和附件：先快照，否则首条消息（无会话时）的图片会被清掉
   const outImages = [...images.value]
   const outFiles = [...attachedFiles.value]
-  if (!currentSession.value || currentSession.value.groupId !== activeId.value) newChat()
-  const session = currentSession.value
-  // 始终使用分组当前配置：用户改模型/思考后应立刻对新消息生效
-  // （历史消息已落库不受影响；会话仍用自身 piSessionId 续接上下文）
   const g = snapshotConfig(activeGroup.value)
-  updateSession(session.id, { config: { ...g } })
 
   // 局部命名 sendFiles：避免遮蔽外层 @ 文件菜单的 files ref
   let sendFiles = [...outFiles]
@@ -626,6 +594,18 @@ async function send() {
     try { const p = window.piBridge.saveImage(img.dataUrl); imagePaths.push(p); sendFiles.push(p) }
     catch (e) { errorMsg.value = String(e.message || e); return }
   }
+
+  // 懒创建会话：图片落盘等前置校验通过后再创建会话并入库
+  if (!currentSession.value || currentSession.value.groupId !== activeId.value) {
+    const created = createSession(activeId.value, g)
+    currentSession.value = created
+    sessions.value = listSessions(activeId.value)
+    resetPaging()
+  }
+  const session = currentSession.value
+  // 始终使用分组当前配置：用户改模型/思考后应立刻对新消息生效
+  updateSession(session.id, { config: { ...g } })
+
   // 提示词：分组前缀 + 翻译目标语言 + 用户输入
   let prefix = (g.prompt && g.prompt.trim()) ? g.prompt.trim() : ''
   if (g.targetLang && g.targetLang.trim()) prefix += `\n目标语言：${g.targetLang.trim()}`
@@ -633,10 +613,13 @@ async function send() {
     ? `${prefix}\n\n---\n\n${userText || '请处理上方附带的内容。'}`
     : (userText || '请描述这张图片。')
 
-  // 只存图片数量引用，不存 base64（避免存储膨胀）
+  const fileNames = outFiles.map(f => String(f).split(/[\\/]/).pop()).filter(Boolean)
+  // 只存图片数量与本地路径引用，不存 base64（避免存储膨胀）
   const imageRefs = outImages.length ? { imageCount: outImages.length, imagePaths } : {}
-  session.messages.push({ role: 'user', text: userText || '(图片)', ...imageRefs })
-  if (session.title === '新对话') session.title = titleFromText(userText || '(图片)')
+  const fileRefs = fileNames.length ? { fileNames } : {}
+  const fallbackUserText = outImages.length ? '(图片)' : '(附件)'
+  session.messages.push({ role: 'user', text: userText || fallbackUserText, ...imageRefs, ...fileRefs })
+  if (session.title === '新对话') session.title = titleFromText(userText || fallbackUserText)
   currentAssistant = { role: 'assistant', text: '', thinking: '', tools: [], error: '', aborted: false }
   session.messages.push(currentAssistant)
   updateSession(session.id, { messages: session.messages, title: session.title })
@@ -661,24 +644,40 @@ async function send() {
         prompt, model: g.model || '', thinking: g.thinking || '', cwd: g.cwd || '', files: sendFiles,
         sessionId: session.piSessionId,
         tool: g.tool,
-        ...(g.lean || {}),
       },
       {
         onEvent: rec => {
+          if (finalized) return
           if (rec.type === 'agent_start' || rec.type === 'turn_start') {
             if (runPhase.value === 'spawning') runPhase.value = 'connecting'
           }
         },
-        onText: delta => { runPhase.value = 'generating'; currentAssistant.text += delta; scrollChatThrottled() },
-        onThinking: delta => { if (runPhase.value !== 'generating') runPhase.value = 'generating'; currentAssistant.thinking += delta },
+        onText: delta => {
+          if (finalized || !currentAssistant) return
+          runPhase.value = 'generating'
+          currentAssistant.text += delta
+          scrollChatThrottled()
+        },
+        onThinking: delta => {
+          if (finalized || !currentAssistant) return
+          if (runPhase.value !== 'generating') runPhase.value = 'generating'
+          currentAssistant.thinking += delta
+        },
         onTool: (phase, name, payload, id) => {
-          if (phase === 'start') currentAssistant.tools.push({ id: id || ('t' + Date.now() + Math.random()), name, args: payload, expanded: false })
-          else {
-            const t = id ? currentAssistant.tools.find(x => x.id === id && !x.result) : [...currentAssistant.tools].reverse().find(x => x.name === name && !x.result)
-            if (t) t.result = payload
+          if (finalized || !currentAssistant) return
+          if (phase === 'start') {
+            currentAssistant.tools.push({ id: id || ('t' + Date.now() + Math.random()), name, args: payload })
+          } else {
+            const t = id
+              ? currentAssistant.tools.find(x => x.id === id && !x.result)
+              : [...currentAssistant.tools].reverse().find(x => x.name === name && !x.result)
+            if (t) t.result = truncateToolResult(payload)
           }
         },
-        onUsage: usage => { session.usage = usage },
+        onUsage: usage => {
+          if (finalized) return
+          session.usage = usage
+        },
         onDone: payload => finalize(!!(payload && payload.aborted), ''),
         onError: msg => finalize(cancelled, cancelled ? '' : msg),
       }
@@ -723,7 +722,6 @@ function scrollChatThrottled() {
   scrollScheduled = true
   requestAnimationFrame(() => { scrollScheduled = false; scrollChat(false) })
 }
-// 折叠件：未手动操作时，最后一条在生成中自动展开
 function usageText(session) {
   const u = session && session.usage
   if (!u || !u.totalTokens) return ''
@@ -733,153 +731,9 @@ function usageText(session) {
 }
 const usageLine = computed(() => usageText(currentSession.value))
 
-function defaultModelLabel() {
-  const d = defaults.value || {}
-  const raw = d.modelName || d.modelId
-  if (!raw) return '默认（继承 pi 设置）'
-  // "DeepSeek V4.1 Flash · routing group" → 取 · 前的主名称
-  const name = String(raw).split('·')[0].trim()
-  return `默认（${name}）`
-}
-function defaultThinkingLabel() {
-  const lv = (defaults.value || {}).thinkingLevel
-  if (!lv) return '默认（继承 pi 设置）'
-  return `默认（${THINKING_LABELS[lv] || lv}）`
-}
+function openSettings() { showSettings.value = true }
+function closeSettings() { showSettings.value = false }
 
-// 分组管理
-const editing = ref(null)
-const SETTINGS_TABS = [
-  { id: 'general', label: '对话默认' },
-  { id: 'groups', label: '分组' },
-  { id: 'diag', label: '诊断' },
-]
-function openSettings() { editing.value = null; settingsTab.value = 'general'; showSettings.value = true }
-function closeSettings() { showSettings.value = false; editing.value = null }
-function editGroup(g) {
-  const base = g.tool || TOOL_PRESETS.read
-  editing.value = {
-    ...g,
-    lean: { noContextFiles: false, noSkills: false, noMcp: false, noTools: false, ...(g.lean || {}) },
-    tool: {
-      ...base,
-      list: (base.list || []).slice(),
-      mcpServers: base.mcpServers || '',
-      skillNames: (base.skillNames || []).slice(),
-    },
-  }
-  showSettings.value = true
-  detectContext()
-}
-function addGroup() {
-  editing.value = newGroup()
-  showSettings.value = true
-  detectContext()
-}
-function saveGroup() {
-  const e = editing.value
-  if (!e || !e.name.trim()) return
-  const tool = {
-    ...(e.tool || TOOL_PRESETS.read),
-    list: ((e.tool && e.tool.list) || []).slice(),
-    skillNames: ((e.tool && e.tool.skillNames) || []).slice(),
-  }
-  const next = {
-    ...e, tool,
-    lean: {
-      ...(e.lean || {}),
-      noTools: tool.list.length === 0,
-      noMcp: tool.mcp === 'off',
-      noSkills: tool.skills === 'off',
-      noContextFiles: !tool.context,
-      noPromptTemplates: !tool.templates,
-    },
-  }
-  const idx = groups.value.findIndex(g => g.id === next.id)
-  if (idx >= 0) groups.value.splice(idx, 1, next)
-  else groups.value.push(next)
-  saveGroups(groups.value)
-  editing.value = null
-  showToast('设置已保存')
-  loadSkillsAsync()
-  files.value = []
-}
-// 设置行里的分组摘要：每项独立成段，用 1px 竖线分隔（不用 · 串联）
-function groupSummary(g) {
-  const parts = []
-  if (g.kind === 'translate' && g.targetLang) parts.push(`译为${g.targetLang}`)
-  parts.push(PRESET_LABEL[presetOf(g.tool)] || '自定义')
-  const tl = (g.tool && g.tool.list) || []
-  if (tl.length && tl.length < TOOL_NAMES.length) parts.push(tl.length + ' 个工具')
-  if (g.tool && g.tool.mcp && g.tool.mcp !== 'off') parts.push('MCP 开')
-  parts.push(g.model ? String(g.model).split('/').pop() : '默认模型')
-  if (g.thinking) parts.push(THINKING_LABELS[g.thinking] || g.thinking)
-  parts.push(displayCwd(g.cwd))
-  return parts
-}
-// 权限档位的风险说明：这是给用户看的唯一"安全文案"，必须具体
-// 内置工具清单：分成"读"与"写/执行"，后者勾选后要显著提示
-const TOOL_META = [
-  { id: 'read', label: 'read', note: '读取文件内容' },
-  { id: 'grep', label: 'grep', note: '按内容搜索文件' },
-  { id: 'find', label: 'find', note: '按名称找路径' },
-  { id: 'ls', label: 'ls', note: '列目录' },
-  { id: 'edit', label: 'edit', note: '按片段修改文件', risk: true },
-  { id: 'write', label: 'write', note: '新建或覆盖文件', risk: true },
-  { id: 'bash', label: 'bash', note: '执行 shell 命令', risk: true },
-  { id: 'powershell', label: 'pwsh', note: '执行 PowerShell（仅 Windows）', risk: true },
-]
-const editTool = computed(() => (editing.value && editing.value.tool) || TOOL_PRESETS.read)
-const editPreset = computed(() => presetOf(editing.value && editing.value.tool))
-function applyPreset(id) {
-  const e = editing.value
-  if (!e) return
-  const preset = TOOL_PRESETS[id]
-  e.tool = {
-    ...preset, list: preset.list.slice(), mcpServers: '', skillNames: [], trust: false,
-  }
-}
-function hasTool(id) { return (editTool.value.list || []).includes(id) }
-function toggleTool(id) {
-  const t = editing.value && editing.value.tool
-  if (!t) return
-  const list = (t.list || []).slice()
-  const i = list.indexOf(id)
-  if (i >= 0) list.splice(i, 1)
-  else list.push(id)
-  t.list = list.sort((a, b) => TOOL_NAMES.indexOf(a) - TOOL_NAMES.indexOf(b))
-}
-function hasSkill(name) { return (editTool.value.skillNames || []).includes(name) }
-function toggleSkill(name) {
-  const t = editing.value && editing.value.tool
-  if (!t) return
-  const names = (t.skillNames || []).slice()
-  const i = names.indexOf(name)
-  if (i >= 0) names.splice(i, 1)
-  else names.push(name)
-  t.skillNames = names
-}
-// 组合后的真实后果：白名单之外 MCP / 扩展仍可能带工具，必须说清
-const editRisk = computed(() => {
-  const t = editing.value && editing.value.tool
-  if (!t) return []
-  const out = []
-  const list = t.list || []
-  if (!list.length) return ['不暴露任何工具']
-  if (list.some(n => n === 'edit' || n === 'write')) out.push('可改文件')
-  if (list.some(n => n === 'bash' || n === 'powershell')) out.push('可执行命令')
-  if (t.mcp === 'all') out.push('MCP 全部（不受白名单约束）')
-  if (t.mcp === 'servers') {
-    out.push(String(t.mcpServers || '').trim() ? 'MCP 指定（不受白名单约束）' : 'MCP 未填 server，按关闭处理')
-  }
-  if (t.ext) out.push('扩展可能自带工具')
-  return out
-})
-const editHasExec = computed(() => {
-  const t = editing.value && editing.value.tool
-  if (!t) return false
-  return (t.list || []).some(n => n === 'bash' || n === 'powershell')
-})
 function toolTitle(t) {
   if (!t) return ''
   const bits = []
@@ -902,8 +756,12 @@ function toolForSend(g) {
     skillNames: (src.skillNames || []).slice(),
   }
   if (t.skills === 'some') {
+    let pool = skills.value
+    if (g && g.cwd && (!activeGroup.value || g.cwd !== activeGroup.value.cwd) && window.piBridge && window.piBridge.listSkills) {
+      try { pool = window.piBridge.listSkills(effectiveGroupCwd(g)) || pool } catch (_) {}
+    }
     t.skillPaths = (t.skillNames || [])
-      .map(n => (skills.value.find(x => x.name === n) || {}).dir)
+      .map(n => (pool.find(x => x.name === n) || {}).dir)
       .filter(Boolean)
   } else {
     t.skillPaths = []
@@ -911,6 +769,10 @@ function toolForSend(g) {
   return t
 }
 const activePermLabel = computed(() => PRESET_LABEL[presetOf(activeGroup.value && activeGroup.value.tool)] || '自定义')
+const activeHasExec = computed(() =>
+  ((activeGroup.value && activeGroup.value.tool && activeGroup.value.tool.list) || [])
+    .some(n => n === 'bash' || n === 'powershell'))
+
 // 升级后一次性提示：工具权限默认收紧了
 function noticePermOnce() {
   try {
@@ -919,7 +781,20 @@ function noticePermOnce() {
     setTimeout(() => showToast('工具权限已默认设为「只读」，可在分组设置里放开'), 900)
   } catch (_) {}
 }
-function deleteGroup(g) {
+
+function onSaveGroup(next) {
+  const idx = groups.value.findIndex(g => g.id === next.id)
+  if (idx >= 0) groups.value.splice(idx, 1, next)
+  else groups.value.push(next)
+  saveGroups(groups.value)
+  showToast('设置已保存')
+  loadSkillsAsync()
+  detectContext()
+  files.value = []
+  if (next.id === activeId.value && engine.value === 'rpc') maybePrewarmRpc()
+}
+
+function onDeleteGroup(g) {
   if (groups.value.length <= 1) return
   const list = listSessions(g.id)
   const count = list.length
@@ -937,55 +812,20 @@ function deleteGroup(g) {
   else sessions.value = listSessions(activeId.value)
   closeSettings()
 }
-function pickCwd() {
-  if (!window.piBridge || !window.piBridge.pickFolder) return
-  const dir = window.piBridge.pickFolder()
-  if (dir && editing.value) editing.value.cwd = dir
-}
-
 </script>
 
 <template>
   <div class="app" :class="'layout-' + layout">
-    <!-- 环境未就绪：分步安装引导 -->
-    <div v-if="piStatus && !piStatus.ok" class="env-banner">
-      <div class="env-banner-head">
-        <span class="env-dot err"></span>
-        <strong>Pi 环境未就绪</strong>
-        <span class="env-sub">{{ envInfo && envInfo.errorCode === 'NODE_MISSING' ? '缺少 Node.js' : envInfo && envInfo.errorCode === 'PI_MISSING' ? '未安装 pi CLI' : '无法启动 Pi' }}</span>
-        <span class="spacer"></span>
-        <button class="mini-btn" @click="showEnvHelp = !showEnvHelp">{{ showEnvHelp ? '收起' : '如何安装' }}</button>
-        <button class="mini-btn" @click="recheckEnv"><Icon name="refresh" :size="12" />重新检测</button>
-      </div>
-      <div v-if="showEnvHelp" class="env-steps">
-        <div class="env-step" :class="{ done: envInfo && envInfo.nodePath }">
-          <div class="env-step-title">1. 安装 Node.js <b>≥ 22.19</b></div>
-          <div class="env-step-body">
-            下载：<a href="#" class="env-link" @click.prevent="openLink('https://nodejs.org')">nodejs.org<Icon name="external" :size="11" /></a>
-            <span v-if="envInfo && envInfo.nodeVersion" class="env-ok">已检测 {{ envInfo.nodeVersion }}</span>
-            <span v-else class="env-miss">未检测到</span>
-          </div>
-        </div>
-        <div class="env-step" :class="{ done: envInfo && envInfo.piPath }">
-          <div class="env-step-title">2. 安装 pi CLI</div>
-          <div class="env-step-body">
-            <code class="cmd">{{ installCmd('pi') }}</code>
-            <button class="mini-btn" @click="copyCmd(installCmd('pi'))">复制</button>
-            <span v-if="envInfo && envInfo.piVersion" class="env-ok">已安装 v{{ envInfo.piVersion }}</span>
-            <span v-else class="env-miss">未检测到</span>
-          </div>
-        </div>
-        <div class="env-step" :class="{ done: envInfo && envInfo.configs && envInfo.configs.find(c => c.name === 'auth.json' && c.exists) }">
-          <div class="env-step-title">3. 配置模型与 API 凭证</div>
-          <div class="env-step-body">
-            运行 <code class="cmd">pi</code> 进入交互界面，按提示登录/配置模型；或编辑
-            <code>{{ (envInfo && envInfo.agentDir) || '~/.pi/agent' }}</code>
-            <button class="mini-btn" @click="openPath(envInfo && envInfo.agentDir)"><Icon name="folder" :size="12" />打开目录</button>
-          </div>
-        </div>
-        <div class="env-tip">装好后点「重新检测」。若仍失败，重启 uTools 让环境变量生效。</div>
-      </div>
-    </div>
+    <EnvBanner
+      :pi-status="piStatus"
+      :env-info="envInfo"
+      :show-env-help="showEnvHelp"
+      @toggle-help="showEnvHelp = !showEnvHelp"
+      @recheck="recheckEnv"
+      @open-link="openLink"
+      @copy-cmd="copyCmd"
+      @open-path="openPath"
+    />
 
     <div class="shell">
       <!-- 经典布局：左侧栏 -->
@@ -1019,7 +859,7 @@ function pickCwd() {
           >
             <span class="history-title" role="button" tabindex="0" @click="loadSession(s.id)" @keydown.enter.prevent="loadSession(s.id)">{{ s.title }}</span>
             <span class="history-time">{{ relTime(s.updatedAt) }}</span>
-            <button class="history-del" title="删除" @click.stop="removeSession(s.id)"><Icon name="close" :size="11" /></button>
+            <button class="history-del" title="删除" aria-label="删除会话" @click.stop="removeSession(s.id)"><Icon name="close" :size="11" /></button>
           </div>
           <div v-if="!filteredSessions.length" class="history-empty">{{ sessionSearch ? '没有匹配的会话' : '暂无对话' }}</div>
         </div>
@@ -1063,7 +903,7 @@ function pickCwd() {
             <span class="meta-sep"></span>
             <span>{{ thinkReadout }}</span>
             <span class="meta-sep"></span>
-            <span class="meta-perm" :class="{ risky: (activeGroup && activeGroup.tool || {}).list && (activeGroup.tool.list || []).some(n => n === 'bash' || n === 'powershell') }" :title="toolTitle(activeGroup && activeGroup.tool)">{{ activePermLabel }}</span>
+            <span class="meta-perm" :class="{ risky: activeHasExec }" :title="toolTitle(activeGroup && activeGroup.tool)">{{ activePermLabel }}</span>
             <span class="meta-sep meta-path-sep"></span>
             <span class="meta-path" :title="displayCwd(activeGroup && activeGroup.cwd)">{{ displayCwd(activeGroup && activeGroup.cwd) }}</span>
           </span>
@@ -1072,6 +912,7 @@ function pickCwd() {
         <div ref="chatEl" class="chat">
           <TurnList
             :variant="layout"
+            :session-id="currentSession ? currentSession.id : ''"
             :visible="visibleMessages" :total="messages.length"
             :hidden-count="hiddenCount" :page-size="PAGE_SIZE"
             :running="running" :run-phase="runPhase" :usage="usageLine"
@@ -1081,325 +922,105 @@ function pickCwd() {
           />
         </div>
 
-      <!-- 输入区：命令行形态，读数与发送键同一行 -->
-      <div class="composer">
-        <div class="composer-inner">
-          <div v-if="images.length || attachedFiles.length" class="attachments">
-            <div v-for="(img, i) in images" :key="'i'+i" class="thumb">
-              <img :src="img.dataUrl" title="点击放大" @click="showPreview(img.dataUrl)" /><button class="thumb-x" @click="removeImage(i)"><Icon name="close" :size="10" :stroke="2" /></button>
+        <!-- 输入区：命令行形态，读数与发送键同一行 -->
+        <div class="composer">
+          <div class="composer-inner">
+            <div v-if="images.length || attachedFiles.length" class="attachments">
+              <div v-for="(img, i) in images" :key="'i'+i" class="thumb">
+                <img :src="img.dataUrl" alt="已粘贴图片" title="点击放大" @click="showPreview(img.dataUrl)" /><button class="thumb-x" aria-label="移除图片" @click="removeImage(i)"><Icon name="close" :size="10" :stroke="2" /></button>
+              </div>
+              <div v-for="(f, i) in attachedFiles" :key="'f'+i" class="file-chip">
+                {{ f.split(/[\\/]/).pop() }}<button class="thumb-x" aria-label="移除附件" @click="removeFile(i)"><Icon name="close" :size="10" :stroke="2" /></button>
+              </div>
             </div>
-            <div v-for="(f, i) in attachedFiles" :key="'f'+i" class="file-chip">
-              {{ f.split(/[\\/]/).pop() }}<button class="thumb-x" @click="removeFile(i)"><Icon name="close" :size="10" :stroke="2" /></button>
-            </div>
-          </div>
 
-          <div v-if="showSkillMenu" class="suggest-menu">
-            <div class="suggest-head">技能</div>
-            <button
-              v-for="(s, si) in filteredSkills" :key="s.name" class="suggest-item"
-              :class="{ active: si === menuIndex }" @click="insertSkill(s)" @mouseenter="menuIndex = si"
-            >
-              <span class="suggest-name">/skill:{{ s.name }}</span>
-              <span class="suggest-desc">{{ s.description }}</span>
-            </button>
-            <div v-if="!filteredSkills.length" class="suggest-empty">无匹配技能</div>
-          </div>
-          <div v-if="showFileMenu" class="suggest-menu">
-            <div class="suggest-head">文件<span class="suggest-path">{{ displayCwd(activeGroup && activeGroup.cwd) }}</span></div>
-            <button
-              v-for="(f, fi) in filteredFiles" :key="f.path" class="suggest-item"
-              :class="{ active: fi === menuIndex }" @click="insertFile(f)" @mouseenter="menuIndex = fi"
-            >
-              <span class="suggest-name">{{ f.dir ? '[目录] ' : '' }}{{ f.path }}</span>
-            </button>
-            <div v-if="!filteredFiles.length" class="suggest-empty">无匹配文件</div>
-          </div>
-
-          <div class="prompt-row">
-            <span class="prompt-caret">›</span>
-            <textarea
-              ref="inputEl" v-model="inputText" class="input" rows="2"
-              placeholder="给 pi 发消息，/ 技能，@ 文件"
-              @paste="onPaste" @input="onInput" @keydown="onComposerKeydown"
-            />
-          </div>
-          <div class="composer-bar">
-            <div class="readout">
-              <span class="ro ro-perm" :class="{ risky: editHasExec }" :title="toolTitle(activeGroup && activeGroup.tool)">{{ activePermLabel }}</span>
-              <span class="ro-sep"></span>
-              <span class="ro ro-model" :title="modelReadout">{{ modelReadout }}</span>
-              <span class="ro-sep"></span>
-              <span class="ro">{{ thinkReadout }}</span>
-              <span class="ro-sep ro-path-sep"></span>
-              <span class="ro ro-path" :title="displayCwd(activeGroup && activeGroup.cwd)">{{ displayCwd(activeGroup && activeGroup.cwd) }}</span>
-            </div>
-            <span class="spacer"></span>
-            <button class="sendkey" @click="toggleSendKey" title="点击切换发送键">{{ sendKeyMode === 'enter' ? 'Enter 发送' : 'Ctrl+回车 发送' }}</button>
-            <button v-if="running" class="send-btn stop" @click="cancel" title="停止"><Icon name="stop" :size="12" /></button>
-            <button v-else class="send-btn" @click="send" :disabled="!inputText.trim() && !images.length && !attachedFiles.length" title="发送"><Icon name="send" :size="14" :stroke="1.9" /></button>
-          </div>
-        </div>
-      </div>
-      </div>
-    </div>
-
-
-    <!-- 历史滑出面板 -->
-    <div v-if="showHistory" class="drawer-mask" @click.self="closeHistory">
-      <aside class="drawer" @keydown.down.prevent="moveHistory(1)" @keydown.up.prevent="moveHistory(-1)" @keydown.enter.prevent="openHistoryActive">
-        <div class="drawer-head">
-          <Icon name="search" :size="13" class="drawer-search-ico" />
-          <input ref="historySearchEl" v-model="sessionSearch" class="drawer-search" placeholder="搜索会话" />
-          <button class="icon-btn" @click="closeHistory" title="关闭"><Icon name="close" :size="12" /></button>
-        </div>
-        <div class="drawer-list">
-          <template v-for="bucket in groupedSessions" :key="bucket.label">
-            <div class="drawer-label">{{ bucket.label }}</div>
-            <div
-              v-for="s in bucket.items" :key="s.id" class="h-row" role="button" tabindex="0"
-              :class="{ active: currentSession && currentSession.id === s.id, focus: isFocusedSession(s) }"
-              @click="loadSession(s.id)" @keydown.enter.stop.prevent="loadSession(s.id)"
-            >
-              <span class="h-title">{{ s.title }}</span>
-              <span class="h-time">{{ relTime(s.updatedAt) }}</span>
-              <button class="h-del" title="删除" @click.stop="removeSession(s.id)"><Icon name="close" :size="11" /></button>
-            </div>
-          </template>
-          <div v-if="!filteredSessions.length" class="drawer-empty">{{ sessionSearch ? '没有匹配的会话' : '还没有对话' }}</div>
-        </div>
-        <div class="drawer-foot">
-          <span><kbd>↑</kbd><kbd>↓</kbd> 选择</span>
-          <span><kbd>↵</kbd> 打开</span>
-          <span><kbd>Esc</kbd> 关闭</span>
-        </div>
-      </aside>
-    </div>
-
-    <!-- 设置 -->
-    <div v-if="showSettings" class="modal-mask" @click.self="closeSettings">
-      <div class="modal" :class="{ wide: settingsTab === 'groups' && !editing }">
-        <div class="modal-head">
-          <button v-if="editing" class="back-btn" @click="editing = null" title="返回分组列表"><Icon name="back" :size="13" /></button>
-          <strong>{{ editing ? '编辑分组 · ' + (editing.name || '未命名') : '设置' }}</strong>
-          <span class="spacer"></span>
-          <button class="icon-btn" @click="closeSettings" title="关闭"><Icon name="close" :size="13" /></button>
-        </div>
-
-        <!-- 分组编辑：整窗切换，不再从长列表底部开始 -->
-        <div v-if="editing" class="group-form">
-          <label><span>分组名称</span><input v-model="editing.name" type="text" placeholder="如：代码审查" /></label>
-          <label><span>提示词（作为每次对话前缀）</span><textarea v-model="editing.prompt" rows="4" placeholder="定义该分组的角色、语气、输出格式…"></textarea></label>
-          <div class="form-grid">
-            <label>
-              <span>模型
-                <button class="refresh-link" @click="refreshModels"><Icon name="refresh" :size="11" />刷新</button>
-              </span>
-              <select v-model="editing.model">
-                <option value="">{{ defaultModelLabel() }}</option>
-                <option v-for="m in models" :key="m.display" :value="m.model">{{ m.display }}</option>
-              </select>
-              <span v-if="!models.length" class="hint">未获取到模型列表（Pi 未就绪或未配置模型）</span>
-            </label>
-            <label><span>思考强度</span>
-              <select v-model="editing.thinking">
-                <option v-for="lv in THINKING_LEVELS" :key="lv" :value="lv">{{ thinkingLabel(lv) }}</option>
-              </select>
-            </label>
-            <label><span>目标语言（翻译类分组用）</span>
-              <select v-model="editing.targetLang">
-                <option v-for="l in TARGET_LANGS" :key="l" :value="l">{{ l || '不指定' }}</option>
-              </select>
-            </label>
-          </div>
-          <label>
-            <span>工作文件夹（留空则用全局默认）</span>
-            <div class="cwd-row">
-              <input v-model="editing.cwd" type="text" :placeholder="`留空 = ${displayCwd('')}`" />
-              <button class="mini-btn" @click="pickCwd">选择</button>
-            </div>
-            <span class="hint accent">当前生效：{{ displayCwd(editing.cwd) }}{{ editing.cwd ? '' : '（默认值）' }}</span>
-          </label>
-          <div class="perm-section">
-            <div class="lean-title">工具权限</div>
-            <div class="perm-row">
+            <div v-if="showSkillMenu" class="suggest-menu">
+              <div class="suggest-head">技能</div>
               <button
-                v-for="p in PRESET_LIST" :key="p.id" class="choice"
-                :class="{ on: editPreset === p.id, risk: p.id === 'full' && editPreset === 'full' }"
-                @click="applyPreset(p.id)"
-              >{{ p.label }}</button>
-              <span v-if="editPreset === 'custom'" class="choice on custom">自定义</span>
-            </div>
-
-            <div class="tool-label">读与搜索</div>
-            <div class="tool-chips">
-              <label
-                v-for="t in TOOL_META.filter(x => !x.risk)" :key="t.id"
-                class="tool-chip" :class="{ on: hasTool(t.id) }" :title="t.note"
+                v-for="(s, si) in filteredSkills" :key="s.name" class="suggest-item"
+                :class="{ active: si === menuIndex }" @click="insertSkill(s)" @mouseenter="menuIndex = si"
               >
-                <input type="checkbox" :checked="hasTool(t.id)" @change="toggleTool(t.id)" />
-                <span>{{ t.label }}</span>
-              </label>
+                <span class="suggest-name">/skill:{{ s.name }}</span>
+                <span class="suggest-desc">{{ s.description }}</span>
+              </button>
+              <div v-if="!filteredSkills.length" class="suggest-empty">无匹配技能</div>
             </div>
-
-            <div class="tool-label">写入与执行 <small>勾选后可以改动磁盘或运行命令</small></div>
-            <div class="tool-chips">
-              <label
-                v-for="t in TOOL_META.filter(x => x.risk)" :key="t.id"
-                class="tool-chip risk" :class="{ on: hasTool(t.id) }" :title="t.note"
+            <div v-if="showFileMenu" class="suggest-menu">
+              <div class="suggest-head">文件<span class="suggest-path">{{ displayCwd(activeGroup && activeGroup.cwd) }}</span></div>
+              <button
+                v-for="(f, fi) in filteredFiles" :key="f.path" class="suggest-item"
+                :class="{ active: fi === menuIndex }" @click="insertFile(f)" @mouseenter="menuIndex = fi"
               >
-                <input type="checkbox" :checked="hasTool(t.id)" @change="toggleTool(t.id)" />
-                <span>{{ t.label }}</span>
-              </label>
+                <span class="suggest-name">{{ f.dir ? '[目录] ' : '' }}{{ f.path }}</span>
+              </button>
+              <div v-if="!filteredFiles.length" class="suggest-empty">无匹配文件</div>
             </div>
 
-            <span class="hint" :class="{ warn: editHasExec }">工具影响：{{ editRisk.join('、') }}</span>
-          </div>
-
-          <div class="ctx-section">
-            <div class="lean-title">资源与上下文</div>
-
-            <div class="seg-row">
-              <span class="seg-name">MCP</span>
-              <div class="seg">
-                <button :class="{ on: editTool.mcp === 'off' }" @click="editTool.mcp = 'off'">关</button>
-                <button :class="{ on: editTool.mcp === 'all' }" @click="editTool.mcp = 'all'">全部</button>
-                <button :class="{ on: editTool.mcp === 'servers' }" @click="editTool.mcp = 'servers'">指定</button>
+            <div class="prompt-row">
+              <span class="prompt-caret">›</span>
+              <textarea
+                ref="inputEl" v-model="inputText" class="input" rows="2"
+                placeholder="给 pi 发消息，/ 技能，@ 文件"
+                @paste="onPaste" @input="onInput" @keydown="onComposerKeydown"
+              />
+            </div>
+            <div class="composer-bar">
+              <div class="readout">
+                <span class="ro ro-perm" :class="{ risky: activeHasExec }" :title="toolTitle(activeGroup && activeGroup.tool)">{{ activePermLabel }}</span>
+                <span class="ro-sep"></span>
+                <span class="ro ro-model" :title="modelReadout">{{ modelReadout }}</span>
+                <span class="ro-sep"></span>
+                <span class="ro">{{ thinkReadout }}</span>
+                <span class="ro-sep ro-path-sep"></span>
+                <span class="ro ro-path" :title="displayCwd(activeGroup && activeGroup.cwd)">{{ displayCwd(activeGroup && activeGroup.cwd) }}</span>
               </div>
+              <span class="spacer"></span>
+              <button class="sendkey" @click="toggleSendKey" title="点击切换发送键">{{ sendKeyMode === 'enter' ? 'Enter 发送' : (isMac ? 'Cmd+回车 发送' : 'Ctrl+回车 发送') }}</button>
+              <button v-if="running" class="send-btn stop" @click="cancel" title="停止"><Icon name="stop" :size="12" /></button>
+              <button v-else class="send-btn" @click="send" :disabled="!inputText.trim() && !images.length && !attachedFiles.length" title="发送"><Icon name="send" :size="14" :stroke="1.9" /></button>
             </div>
-            <input
-              v-if="editTool.mcp === 'servers'" v-model="editTool.mcpServers" class="mini-input"
-              placeholder="server 名，逗号分隔，如 radius, github"
-            />
-
-            <div class="seg-row">
-              <span class="seg-name">技能</span>
-              <div class="seg">
-                <button :class="{ on: editTool.skills === 'off' }" @click="editTool.skills = 'off'">关</button>
-                <button :class="{ on: editTool.skills === 'all' }" @click="editTool.skills = 'all'">全部</button>
-                <button :class="{ on: editTool.skills === 'some' }" @click="editTool.skills = 'some'">指定</button>
-              </div>
-            </div>
-            <div v-if="editTool.skills === 'some'" class="skill-pick">
-              <label v-for="s in skills" :key="s.name" class="tool-chip" :class="{ on: hasSkill(s.name) }" :title="s.description">
-                <input type="checkbox" :checked="hasSkill(s.name)" @change="toggleSkill(s.name)" />
-                <span>{{ s.name }}</span>
-              </label>
-              <span v-if="!skills.length" class="hint">未检测到技能</span>
-            </div>
-
-            <label class="switch-row">
-              <span class="switch-label">扩展<small>加载 ~/.pi 扩展；扩展可自带工具</small></span>
-              <input class="switch" type="checkbox" :checked="editTool.ext" @change="editTool.ext = $event.target.checked" />
-            </label>
-            <label class="switch-row">
-              <span class="switch-label">项目规范<small>注入 AGENTS.md / CLAUDE.md</small></span>
-              <input class="switch" type="checkbox" :checked="editTool.context" @change="editTool.context = $event.target.checked" />
-            </label>
-            <label class="switch-row">
-              <span class="switch-label">提示词模板<small>加载 prompt templates</small></span>
-              <input class="switch" type="checkbox" :checked="editTool.templates" @change="editTool.templates = $event.target.checked" />
-            </label>
-            <label class="switch-row">
-              <span class="switch-label">项目级 .pi 配置<small>项目扩展 / 项目 MCP / 项目技能</small></span>
-              <input class="switch" type="checkbox" :checked="editTool.trust" @change="editTool.trust = $event.target.checked" />
-            </label>
-            <span class="hint">全局 ~/.pi 配置始终生效；项目级配置需要信任，非交互模式不会弹窗</span>
-            <div v-if="contextFiles.length" class="ctx-info">
-              检测到规范文件：
-              <div v-for="c in contextFiles" :key="c.path" class="ctx-row">
-                <span class="ctx-tag">{{ ctxLabel(c) }}</span>{{ c.path }} · {{ fmtSize(c.size) }}
-              </div>
-            </div>
-            <div v-else class="ctx-info muted">未检测到 AGENTS.md / CLAUDE.md</div>
-          </div>
-          <div class="form-actions">
-            <button v-if="groups.length > 1" class="danger-link" @click="deleteGroup(editing)"><Icon name="trash" :size="12" />删除这个分组</button>
-            <span class="spacer"></span>
-            <button class="mini-btn" @click="editing = null">取消</button>
-            <button class="primary-btn" @click="saveGroup">保存</button>
           </div>
         </div>
-
-        <template v-else>
-          <div class="tabs">
-            <button
-              v-for="t in SETTINGS_TABS" :key="t.id" class="tab sub"
-              :class="{ active: settingsTab === t.id }" @click="settingsTab = t.id"
-            >{{ t.label }}</button>
-          </div>
-
-          <div v-if="settingsTab === 'general'" class="pane">
-            <div class="field-label">界面布局</div>
-            <div class="engine-row">
-              <button class="layout-opt" :class="{ on: layout === 'classic' }" @click="setLayout('classic')">
-                <span>经典<small>左侧栏 + 对话气泡</small></span>
-              </button>
-              <button class="layout-opt" :class="{ on: layout === 'console' }" @click="setLayout('console')">
-                <span>控制台<small>顶栏分组 + 转录式对话</small></span>
-              </button>
-            </div>
-            <div class="field-label">运行引擎</div>
-            <div class="engine-row">
-              <label class="engine-opt">
-                <input type="radio" name="engine" value="json" :checked="engine === 'json'" @change="setEngine('json')" />
-                <span>单次调用 <small>稳定，每次启动约 1.5s；上下文由 pi 落盘，可跨次续接</small></span>
-              </label>
-              <label class="engine-opt">
-                <input type="radio" name="engine" value="rpc" :checked="engine === 'rpc'" @change="setEngine('rpc')" />
-                <span>长驻预热 <small>更快，打开即预热；上下文仅存内存，进程回收或切换会话后从新开始</small></span>
-              </label>
-            </div>
-            <div class="field-label">默认工作目录</div>
-            <div class="cwd-row">
-              <input :value="defaultCwd" type="text" placeholder="留空 = MyPiDeck（用户主目录下）" @change="commitDefaultCwd($event.target.value)" />
-              <button class="mini-btn" @click="pickDefaultCwd">选择</button>
-              <button v-if="defaultCwd" class="mini-btn" @click="setDefaultCwd('')">清除</button>
-            </div>
-            <span class="hint accent">分组未单独设置时使用：{{ displayCwd('') }}</span>
-            <div class="field-label">发送后</div>
-            <div class="engine-row">
-              <button class="choice" :class="{ on: sendKeyMode === 'enter' }" @click="setSendKeyMode('enter')">Enter 发送</button>
-              <button class="choice" :class="{ on: sendKeyMode === 'ctrl' }" @click="setSendKeyMode('ctrl')">Ctrl+回车 发送</button>
-            </div>
-          </div>
-
-          <div v-else-if="settingsTab === 'groups'" class="pane">
-            <button v-for="g in groups" :key="g.id" class="g-row" @click="editGroup(g)">
-              <span class="g-name">{{ g.name }}</span>
-              <span class="g-sum">
-                <span v-for="(p, pi) in groupSummary(g)" :key="pi" class="sum-i">{{ p }}</span>
-              </span>
-              <Icon name="chevron" :size="12" class="g-chev" />
-            </button>
-            <button class="add-row" @click="addGroup"><Icon name="plus" :size="12" />新建分组</button>
-          </div>
-
-          <div v-else class="pane">
-            <div v-if="envInfo && envInfo.ok" class="env-grid">
-              <div class="env-row"><span>Node</span><code>{{ envInfo.nodeVersion || '—' }}</code></div>
-              <div class="env-row"><span>pi CLI</span><code>{{ envInfo.piVersion ? 'v' + envInfo.piVersion : '—' }}</code></div>
-              <div class="env-row"><span>默认模型</span><code>{{ envInfo.defaultModel || '—' }}</code></div>
-              <div class="env-row"><span>默认思考</span><code>{{ envInfo.defaultThinking || '—' }}</code></div>
-              <div class="env-row"><span>pi 路径</span><code class="path" :title="envInfo.piPath">{{ envInfo.piPath }}</code></div>
-            </div>
-            <div v-else class="env-warn">未检测到可用的 Pi 环境。点顶部提示按步骤安装。</div>
-            <div class="env-configs">
-              <div v-for="c in (envInfo && envInfo.configs) || []" :key="c.name" class="env-config-row">
-                <span class="env-config-name">{{ c.name }}</span>
-                <span class="env-config-label">{{ c.label }}</span>
-                <span class="spacer"></span>
-                <span class="env-config-state" :class="c.exists ? 'on' : 'off'">{{ c.exists ? fmtSize(c.size) : '未创建' }}</span>
-                <button class="mini-btn icon-only" :disabled="!c.exists" @click="openPath(c.path)" title="在文件管理器中定位"><Icon name="external" :size="12" /></button>
-              </div>
-            </div>
-            <div class="env-actions">
-              <button class="mini-btn" @click="openPath(envInfo && envInfo.agentDir)"><Icon name="folder" :size="12" />打开配置目录</button>
-              <button class="mini-btn" @click="recheckEnv"><Icon name="refresh" :size="12" />重新检测</button>
-            </div>
-          </div>
-        </template>
       </div>
     </div>
+
+    <HistoryDrawer
+      :show="showHistory"
+      :sessions="sessions"
+      :current-session-id="currentSession ? currentSession.id : ''"
+      @close="closeHistory"
+      @select="loadSession"
+      @remove="removeSession"
+    />
+
+    <SettingsModal
+      ref="settingsModalEl"
+      :show="showSettings"
+      :groups="groups"
+      :models="models"
+      :skills="skills"
+      :defaults="defaults"
+      :env-info="envInfo"
+      :engine="engine"
+      :layout="layout"
+      :default-cwd="defaultCwd"
+      :send-key-mode="sendKeyMode"
+      :is-mac="isMac"
+      :display-cwd="displayCwd"
+      :fmt-size="fmtSize"
+      @close="closeSettings"
+      @set-layout="setLayout"
+      @set-engine="setEngine"
+      @commit-default-cwd="commitDefaultCwd"
+      @set-default-cwd="setDefaultCwd"
+      @pick-default-cwd="pickDefaultCwd"
+      @set-send-key-mode="setSendKeyMode"
+      @save-group="onSaveGroup"
+      @delete-group="onDeleteGroup"
+      @refresh-models="refreshModels"
+      @open-path="openPath"
+      @recheck-env="recheckEnv"
+    />
 
     <!-- 图片放大预览 -->
     <div v-if="previewImage" class="lightbox" @click.self="closePreview">

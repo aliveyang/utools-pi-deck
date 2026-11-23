@@ -136,40 +136,49 @@ function saveTextFile(name, content) {
   return { ok: false, unsupported: true }
 }
 
-// 用系统浏览器打开外链（uTools 内 target=_blank 常被拦）
+// 用系统浏览器打开外链（uTools 内 target=_blank 常被拦，仅允许 http/https）
 function openExternal(url) {
+  const s = String(url || '').trim()
+  if (!/^https?:\/\//i.test(s)) return false
   try {
-    if (window.utools && window.utools.shellOpenExternal) { window.utools.shellOpenExternal(url); return true }
-    if (window.utools && window.utools.shellOpenPath) { window.utools.shellOpenPath(url); return true }
+    if (window.utools && window.utools.shellOpenExternal) { window.utools.shellOpenExternal(s); return true }
+    if (window.utools && window.utools.shellOpenPath) { window.utools.shellOpenPath(s); return true }
   } catch (_) {}
   return false
 }
 
 // ---------- Pi 调用 ----------
 let currentChild = null
+let activeRpcCancel = null
 
 function run(opts, handlers) {
-  if (currentChild) throw new Error('已有任务运行中，请先取消')
-  // 禁工具的纯文本分组：必须替换 system prompt，否则模型输出原始工具调用标记
-  if (core.permFlags(opts.perm, opts).noTools && !opts.systemPrompt) opts = { ...opts, systemPrompt: core.LEAN_SYSTEM_PROMPT }
+  if (currentChild || activeRpcCancel) throw new Error('已有任务运行中，请先取消')
+  // 禁工具且未开 MCP/扩展的纯文本分组：替换 system prompt，避免模型输出原始工具调用标记
+  opts = core.applyLeanSystemPrompt(opts)
   const cfg = loadConfig()
-  // RPC 引擎：已预热则走长驻进程（零冷启动）；否则回退 JSON 模式并懒预热供后续消息使用
-  if (cfg.engine === 'rpc' && rpcEngine) {
+  // RPC 引擎：已预热且无非图片附件时走长驻进程；否则回退 JSON 模式并懒预热
+  const canRpc = !(rpcEngine && rpcEngine.hasNonImageFiles && rpcEngine.hasNonImageFiles(opts.files))
+  if (cfg.engine === 'rpc' && rpcEngine && canRpc) {
     if (!rpcEngine.isReady(opts.cwd, opts)) {
       // 懒预热：本条回退 JSON，后台建立长驻进程，下一条消息起零冷启动
       try { rpcEngine.prewarm(opts.cwd, opts).catch(() => {}) } catch (_) {}
     } else {
-      let rpcHandle
       try {
+        const clearActive = () => { if (activeRpcCancel === doCancel) activeRpcCancel = null }
+        let rpcHandle = null
+        const doCancel = () => {
+          clearActive()
+          if (rpcHandle && rpcHandle.cancel) rpcHandle.cancel()
+        }
+        activeRpcCancel = doCancel
         rpcHandle = rpcEngine.prompt(opts.cwd, opts, {
           ...handlers,
-          onDone: payload => { handlers.onDone && handlers.onDone(payload) },
+          onDone: payload => { clearActive(); handlers.onDone && handlers.onDone(payload) },
+          onError: msg => { clearActive(); handlers.onError && handlers.onError(msg) },
         })
-        return {
-          cancel: () => { if (rpcHandle && rpcHandle.cancel) rpcHandle.cancel() },
-          mode: 'rpc',
-        }
+        return { cancel: doCancel, mode: 'rpc' }
       } catch (_) {
+        activeRpcCancel = null
         // RPC 不可用，静默回退 JSON
       }
     }
@@ -233,7 +242,9 @@ function run(opts, handlers) {
   // watchdog：15 分钟无结束则强杀
   const timer = setTimeout(() => {
     if (!settled) {
+      settled = true
       aborted = true
+      release()
       try { child.kill() } catch (_) {}
       handlers.onError && handlers.onError('pi 运行超时（15 分钟），已终止')
     }
@@ -252,6 +263,11 @@ function run(opts, handlers) {
 }
 
 function cancel() {
+  if (activeRpcCancel) {
+    const fn = activeRpcCancel
+    activeRpcCancel = null
+    try { fn(); return true } catch (_) { return false }
+  }
   if (!currentChild) return false
   const child = currentChild
   // 立即释放引用：kill 到 close 有延迟，期间用户再发送会被误判为"任务运行中"
@@ -275,13 +291,7 @@ function listModelsAsync() {
     const { node, cli } = resolvePi()
     execFile(node, [cli, '--list-models'], { windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
       if (err) return reject(err)
-      const out = []
-      for (const line of stdout.split(/\r?\n/)) {
-        if (!line.trim() || /^provider\s+model/i.test(line)) continue
-        const parts = line.trim().split(/\s{2,}|\s+/)
-        if (parts.length >= 2) out.push({ provider: parts[0], model: parts[1], display: `${parts[0]}/${parts[1]}` })
-      }
-      resolve(out)
+      resolve(core.parseModelsOutput(stdout))
     })
   })
 }
@@ -325,8 +335,7 @@ window.piBridge = {
   setConfig: patch => saveConfig(patch),
   prewarmRpc: (cwd, flags) => {
     if (!rpcEngine) return Promise.resolve(false)
-    const f = flags || {}
-    return rpcEngine.prewarm(cwd, core.permFlags(f.perm, f).noTools && !f.systemPrompt ? { ...f, systemPrompt: core.LEAN_SYSTEM_PROMPT } : f)
+    return rpcEngine.prewarm(cwd, core.applyLeanSystemPrompt(flags || {}))
   },
   stopRpc: () => (rpcEngine ? rpcEngine.stop() : null),
   resolvePi: () => {

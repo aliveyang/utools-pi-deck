@@ -1,10 +1,9 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { piDevApi } from './dev-server-plugin.mjs'
-import { copyFileSync, mkdirSync } from 'node:fs'
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { readFileSync, writeFileSync } from 'node:fs'
 
 const ROOT = dirname(fileURLToPath(import.meta.url))
 
@@ -60,5 +59,10 @@ export default defineConfig({
     modulePreload: false,   // 避免 polyfill 内联的 <script> 字符串破坏内联
     cssCodeSplit: false,
     assetsInlineLimit: 100000000,
+    rolldownOptions: {
+      output: {
+        format: 'iife',
+      },
+    },
   },
 })

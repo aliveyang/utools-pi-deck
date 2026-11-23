@@ -74,6 +74,13 @@ describe('旧数据迁移与索引重建', () => {
     write(IDX_KEY, 'garbage')
     expect(listSessions().map(s => s.id)).toContain(a.id)
   })
+
+  it('空索引 [] 直接返回空数组，不重复触发扫描重建', () => {
+    write(IDX_KEY, [])
+    // 即使存在孤立项，空数组表示合法无记录状态，不应每次列表扫描触发重建
+    write(ITEM_PREFIX + 'orphan-1', { id: 'orphan-1', groupId: 'chat', title: '孤立', messages: [] })
+    expect(listSessions()).toEqual([])
+  })
 })
 
 describe('辅助函数', () => {
@@ -83,11 +90,11 @@ describe('辅助函数', () => {
     expect(titleFromText('  \n ')).toBe('新对话')
   })
 
-  it('exportMarkdown：用户/AI 分节、图片计数、错误行', () => {
+  it('exportMarkdown：用户/AI 分节、图片计数、非图片附件、错误行', () => {
     const md = exportMarkdown({
       title: '测试',
       messages: [
-        { role: 'user', text: '问题', imageCount: 2 },
+        { role: 'user', text: '问题', imageCount: 2, fileNames: ['a.md', 'b.pdf'] },
         { role: 'assistant', text: '回答' },
         { role: 'assistant', text: '', error: '超时' },
       ],
@@ -95,6 +102,7 @@ describe('辅助函数', () => {
     expect(md).toContain('# 测试')
     expect(md).toContain('## 用户')
     expect(md).toContain('> 2 张图片')
+    expect(md).toContain('> 附件：a.md、b.pdf')
     expect(md).toContain('## Pi')
     expect(md).toContain('回答')
     expect(md).toContain('> 错误：超时')

@@ -74,10 +74,10 @@ function rebuildIndex() {
 
 function readIndex() {
   const arr = read(IDX_KEY, null)
-  if (Array.isArray(arr) && arr.length) return arr
+  if (Array.isArray(arr)) return arr
   const migrated = migrateLegacy()
   if (migrated.length) return migrated
-  // 索引空/不可读：磁盘若还有会话则重建，避免会话"集体消失"
+  // 索引不存在/损坏：磁盘若还有会话则重建，避免会话"集体消失"
   return rebuildIndex()
 }
 function writeIndex(idx) { write(IDX_KEY, idx) }
@@ -152,6 +152,18 @@ export function titleFromText(text) {
   return clean ? clean.slice(0, 24) + (clean.length > 24 ? '…' : '') : '新对话'
 }
 
+export function relTime(ts) {
+  if (!ts) return ''
+  const diff = Date.now() - ts
+  if (diff < 60000) return '刚刚'
+  if (diff < 3600000) return `${Math.floor(diff / 60000)} 分钟前`
+  const now = new Date(), t = new Date(ts)
+  if (now.toDateString() === t.toDateString()) return `${Math.floor(diff / 3600000)} 小时前`
+  const y = new Date(now.getTime() - 86400000)
+  if (y.toDateString() === t.toDateString()) return '昨天'
+  return `${t.getMonth() + 1} 月 ${t.getDate()} 日`
+}
+
 export function exportMarkdown(session) {
   if (!session) return ''
   const lines = [`# ${session.title}`, '']
@@ -160,6 +172,7 @@ export function exportMarkdown(session) {
       lines.push('## 用户', '', m.text || '(图片)', '')
       if (m.imageCount) lines.push(`> ${m.imageCount} 张图片`, '')
       else if (m.images && m.images.length) lines.push(`> ${m.images.length} 张图片`, '')
+      if (m.fileNames && m.fileNames.length) lines.push(`> 附件：${m.fileNames.join('、')}`, '')
     } else {
       lines.push('## Pi', '')
       if (m.text) lines.push(m.text, '')

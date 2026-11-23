@@ -29,9 +29,17 @@ describe('formatText XSS 防护', () => {
 })
 
 describe('formatText 渲染规则', () => {
-  it('代码块内容不被行内规则改写，保留换行', () => {
+  it('代码块内容不被行内规则改写，保留换行并剥离围栏语言名', () => {
     const out = formatText('```\n<b> **bold** </b>\n```')
-    expect(out).toBe('<pre><code>\n&lt;b&gt; **bold** &lt;/b&gt;\n</code></pre>')
+    expect(out).toBe('<pre><code>&lt;b&gt; **bold** &lt;/b&gt;\n</code></pre>')
+
+    const withLang = formatText('```js\nconst a = 1\n```')
+    expect(withLang).toBe('<pre><code>const a = 1\n</code></pre>')
+  })
+
+  it('列表紧跟标题时正常渲染标题', () => {
+    const out = formatText('- a\n- b\n## 标题')
+    expect(out).toBe('<ul><li>a</li><li>b</li></ul><h2>标题</h2>')
   })
 
   it('行内代码内的加粗/链接标记不被二次渲染', () => {

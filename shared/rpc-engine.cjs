@@ -1,229 +1,300 @@
-// RPC 长驻引擎：按 cwd 维护 pi --mode rpc 子进程，预热后发送零冷启动
-// 失败/不存活时由调用方回退 JSON 模式
-const { spawn } = require('node:child_process')
+// RPC 长驻引擎：按 cwd + 权限 + systemPrompt 维护 pi --mode rpc 子进程，预热后发送零冷启动
+// 失败/不存活/含非图片附件时由调用方回退 JSON 模式
+const childProcess = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
-const core = require('./pi-core.cjs')
+const defaultCore = require('./pi-core.cjs')
 
-const processes = new Map()   // key -> { child, buf, decoder, pending, alive, ready }
-let seq = 0
-const IDLE_TTL = 10 * 60 * 1000
-const MAX_PROCS = 3           // 最多同时保留 3 个长驻进程，超出淘汰最久未用
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'avif'])
 
-// 超出上限时淘汰最久未使用的进程，避免内存无限增长
-function evictOverflow() {
-  while (processes.size > MAX_PROCS) {
-    let oldestKey = null, oldest = Infinity
-    for (const [k, e] of processes) {
-      if (!e.lastUsed || e.lastUsed < oldest) { oldest = e.lastUsed || 0; oldestKey = k }
-    }
-    if (!oldestKey) break
-    const e = processes.get(oldestKey)
-    try { e.child.stdin.end() } catch (_) {}
-    setTimeout(() => { try { e.child.kill() } catch (_) {} }, 3000)
-    processes.delete(oldestKey)
-  }
+function isImageFile(f) {
+  if (typeof f !== 'string' || !f) return false
+  if (/^data:image\//i.test(f)) return true
+  const m = /\.([a-zA-Z0-9]+)$/.exec(f)
+  return !!(m && IMAGE_EXTS.has(m[1].toLowerCase()))
 }
 
-function getEntry(cwd) {
-  let e = processes.get(cwd)
-  if (e && e.alive) { e.lastUsed = Date.now(); return e }
-  if (e && !e.alive) processes.delete(cwd)
-  return null
+function hasNonImageFiles(files) {
+  return Array.isArray(files) && files.some(f => f && !isImageFile(f))
 }
 
-// 启动/复用一个 cwd 对应的 RPC 进程（按 cwd + 上下文精简配置区分）
-function ensure(cwd, flags) {
-  const f = flags || {}
-  const key = keyOf(cwd, f)
-  const existing = getEntry(key)
-  if (existing) return Promise.resolve(existing)
-  const { node, cli } = core.resolvePi()
-  const args = [cli, '--mode', 'rpc', '--no-session']
-  args.push(...core.buildPermArgs(f.tool, f))
-  if (f.systemPrompt) args.push('--system-prompt', f.systemPrompt)
-  const child = spawn(node, args, {
-    cwd: core.effectiveCwd(cwd), windowsHide: true,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
-  const e = {
-    child, cwd: key, alive: true, ready: false, lastUsed: Date.now(),
-    sessionId: '',   // 当前进程内对话所属的 PiDeck 会话（用于切换时隔离上下文）
-    buf: '', decoder: new StringDecoder('utf8'),
-    pending: new Map(), listeners: new Set(),
-  }
-  processes.set(key, e)
-  evictOverflow()
+function createRpcEngine(deps = {}) {
+  const spawn = deps.spawn || childProcess.spawn
+  const core = deps.core || defaultCore
+  const IDLE_TTL = deps.idleTtl ?? (10 * 60 * 1000)
+  const MAX_PROCS = deps.maxProcs ?? 3
+  const CLEANUP_INTERVAL = deps.cleanupInterval ?? (60 * 1000)
 
-  const handle = rec => {
-    if (rec.type === 'response' && rec.id && e.pending.has(rec.id)) {
-      const { resolve, reject } = e.pending.get(rec.id)
-      e.pending.delete(rec.id)
-      rec.success === false ? reject(new Error(rec.error || 'RPC 命令失败')) : resolve(rec.data)
-      return
-    }
-    for (const l of e.listeners) { try { l(rec) } catch (_) {} }
-  }
-  child.stdout.on('data', chunk => {
-    e.buf += e.decoder.write(chunk)
-    let nl
-    while ((nl = e.buf.indexOf('\n')) !== -1) {
-      let line = e.buf.slice(0, nl); e.buf = e.buf.slice(nl + 1)
-      if (line.endsWith('\r')) line = line.slice(0, -1)
-      if (!line.trim()) continue
-      let rec; try { rec = JSON.parse(line) } catch (_) { continue }
-      handle(rec)
-    }
-  })
-  child.stderr.on('data', () => {})
-  const die = () => {
-    e.alive = false; e.ready = false
-    // 仅当 map 里还是本条目时才移除：延迟 kill 期间同 key 可能已重建新进程
-    if (processes.get(key) === e) processes.delete(key)
-    // 挂起中的 RPC 命令立即拒绝，不等 60s 超时；监听器一并清理
-    for (const p of e.pending.values()) { try { p.reject(new Error('RPC 进程已退出')) } catch (_) {} }
-    e.pending.clear()
-    e.listeners.clear()
-  }
-  child.on('error', die)
-  child.on('exit', die)
+  const processes = new Map() // key -> entry
+  let seq = 0
 
-  // get_state 探测就绪
-  return send(e, { type: 'get_state' }).then(() => { e.ready = true; return e })
-}
-
-function send(e, cmdObj) {
-  if (!e.alive) return Promise.reject(new Error('RPC 进程已退出'))
-  const id = cmdObj.id || ('r' + (++seq))
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { e.pending.delete(id); reject(new Error('RPC 命令超时')) }, 60000)
-    e.pending.set(id, {
-      resolve: d => { clearTimeout(timer); resolve(d) },
-      reject: err => { clearTimeout(timer); reject(err) },
-    })
-    e.child.stdin.write(JSON.stringify({ ...cmdObj, id }) + '\n')
-  })
-}
-
-// 发送 prompt，事件通过 handlers 回调等价格式（与 JSON 模式一致）
-function prompt(cwd, opts, handlers) {
-  const key = keyOf(cwd, opts)
-  let entry
-  try { entry = getEntry(key) } catch (_) { return Promise.reject(new Error('RPC 未预热')) }
-  if (!entry) return Promise.reject(new Error('RPC 未预热'))
-
-  const applyCfg = async () => {
-    // PiDeck 会话切换时先重置进程内对话（实测 pi RPC 进程内多轮共享上下文，
-    // 不隔离会导致不同会话互相串上下文）；进程回收后上下文不续接，由设置页披露
-    // 重置失败不吞错：隔离无法保证时不应发送 prompt，直接走 onError（下次 prompt 会重试）
-    if ((entry.sessionId || '') !== (opts.sessionId || '')) {
-      await send(entry, { type: 'new_session' })
-      entry.sessionId = opts.sessionId || ''
-    }
-    if (opts.model) await send(entry, { type: 'set_model', model: opts.model }).catch(() => {})
-    if (opts.thinking) await send(entry, { type: 'set_thinking_level', level: opts.thinking }).catch(() => {})
+  function isBusy(e) {
+    return !!(e && (e.listeners.size > 0 || e.pending.size > 0))
   }
 
-  let aborted = false
-  let settled = false
-  const finish = payload => {
-    if (settled) return
-    settled = true
-    clearTimeout(watchdog)
-    entry.listeners.delete(listener)
-    handlers.onDone && handlers.onDone(payload)
-  }
-  const listener = rec => {
-    const settled = core.mapPiEvent(rec, handlers)
-    if (settled && !aborted) finish({ aborted: false })
-  }
-  entry.listeners.add(listener)
-
-  // 与 JSON 模式一致的 15 分钟看门狗：防止 RPC 卡死导致界面永远"运行中"
-  const watchdog = setTimeout(() => {
-    if (settled) return
-    aborted = true
-    entry.listeners.delete(listener)
-    settled = true
-    send(entry, { type: 'abort' }).catch(() => {})
-    handlers.onError && handlers.onError('运行超时（15 分钟），已中止')
-  }, 15 * 60 * 1000)
-
-  // 图片：RPC 不支持 @file，用 images 字段
-  const images = []
-  for (const f of (opts.files || [])) {
-    try {
-      if (f.startsWith('data:')) {
-        const m = /^data:image\/([a-zA-Z0-9+.-]+);base64,(.*)$/s.exec(f)
-        if (m) images.push({ type: 'image', data: m[2], mimeType: 'image/' + m[1] })
-      } else {
-        const data = core.fs.readFileSync(f)
-        const ext = core.path.extname(f).slice(1).toLowerCase()
-        images.push({ type: 'image', data: data.toString('base64'), mimeType: 'image/' + (ext === 'jpg' ? 'jpeg' : ext || 'png') })
+  // 超出上限时只淘汰空闲且最久未使用的进程，避免误杀正在运行中的任务或刚创建的条目
+  function evictOverflow(keepKey) {
+    while (processes.size > MAX_PROCS) {
+      let oldestKey = null, oldest = Infinity
+      for (const [k, e] of processes) {
+        if (k === keepKey || isBusy(e)) continue
+        if (!e.lastUsed || e.lastUsed < oldest) { oldest = e.lastUsed || 0; oldestKey = k }
       }
-    } catch (_) {}
-  }
-
-  applyCfg()
-    .then(() => send(entry, { type: 'prompt', message: opts.prompt || '', images }))
-    .then(() => {})
-    .catch(err => {
-      entry.listeners.delete(listener)
-      clearTimeout(watchdog)
-      handlers.onError && handlers.onError(String(err.message || err))
-    })
-
-  // 进程中途退出：立即报错收口，不等 15 分钟 watchdog
-  const onExit = () => {
-    if (!settled) {
-      settled = true
-      clearTimeout(watchdog)
-      entry.listeners.delete(listener)
-      handlers.onError && handlers.onError('RPC 进程已退出，本次回答中断')
+      if (!oldestKey) break
+      const e = processes.get(oldestKey)
+      try { e.child.stdin.end() } catch (_) {}
+      setTimeout(() => { try { e.child.kill() } catch (_) {} }, 3000)
+      processes.delete(oldestKey)
     }
   }
-  entry.child.once('exit', onExit)
 
-  return {
-    cancel: () => {
+  function getEntry(key) {
+    const e = processes.get(key)
+    if (e && e.alive) { e.lastUsed = Date.now(); return e }
+    if (e && !e.alive) processes.delete(key)
+    return null
+  }
+
+  function keyOf(cwd, flags) {
+    const f = flags || {}
+    return [core.effectiveCwd(cwd), core.buildPermArgs(f.tool, f).join('\0'), f.systemPrompt || ''].join('\x1f')
+  }
+
+  function send(e, cmdObj) {
+    if (!e.alive) return Promise.reject(new Error('RPC 进程已退出'))
+    const id = cmdObj.id || ('r' + (++seq))
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { e.pending.delete(id); reject(new Error('RPC 命令超时')) }, 60000)
+      e.pending.set(id, {
+        resolve: d => { clearTimeout(timer); resolve(d) },
+        reject: err => { clearTimeout(timer); reject(err) },
+      })
+      try {
+        e.child.stdin.write(JSON.stringify({ ...cmdObj, id }) + '\n')
+      } catch (err) {
+        clearTimeout(timer)
+        e.pending.delete(id)
+        reject(err)
+      }
+    })
+  }
+
+  // 启动/复用一个 key 对应的 RPC 进程；并发调用复用同一 readyPromise
+  function ensure(cwd, flags) {
+    const f = flags || {}
+    const key = keyOf(cwd, f)
+    const existing = getEntry(key)
+    if (existing) return existing.readyPromise
+    const { node, cli } = core.resolvePi()
+    const args = [cli, '--mode', 'rpc', '--no-session']
+    args.push(...core.buildPermArgs(f.tool, f))
+    if (f.systemPrompt) args.push('--system-prompt', f.systemPrompt)
+    const child = spawn(node, args, {
+      cwd: core.effectiveCwd(cwd), windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    const e = {
+      child, key, alive: true, ready: false, lastUsed: Date.now(),
+      sessionId: '',
+      defaultModel: '', defaultThinking: '',
+      curModel: '', curThinking: '',
+      buf: '', decoder: new StringDecoder('utf8'),
+      pending: new Map(), listeners: new Set(),
+      readyPromise: null,
+    }
+    processes.set(key, e)
+    evictOverflow(key)
+
+    const handle = rec => {
+      if (rec.type === 'response' && rec.id && e.pending.has(rec.id)) {
+        const { resolve, reject } = e.pending.get(rec.id)
+        e.pending.delete(rec.id)
+        rec.success === false ? reject(new Error(rec.error || 'RPC 命令失败')) : resolve(rec.data)
+        return
+      }
+      for (const l of e.listeners) { try { l(rec) } catch (_) {} }
+    }
+    child.stdout.on('data', chunk => {
+      e.buf += e.decoder.write(chunk)
+      let nl
+      while ((nl = e.buf.indexOf('\n')) !== -1) {
+        let line = e.buf.slice(0, nl); e.buf = e.buf.slice(nl + 1)
+        if (line.endsWith('\r')) line = line.slice(0, -1)
+        if (!line.trim()) continue
+        let rec; try { rec = JSON.parse(line) } catch (_) { continue }
+        handle(rec)
+      }
+    })
+    child.stderr.on('data', () => {})
+    const die = () => {
+      e.alive = false; e.ready = false
+      // 仅当 map 里还是本条目时才移除：延迟 kill 期间同 key 可能已重建新进程
+      if (processes.get(key) === e) processes.delete(key)
+      // 挂起中的 RPC 命令立即拒绝，不等 60s 超时；监听器一并清理
+      for (const p of e.pending.values()) { try { p.reject(new Error('RPC 进程已退出')) } catch (_) {} }
+      e.pending.clear()
+      e.listeners.clear()
+    }
+    child.on('error', die)
+    child.on('exit', die)
+
+    // get_state 探测就绪并记录默认模型/思考强度，便于切换回默认分组时复位
+    e.readyPromise = send(e, { type: 'get_state' }).then(d => {
+      const state = d || {}
+      e.defaultModel = (state.model && state.model.id) || ''
+      e.defaultThinking = state.thinkingLevel || ''
+      e.curModel = e.defaultModel
+      e.curThinking = e.defaultThinking
+      e.ready = true
+      return e
+    })
+    // 防止无人 await 时触发 unhandledRejection
+    e.readyPromise.catch(() => {})
+    return e.readyPromise
+  }
+
+  // 发送 prompt，事件通过 handlers 回调等价格式（与 JSON 模式一致）
+  // 前置条件不满足时同步抛错，确保调用方 try/catch 可立即回退 JSON 模式
+  function prompt(cwd, opts, handlers) {
+    const o = opts || {}
+    const h = handlers || {}
+    if (hasNonImageFiles(o.files)) throw new Error('RPC 模式不支持非图片文件')
+    const key = keyOf(cwd, o)
+    const entry = getEntry(key)
+    if (!entry || !entry.alive || !entry.ready) throw new Error('RPC 未预热')
+    if (isBusy(entry)) throw new Error('RPC 进程忙碌中')
+
+    const applyCfg = async () => {
+      // PiDeck 会话切换时先重置进程内对话；未传 sessionId 时也强制重置防止串上下文
+      if (!o.sessionId || (entry.sessionId || '') !== (o.sessionId || '')) {
+        await send(entry, { type: 'new_session' })
+        entry.sessionId = o.sessionId || ''
+      }
+      const wantModel = o.model || entry.defaultModel
+      if (wantModel && wantModel !== entry.curModel) {
+        await send(entry, { type: 'set_model', model: wantModel })
+          .then(() => { entry.curModel = wantModel })
+          .catch(() => {})
+      }
+      const wantThinking = o.thinking || entry.defaultThinking
+      if (wantThinking && wantThinking !== entry.curThinking) {
+        await send(entry, { type: 'set_thinking_level', level: wantThinking })
+          .then(() => { entry.curThinking = wantThinking })
+          .catch(() => {})
+      }
+    }
+
+    let aborted = false
+    let settled = false
+
+    const cleanup = () => {
+      clearTimeout(watchdog)
+      entry.listeners.delete(listener)
+      if (entry.child.off) entry.child.off('exit', onExit)
+      else if (entry.child.removeListener) entry.child.removeListener('exit', onExit)
+      entry.lastUsed = Date.now()
+    }
+    const finish = payload => {
+      if (settled) return
+      settled = true
+      cleanup()
+      h.onDone && h.onDone(payload)
+    }
+    const fail = msg => {
+      if (settled) return
+      settled = true
+      cleanup()
+      h.onError && h.onError(msg)
+    }
+
+    const listener = rec => {
+      const done = core.mapPiEvent(rec, h)
+      if (done && !aborted) finish({ aborted: false })
+    }
+    entry.listeners.add(listener)
+
+    // 与 JSON 模式一致的 15 分钟看门狗：防止 RPC 卡死导致界面永远"运行中"
+    const watchdog = setTimeout(() => {
+      if (settled) return
       aborted = true
       send(entry, { type: 'abort' }).catch(() => {})
-      finish({ aborted: true })
-    },
-  }
-}
+      fail('运行超时（15 分钟），已中止')
+    }, 15 * 60 * 1000)
 
-function keyOf(cwd, flags) {
-  const f = flags || {}
-  return core.effectiveCwd(cwd) + '|' + [
-    f.perm || '', f.tool ? JSON.stringify(f.tool) : '', f.systemPrompt ? 'sp' : '',
-  ].join('')
-}
-function prewarm(cwd, flags) {
-  return ensure(cwd, flags).then(() => true).catch(() => false)
-}
-function isReady(cwd, flags) {
-  const e = getEntry(keyOf(cwd, flags))
-  return !!(e && e.alive && e.ready)
-}
-function stop() {
-  for (const [cwd, e] of processes) {
-    try { e.child.stdin.end() } catch (_) {}
-    setTimeout(() => { try { e.child.kill() } catch (_) {} }, 3000)
-  }
-  processes.clear()
-}
-function cleanupIdle() {
-  const now = Date.now()
-  for (const [cwd, e] of processes) {
-    if (e.alive && now - e.lastUsed > IDLE_TTL) {
-      try { e.child.stdin.end() } catch (_) {}
-      // 对齐 stop/evict：stdin 关闭后 3s 仍不退出则强杀，避免孤儿进程滞留
-      setTimeout(() => { try { e.child.kill() } catch (_) {} }, 3000)
-      processes.delete(cwd)
+    // 进程中途退出：立即报错收口，不等 15 分钟 watchdog
+    const onExit = () => fail('RPC 进程已退出，本次回答中断')
+    entry.child.once('exit', onExit)
+
+    // 图片：RPC 不支持 @file，用 images 字段
+    const images = []
+    for (const f of (o.files || [])) {
+      try {
+        if (f.startsWith('data:')) {
+          const m = /^data:image\/([a-zA-Z0-9+.-]+);base64,(.*)$/s.exec(f)
+          if (m) images.push({ type: 'image', data: m[2], mimeType: 'image/' + m[1] })
+        } else {
+          const data = core.fs.readFileSync(f)
+          const ext = core.path.extname(f).slice(1).toLowerCase()
+          images.push({ type: 'image', data: data.toString('base64'), mimeType: 'image/' + (ext === 'jpg' ? 'jpeg' : ext || 'png') })
+        }
+      } catch (_) {}
+    }
+
+    applyCfg()
+      .then(() => {
+        if (settled) return
+        return send(entry, { type: 'prompt', message: o.prompt || '', images })
+      })
+      .catch(err => fail(String((err && err.message) || err)))
+
+    return {
+      cancel: () => {
+        aborted = true
+        send(entry, { type: 'abort' }).catch(() => {})
+        finish({ aborted: true })
+      },
     }
   }
-}
-const cleanupTimer = setInterval(cleanupIdle, 60 * 1000)
-if (cleanupTimer.unref) cleanupTimer.unref()
 
-module.exports = { prewarm, isReady, prompt, stop, ensure }
+  function prewarm(cwd, flags) {
+    return ensure(cwd, flags).then(() => true).catch(() => false)
+  }
+
+  function isReady(cwd, flags) {
+    const e = getEntry(keyOf(cwd, flags))
+    return !!(e && e.alive && e.ready)
+  }
+
+  function stop() {
+    for (const [, e] of processes) {
+      try { e.child.stdin.end() } catch (_) {}
+      setTimeout(() => { try { e.child.kill() } catch (_) {} }, 3000)
+    }
+    processes.clear()
+  }
+
+  function cleanupIdle() {
+    const now = Date.now()
+    for (const [key, e] of processes) {
+      if (e.alive && !isBusy(e) && now - e.lastUsed > IDLE_TTL) {
+        try { e.child.stdin.end() } catch (_) {}
+        // 对齐 stop/evict：stdin 关闭后 3s 仍不退出则强杀，避免孤儿进程滞留
+        setTimeout(() => { try { e.child.kill() } catch (_) {} }, 3000)
+        processes.delete(key)
+      }
+    }
+  }
+
+  const cleanupTimer = setInterval(cleanupIdle, CLEANUP_INTERVAL)
+  if (cleanupTimer.unref) cleanupTimer.unref()
+
+  return { prewarm, isReady, prompt, stop, ensure, keyOf, cleanupIdle, isBusy, _processes: processes }
+}
+
+const defaultEngine = createRpcEngine()
+
+module.exports = {
+  ...defaultEngine,
+  createRpcEngine,
+  isImageFile,
+  hasNonImageFiles,
+}

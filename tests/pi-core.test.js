@@ -1,10 +1,10 @@
-import { describe, it, expect, beforeAll } from 'vitest'
-import { mkdtempSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { mkdtempSync, writeFileSync, mkdirSync, existsSync, readdirSync, rmSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 // findPiCli/findNode 依赖文件系统探测：用运行时 tmp 假 cli.js + 当前 node 注入环境变量，
-// 使 buildArgs 等纯逻辑不依赖真实 pi 安装（fixture 留在系统临时目录，不做清理）
+// 使 buildArgs 等纯逻辑不依赖真实 pi 安装
 const fixtureDir = mkdtempSync(join(tmpdir(), 'pideck-test-'))
 const fakeCli = join(fixtureDir, 'cli.js')
 writeFileSync(fakeCli, '// fake pi cli for tests\n')
@@ -12,6 +12,10 @@ process.env.PIDECK_PI_CLI = fakeCli
 process.env.PIDECK_NODE = process.execPath
 
 const core = await import('../shared/pi-core.cjs')
+
+afterAll(() => {
+  try { rmSync(fixtureDir, { recursive: true, force: true }) } catch (_) {}
+})
 
 // 构造完整精细工具对象（与 groups.js makeTool 产物形状一致）
 function tool(over = {}) {
@@ -71,6 +75,55 @@ describe('buildPermArgs 权限档位 → pi argv', () => {
   it('trust=true → --approve', () => {
     expect(core.buildPermArgs(tool({ trust: true }))).toContain('--approve')
     expect(core.buildPermArgs(tool({ trust: true }))).not.toContain('--no-approve')
+  })
+
+  it('无内置工具 + MCP 指定 server：仍用 --tools 过滤而不退化为 -nt 全放开', () => {
+    expect(core.buildPermArgs(tool({ list: [], mcp: 'servers', mcpServers: 'github' }))).toEqual([
+      '--tools', 'mcp__github__*', '-ne', '-e', 'builtin:mcp', '-ns', '-nc', '-np', '--no-approve',
+    ])
+  })
+})
+
+describe('permFlags / applyLeanSystemPrompt', () => {
+  it('无内置工具但开了 MCP 或扩展时，noTools 为 false 且不替换 systemPrompt', () => {
+    expect(core.permFlags('', { tool: tool({ list: [], mcp: 'all' }) })).toEqual({ noTools: false })
+    expect(core.permFlags('', { tool: tool({ list: [], ext: true }) })).toEqual({ noTools: false })
+    expect(core.permFlags('', { tool: tool({ list: [] }) })).toEqual({ noTools: true })
+
+    const withMcp = core.applyLeanSystemPrompt({ prompt: 'hi', tool: tool({ list: [], mcp: 'all' }) })
+    expect(withMcp.systemPrompt).toBeUndefined()
+
+    const pureText = core.applyLeanSystemPrompt({ prompt: 'hi', tool: tool({ list: [] }) })
+    expect(pureText.systemPrompt).toBe(core.LEAN_SYSTEM_PROMPT)
+  })
+})
+
+describe('parseModelsOutput 与 listFiles 符号链接', () => {
+  it('parseModelsOutput 解析多空格分隔模型表', () => {
+    const out = [
+      'provider   model            context',
+      'openai     gpt-4o           128k',
+      'anthropic  claude-sonnet-4  200k',
+    ].join('\n')
+    expect(core.parseModelsOutput(out)).toEqual([
+      { provider: 'openai', model: 'gpt-4o', display: 'openai/gpt-4o' },
+      { provider: 'anthropic', model: 'claude-sonnet-4', display: 'anthropic/claude-sonnet-4' },
+    ])
+  })
+
+  it('listFiles 正确处理普通文件及安全跳过循环/坏符号链接', () => {
+    const ws = mkdtempSync(join(fixtureDir, 'ws-'))
+    writeFileSync(join(ws, 'a.txt'), 'hi')
+    const sub = join(ws, 'sub')
+    mkdirSync(sub)
+    writeFileSync(join(sub, 'b.txt'), 'world')
+    try { symlinkSync(join(ws, 'a.txt'), join(ws, 'link-file.txt')) } catch (_) {}
+    try { symlinkSync(ws, join(sub, 'loop-dir')) } catch (_) {}
+    const items = core.listFiles(ws, '')
+    expect(items.find(x => x.path === 'a.txt')).toEqual({ path: 'a.txt', dir: false })
+    const lf = items.find(x => x.path === 'link-file.txt')
+    if (lf) expect(lf.dir).toBe(false)
+    expect(items.find(x => x.path === 'sub/b.txt')).toEqual({ path: 'sub/b.txt', dir: false })
   })
 })
 
@@ -192,6 +245,9 @@ describe('deletePiSession 会话文件清理（root 注入）', () => {
     writeFileSync(join(dir, '20260101_000000_pideck-abc123.jsonl'), '')
     writeFileSync(join(dir, '20260101_000000_pideck-zzz999.jsonl'), '')
     writeFileSync(join(dir, 'unrelated.jsonl'), '')
+  })
+  afterAll(() => {
+    try { rmSync(root, { recursive: true, force: true }) } catch (_) {}
   })
 
   it('合法 id：精确删除同后缀文件，其余保留', () => {

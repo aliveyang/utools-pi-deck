@@ -15,6 +15,10 @@ function run(opts, handlers) {
     body: JSON.stringify(opts),
     signal: ctrl.signal,
   }).then(async res => {
+    if (!res.ok) {
+      handlers.onError && handlers.onError('dev API 请求失败：HTTP ' + res.status)
+      return
+    }
     const reader = res.body.getReader()
     const decoder = new TextDecoder()
     let buf = '', doneFired = false
@@ -54,14 +58,16 @@ function run(opts, handlers) {
   return { cancel: () => ctrl.abort() }
 }
 
-function syncGet(path) {
+function syncReq(method, path) {
   try {
     const x = new XMLHttpRequest()
-    x.open('GET', BASE + path, false)
+    x.open(method, BASE + path, false)
     x.send()
     return x.status === 200 ? JSON.parse(x.responseText) : null
   } catch (_) { return null }
 }
+function syncGet(path) { return syncReq('GET', path) }
+function syncPost(path) { return syncReq('POST', path) }
 
 let homedir = (syncGet('/homedir') || {}).homedir || ''
 
@@ -100,7 +106,7 @@ window.piBridge = {
     catch (_) { return {} }
   },
   deletePiSession: id => {
-    try { return syncGet('/delete-session?id=' + encodeURIComponent(id || '')) || { ok: false } }
+    try { return syncPost('/delete-session?id=' + encodeURIComponent(id || '')) || { ok: false } }
     catch (_) { return { ok: false } }
   },
   getEnv: () => {

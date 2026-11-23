@@ -14,8 +14,8 @@ uTools 内的 [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi
 
 ## 安装到 uTools
 
-1. 构建产物：`npm run build` → 生成自包含的 `dist/`（内联 JS/CSS + `shared/*.cjs` + `preload.js`）。
-2. uTools → 设置 → 开发者 → 新建插件，选择项目目录（读取 `public/plugin.json`，正式使用加载 `dist/`）。
+1. 构建产物：`npm run build` → 生成自包含的 `dist/`（外链 IIFE JS + 单文件 CSS + `shared/*.cjs` + `preload.js`）。
+2. uTools → 设置 → 开发者 → 新建插件，选择包含 `plugin.json` 的目录（开发调试选 `public/`，正式使用选 `dist/`）。
 
 ## 环境变量（可选）
 

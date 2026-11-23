@@ -17,11 +17,23 @@ export function read(key, fallback) {
 
 export function write(key, value) {
   // 关键：必须存字符串，uTools dbStorage 走 IPC 无法克隆 Vue Proxy
-  backend().setItem(key, JSON.stringify(value))
+  try {
+    backend().setItem(key, JSON.stringify(value))
+    return true
+  } catch (e) {
+    console.warn('[PiDeck] storage write failed:', key, e)
+    return false
+  }
 }
 
 export function remove(key) {
-  backend().removeItem(key)
+  try {
+    backend().removeItem(key)
+    return true
+  } catch (e) {
+    console.warn('[PiDeck] storage remove failed:', key, e)
+    return false
+  }
 }
 
 const CACHE_TTL = 5 * 60 * 1000
