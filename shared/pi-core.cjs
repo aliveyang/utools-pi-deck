@@ -159,6 +159,11 @@ function effectiveCwd(p) {
   return dir
 }
 
+// pi 配置目录：与 pi 的 getAgentDir() 保持一致，可用 PI_CODING_AGENT_DIR 覆盖
+function agentDir() {
+  return process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent')
+}
+
 // ---------- 技能扫描 ----------
 function parseSkillMd(file) {
   try {
@@ -210,7 +215,7 @@ function listSkills(cwd) {
   const out = [], seen = new Set()
   const roots = [
     path.join(os.homedir(), '.agents', 'skills'),
-    path.join(os.homedir(), '.pi', 'agent', 'skills'),
+    path.join(agentDir(), 'skills'),
   ]
   if (cwd) {
     roots.push(path.join(cwd, '.agents', 'skills'))
@@ -455,10 +460,34 @@ function getDefaults(cwd) {
 
 // 删除 pi 侧会话文件：~/.pi/agent/sessions/<cwd编码>/<时间戳>_<sessionId>.jsonl
 // 仅接受 pideck- 前缀的合法 id，避免误删其他会话；root 仅供测试注入
+function findPiSession(sessionId, root) {
+  const id = String(sessionId || '')
+  if (!/^pideck-[a-z0-9]{4,40}$/i.test(id)) return ''
+  root = root || path.join(agentDir(), 'sessions')
+  if (!fs.existsSync(root)) return ''
+  const suffix = `_${id}.jsonl`
+  let dirs = []
+  try { dirs = fs.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory()) }
+  catch (_) { return '' }
+  for (const d of dirs) {
+    const dir = path.join(root, d.name)
+    let files = []
+    try { files = fs.readdirSync(dir) } catch (_) { continue }
+    for (const f of files) {
+      if (!f.endsWith(suffix)) continue
+      const target = path.join(dir, f)
+      if (!target.startsWith(root + path.sep)) continue
+      return target
+    }
+  }
+  return ''
+}
+function hasPiSession(sessionId, root) { return !!findPiSession(sessionId, root) }
+
 function deletePiSession(sessionId, root) {
   const id = String(sessionId || '')
   if (!/^pideck-[a-z0-9]{4,40}$/i.test(id)) return { ok: false, removed: 0, error: 'sessionId 格式不合法' }
-  root = root || path.join(os.homedir(), '.pi', 'agent', 'sessions')
+  root = root || path.join(agentDir(), 'sessions')
   if (!fs.existsSync(root)) return { ok: true, removed: 0 }
   const suffix = `_${id}.jsonl`
   let removed = 0
@@ -489,7 +518,7 @@ function getEnv() {
   const env = {
     ok: false, errorCode: '', error: '',
     nodePath: '', nodeVersion: '', piPath: '', piVersion: '',
-    agentDir: path.join(os.homedir(), '.pi', 'agent'),
+    agentDir: agentDir(),
     configs: [], defaultModel: '', defaultProvider: '', defaultThinking: '',
   }
   try {
@@ -547,7 +576,7 @@ function getEnv() {
 function detectContextFiles(cwd) {
   const names = ['AGENTS.override.md', 'AGENTS.md', 'AGENTS.MD', 'CLAUDE.md', 'CLAUDE.MD']
   const found = []
-  const dirs = [path.join(os.homedir(), '.pi', 'agent')]
+  const dirs = [agentDir()]
   let d = cwd ? effectiveCwd(cwd) : null
   const chain = []
   while (d) {
@@ -562,7 +591,7 @@ function detectContextFiles(cwd) {
       try {
         if (fs.existsSync(f) && fs.statSync(f).isFile()) {
           const size = fs.statSync(f).size
-          found.push({ path: f, size, global: dir === path.join(os.homedir(), '.pi', 'agent') })
+          found.push({ path: f, size, global: dir === agentDir() })
           break
         }
       } catch (_) {}
@@ -574,6 +603,6 @@ function detectContextFiles(cwd) {
 module.exports = {
   resolvePi,
   makeLineBuffer, pushChunk, makeTextStream, validateCwd, effectiveCwd, resolveCwd, defaultWorkspace,
-  parseSkillMd, scanSkillsDir, listSkills, parseModelsOutput, listModels, listFiles, buildArgs, buildPermArgs, normalizeTool, permFlags, applyLeanSystemPrompt, PRESET_LISTS, TOOL_NAMES, detectContextFiles, LEAN_SYSTEM_PROMPT, getDefaults, deletePiSession, getEnv, mapPiEvent,
+  parseSkillMd, scanSkillsDir, listSkills, parseModelsOutput, listModels, listFiles, buildArgs, buildPermArgs, normalizeTool, permFlags, applyLeanSystemPrompt, PRESET_LISTS, TOOL_NAMES, detectContextFiles, LEAN_SYSTEM_PROMPT, getDefaults, findPiSession, hasPiSession, deletePiSession, getEnv, mapPiEvent, agentDir,
   os, path, fs,
 }

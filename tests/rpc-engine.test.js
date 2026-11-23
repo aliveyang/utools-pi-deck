@@ -179,6 +179,18 @@ describe('rpc-engine ensure 与 prompt 契约', () => {
     expect(errors).toBe(1)
   })
 
+  it('hasSession 只在该进程持有同一会话时为真', async () => {
+    const child = makeMockChild()
+    const eng = createRpcEngine({ core, spawn: () => child })
+    await eng.ensure(fixtureDir, {})
+    expect(eng.hasSession(fixtureDir, {}, 'pideck-s1')).toBe(false)
+    await new Promise(resolve => {
+      eng.prompt(fixtureDir, { prompt: 'a', sessionId: 'pideck-s1' }, { onDone: resolve })
+    })
+    expect(eng.hasSession(fixtureDir, {}, 'pideck-s1')).toBe(true)
+    expect(eng.hasSession(fixtureDir, {}, 'pideck-s2')).toBe(false)
+  })
+
   it('忙碌进程不会被 cleanupIdle 或 evictOverflow 误杀', async () => {
     const children = []
     const eng = createRpcEngine({

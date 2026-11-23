@@ -1,6 +1,6 @@
 # PiDeck
 
-uTools 内的 [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) 快速对话面板：`Alt+空格` 唤起即问，纯文本对话 / 翻译 / 带工具的智能体三个默认分组，支持图片、文件、技能（`/`）、工作区文件引用（`@`）。底层始终是本机 pi CLI，不自建服务、不经过第三方中转。
+uTools 内的 [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) 快速对话面板：`Alt+空格` 唤起即问，纯文本对话 / 翻译 / 带工具的智能体三个默认分组，支持图片、文件、技能（`/`）、工作区文件引用（`@`）。设置里提供模型与 API Key 的图形化配置，以及本地操作记录。底层始终是本机 pi CLI，不自建服务、不经过第三方中转。
 
 ## 前置条件
 
@@ -8,7 +8,7 @@ uTools 内的 [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi
 |---|---|---|
 | uTools | 任意近期版本 | 插件宿主 |
 | Node.js | **≥ 22.19** | pi CLI 的运行时要求 |
-| pi CLI | `npm i -g @earendil-works/pi-coding-agent` | 安装后在 pi 里完成模型/凭证配置（`~/.pi/agent`） |
+| pi CLI | `npm i -g @earendil-works/pi-coding-agent` | 安装后可运行 `pi` 完成登录，或直接在插件「设置 → 环境与模型」里粘贴 API Key |
 
 默认模型与凭证不经过 PiDeck 配置，一切以 pi 侧为准；插件只透传 `--model` / `--thinking` 覆盖项。
 
@@ -26,6 +26,18 @@ uTools 内的 [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi
 
 若插件装在 uTools 内找不到 Node/pi（GUI 应用常不带 shell 的 PATH），设置这两个系统环境变量后重启 uTools。
 
+## 模型配置（不碰终端）
+
+设置 → **环境与模型**：
+
+1. 选择服务商：DeepSeek / OpenAI / Anthropic / Gemini / OpenRouter / 自定义端点（中转站、Ollama、LM Studio）
+2. 粘贴 API Key；订阅型服务商可点「终端登录」，插件会打开终端并复制 `pi auth login <provider>` 命令
+3. 点「刷新模型」从 pi 当前可用的模型里选择默认模型（也可手填模型 ID），保存即生效
+
+保存只修改 `models.json` 的目标 provider 与 `settings.json` 的 `defaultProvider` / `defaultModel` / 思考强度，写前自动备份原文件（保留最近 5 份）。密钥以明文保存在本机 `models.json`，不会上传；也可手动改用环境变量或 `$ENV` 插值。保存后会重启长驻 RPC 进程，新配置从下一条消息生效。
+
+环境横幅会在「pi 已安装但没有可用模型/凭证」时提示，点「去配置」直达该页。
+
 ## 运行引擎（设置 → 对话默认）
 
 | 引擎 | 行为 | 会话语义 |
@@ -35,9 +47,17 @@ uTools 内的 [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi
 
 RPC 的会话隔离：同一长驻进程在多个 PiDeck 会话间切换时会先重置进程内对话（实测验证），不会互相串上下文；但历史轮次不落盘，进程回收后从新开始。需要可靠的跨次记忆请用单次调用。
 
+**历史会话续接**：RPC 进程内没有磁盘会话的上下文。打开历史会话继续对话时，插件会自动改用单次调用：若该会话曾由单次调用落盘，模型能续接；若历史来自 RPC（未落盘），会提示「本条作为新上下文开始」。新建会话在同一 RPC 进程内的连续对话仍走长驻预热。
+
 ## 工具权限
 
 每个分组独立配置四档预设（纯文本 / 只读 / 可编辑 / 完整）+ 细粒度勾选（内置工具白名单、MCP 三态、扩展、技能、AGENTS.md 规范、项目级 `.pi` 信任）。写入与执行类工具（`edit`/`write`/`bash`/`powershell`）在 UI 中有显著风险标识。MCP 与扩展不受内置白名单约束，组合后的真实后果会显示在"工具影响"一行。
+
+## 操作记录
+
+「设置 → 操作记录」记录工具调用与权限变更：时间、分组、工具名、参数/结果摘要（截断并脱敏）、耗时、token 用量。记录只保存在本机 `~/.pideck/audit/`（按天 JSONL，保留 30 天，单片 20MB 自动分片），不记录对话全文、完整文件内容与密钥；支持「只看风险」、导出 Markdown、清空记录。
+
+「设置 → 对话默认」底部提供「清空所有对话」，会同时删除 pi 侧会话文件，需要两步确认。删除单条会话与删除分组也都改成了两步确认。
 
 ## 开发
 
@@ -57,9 +77,11 @@ npm test          # vitest 单测（纯函数：权限拼参 / Markdown 转义 /
 ├─ public/preload.js      渲染层 ↔ Node 桥（piBridge），核心逻辑在 shared
 ├─ shared/pi-core.cjs     pi 定位、JSONL 解析、权限拼参、扫描、诊断（三调用方共用）
 ├─ shared/rpc-engine.cjs  RPC 长驻引擎（按 cwd+配置 维护进程，new_session 会话隔离）
+├─ shared/audit.cjs       操作记录（本地 JSONL、脱敏、按天分片、30 天保留）
+├─ shared/config.cjs      pi 配置读写（settings/models、备份、apiKey 不落渲染层）
 ├─ dev-server-plugin.mjs  dev-only vite 中间件：/__pideck/api/*（SSE 流式）
 ├─ src/App.vue            主界面（双布局、设置、发送/取消/收口）
-├─ src/components/        TurnList（消息流）、Icon（图标系统）
+├─ src/components/        TurnList（消息流）、SettingsModal（分组 / 环境与模型 / 操作记录）、Icon（图标系统）
 ├─ src/composables/       usePiEnv（环境/模型/技能）、usePrefs（偏好）、useToast
 ├─ src/sessions.js        会话持久化（单会话分 key + 索引，旧数据自动迁移/重建）
 ├─ src/groups.js          分组与工具权限数据模型

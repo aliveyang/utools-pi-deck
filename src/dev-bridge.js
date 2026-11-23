@@ -122,4 +122,16 @@ window.piBridge = {
   stopRpc: () => {},
   resolvePi: () => syncGet('/resolve') || { ok: false, error: 'dev API 不可用' },
   homedir: () => homedir,
+  // dev 预览不读写真实 pi 配置与审计目录
+  auditTail: () => [],
+  auditExport: () => '',
+  auditDir: () => '',
+  auditClear: () => ({ removed: 0, failed: 0 }),
+  auditRecord: () => false,
+  configState: () => ({ ok: false, error: 'dev 预览不支持修改 pi 配置，请在 uTools 中使用' }),
+  configSave: () => ({ ok: false, error: 'dev 预览不支持修改 pi 配置' }),
+  configRemoveKey: () => ({ ok: false, error: 'dev 预览不支持修改 pi 配置' }),
+  configAuthCheck: () => Promise.resolve({ status: 'unavailable' }),
+  configLoginCommand: provider => 'pi auth login ' + provider,
+  openTerminalForProvider: () => false,
 }

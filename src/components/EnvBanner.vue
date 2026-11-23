@@ -5,23 +5,34 @@ defineProps({
   piStatus: { type: Object, default: null },
   envInfo: { type: Object, default: null },
   showEnvHelp: { type: Boolean, default: false },
+  needsConfig: { type: Boolean, default: false },
 })
-const emit = defineEmits(['toggleHelp', 'recheck', 'openLink', 'copyCmd', 'openPath'])
+const emit = defineEmits(['toggleHelp', 'recheck', 'openLink', 'copyCmd', 'openPath', 'config'])
 
 const PI_INSTALL_CMD = 'npm i -g @earendil-works/pi-coding-agent'
 </script>
 
 <template>
-  <div v-if="piStatus && !piStatus.ok" class="env-banner">
+  <div v-if="(piStatus && !piStatus.ok) || needsConfig" class="env-banner">
     <div class="env-banner-head">
-      <span class="env-dot err"></span>
-      <strong>Pi 环境未就绪</strong>
-      <span class="env-sub">{{ envInfo && envInfo.errorCode === 'NODE_MISSING' ? '缺少 Node.js' : envInfo && envInfo.errorCode === 'PI_MISSING' ? '未安装 pi CLI' : '无法启动 Pi' }}</span>
+      <span class="env-dot" :class="piStatus && !piStatus.ok ? 'err' : 'warn'"></span>
+      <strong>{{ piStatus && !piStatus.ok ? 'Pi 环境未就绪' : '模型还没配好' }}</strong>
+      <span class="env-sub">
+        {{ piStatus && !piStatus.ok
+          ? (envInfo && envInfo.errorCode === 'NODE_MISSING' ? '缺少 Node.js' : envInfo && envInfo.errorCode === 'PI_MISSING' ? '未安装 pi CLI' : '无法启动 Pi')
+          : '已完成安装，但缺少可用的模型凭证，配置后才能对话' }}
+      </span>
       <span class="spacer"></span>
-      <button class="mini-btn" @click="emit('toggleHelp')">{{ showEnvHelp ? '收起' : '如何安装' }}</button>
-      <button class="mini-btn" @click="emit('recheck')"><Icon name="refresh" :size="12" />重新检测</button>
+      <template v-if="piStatus && !piStatus.ok">
+        <button class="mini-btn" @click="emit('toggleHelp')">{{ showEnvHelp ? '收起' : '如何安装' }}</button>
+        <button class="mini-btn" @click="emit('recheck')"><Icon name="refresh" :size="12" />重新检测</button>
+      </template>
+      <template v-else>
+        <button class="mini-btn env-config-btn" @click="emit('config')">去配置</button>
+        <button class="mini-btn" @click="emit('recheck')"><Icon name="refresh" :size="12" />重新检测</button>
+      </template>
     </div>
-    <div v-if="showEnvHelp" class="env-steps">
+    <div v-if="showEnvHelp && (!piStatus || !piStatus.ok)" class="env-steps">
       <div class="env-step" :class="{ done: envInfo && envInfo.nodePath }">
         <div class="env-step-title">1. 安装 Node.js <b>≥ 22.19</b></div>
         <div class="env-step-body">

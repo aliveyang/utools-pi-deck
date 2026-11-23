@@ -264,6 +264,13 @@ function createRpcEngine(deps = {}) {
     return !!(e && e.alive && e.ready)
   }
 
+  // 该 key 的常驻进程当前是否正持有指定会话（用于判断历史会话能否走 RPC 续接）
+  function hasSession(cwd, flags, sessionId) {
+    if (!sessionId) return false
+    const e = getEntry(keyOf(cwd, flags))
+    return !!(e && e.alive && e.ready && e.sessionId === sessionId)
+  }
+
   function stop() {
     for (const [, e] of processes) {
       try { e.child.stdin.end() } catch (_) {}
@@ -287,7 +294,7 @@ function createRpcEngine(deps = {}) {
   const cleanupTimer = setInterval(cleanupIdle, CLEANUP_INTERVAL)
   if (cleanupTimer.unref) cleanupTimer.unref()
 
-  return { prewarm, isReady, prompt, stop, ensure, keyOf, cleanupIdle, isBusy, _processes: processes }
+  return { prewarm, isReady, hasSession, prompt, stop, ensure, keyOf, cleanupIdle, isBusy, _processes: processes }
 }
 
 const defaultEngine = createRpcEngine()

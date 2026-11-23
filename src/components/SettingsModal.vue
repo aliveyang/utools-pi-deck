@@ -22,12 +22,14 @@ const props = defineProps({
 const emit = defineEmits([
   'close', 'setLayout', 'setEngine', 'commitDefaultCwd', 'setDefaultCwd', 'pickDefaultCwd', 'setSendKeyMode',
   'saveGroup', 'deleteGroup', 'refreshModels', 'openPath', 'recheckEnv',
+  'clearAllSessions', 'configSaved', 'notify', 'copyCmd', 'openLink',
 ])
 
 const SETTINGS_TABS = [
   { id: 'general', label: '对话默认' },
   { id: 'groups', label: '分组' },
-  { id: 'diag', label: '诊断' },
+  { id: 'diag', label: '环境与模型' },
+  { id: 'audit', label: '操作记录' },
 ]
 const TARGET_LANGS = ['', '英文', '中文', '日文', '韩文', '法文', '德文', '西班牙文', '俄文']
 const THINKING_LEVELS = ['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
@@ -56,6 +58,12 @@ watch(() => props.show, val => {
     settingsTab.value = 'general'
   } else {
     editing.value = null
+    // 关闭时清掉未提交的密钥与确认态，避免下次打开残留
+    cfgKey.value = ''
+    confirmClearAll.value = false
+    auditConfirmClear.value = false
+    clearTimeout(confirmClearTimer)
+    clearTimeout(auditClearTimer)
   }
 })
 
@@ -138,6 +146,25 @@ function saveGroup() {
   emit('saveGroup', next)
   editing.value = null
 }
+// 分组删除两步确认（会连带删除该分组会话）
+const confirmDeleteGroup = ref(false)
+let confirmDeleteTimer = null
+watch(editing, () => {
+  confirmDeleteGroup.value = false
+  clearTimeout(confirmDeleteTimer)
+})
+function requestDeleteGroup() {
+  if (!editing.value) return
+  if (!confirmDeleteGroup.value) {
+    confirmDeleteGroup.value = true
+    confirmDeleteTimer = setTimeout(() => { confirmDeleteGroup.value = false }, 4000)
+    return
+  }
+  confirmDeleteGroup.value = false
+  clearTimeout(confirmDeleteTimer)
+  emit('deleteGroup', editing.value)
+}
+
 function pickCwd() {
   if (!window.piBridge || !window.piBridge.pickFolder) return
   const dir = window.piBridge.pickFolder()
@@ -209,11 +236,243 @@ function groupSummary(g) {
   return parts
 }
 
+// ---------- 环境与模型配置 ----------
+const cfg = ref(null)
+const cfgProvider = ref('')
+const cfgKey = ref('')
+const cfgBaseUrl = ref('')
+const cfgApi = ref('openai-completions')
+const cfgModelId = ref('')
+const cfgThinking = ref('')
+const cfgModels = ref([])
+const cfgBusy = ref(false)
+const cfgMsg = ref('')
+const cfgAuth = ref(null)
+// 预设 + models.json 里已有的非预设 provider（如中转站/本地网关），避免用户只能选预设
+const cfgAllProviders = computed(() => {
+  const st = cfg.value
+  if (!st || !st.ok) return []
+  const presets = (st.presets || []).map(p => ({ ...p, preset: true }))
+  const extra = (st.providers || [])
+    .filter(p => !p.preset && p.id !== 'custom')
+    .map(p => ({ id: p.id, name: p.name || p.id, builtin: false, preset: false, env: '', site: '', note: '已存在的自定义端点', oauth: false }))
+  return [...presets, ...extra]
+})
+const cfgPreset = computed(() => cfgAllProviders.value.find(p => p.id === cfgProvider.value) || null)
+const cfgIsCustom = computed(() => !!(cfgPreset.value && !cfgPreset.value.builtin))
+const cfgProviderInfo = computed(() => ((cfg.value && cfg.value.providers) || []).find(p => p.id === cfgProvider.value) || null)
+
+function loadCfg() {
+  if (!window.piBridge || !window.piBridge.configState) {
+    cfg.value = { ok: false, error: '当前环境不支持配置（需在 uTools 中运行）' }
+    return
+  }
+  try {
+    cfg.value = window.piBridge.configState()
+    if (!cfg.value || !cfg.value.ok) return
+    const cur = cfg.value.defaultProvider || ''
+    const needInit = !cfgProvider.value || !cfgAllProviders.value.some(p => p.id === cfgProvider.value)
+    if (needInit) {
+      cfgProvider.value = cfgAllProviders.value.some(p => p.id === cur)
+        ? cur : ((cfgAllProviders.value[0] && cfgAllProviders.value[0].id) || 'deepseek')
+      cfgThinking.value = cfg.value.defaultThinkingLevel || ''
+      if (cur === cfgProvider.value && cfg.value.defaultModel) cfgModelId.value = cfg.value.defaultModel
+    }
+    const info = cfgProviderInfo.value
+    cfgBaseUrl.value = (info && info.baseUrl) || ''
+    cfgApi.value = (info && info.api) || 'openai-completions'
+    loadCfgModels()
+  } catch (e) {
+    cfg.value = { ok: false, error: String(e.message || e) }
+  }
+}
+
+async function loadCfgModels() {
+  if (!window.piBridge || !window.piBridge.listModelsAsync) return
+  try {
+    const all = await window.piBridge.listModelsAsync()
+    cfgModels.value = (all || []).filter(m => m.provider === cfgProvider.value)
+  } catch (_) { cfgModels.value = [] }
+}
+
+function selectProvider(id) {
+  cfgProvider.value = id
+  cfgKey.value = ''
+  cfgAuth.value = null
+  cfgMsg.value = ''
+  cfgModelId.value = ''
+  const info = cfgProviderInfo.value
+  cfgBaseUrl.value = (info && info.baseUrl) || ''
+  cfgApi.value = (info && info.api) || 'openai-completions'
+  loadCfgModels()
+}
+
+async function saveCfg() {
+  if (!window.piBridge || !window.piBridge.configSave) return
+  const modelId = (cfgModelId.value || '').trim()
+  if (!modelId) { cfgMsg.value = '请先选择或填写默认模型 ID'; return }
+  cfgBusy.value = true
+  cfgMsg.value = ''
+  try {
+    const r = await window.piBridge.configSave({
+      provider: cfgProvider.value,
+      name: (cfgProviderInfo.value && cfgProviderInfo.value.name)
+        || (cfgIsCustom.value ? '自定义端点' : (cfgPreset.value && cfgPreset.value.name)),
+      apiKey: cfgKey.value,
+      baseUrl: cfgIsCustom.value ? cfgBaseUrl.value : '',
+      api: cfgIsCustom.value ? cfgApi.value : '',
+      modelId,
+      modelName: modelId,
+      thinking: cfgThinking.value,
+      setDefault: true,
+    })
+    if (!r || !r.ok) { cfgMsg.value = (r && r.error) || '保存失败'; return }
+    cfgKey.value = ''
+    cfg.value = r.state || window.piBridge.configState()
+    cfgMsg.value = `已保存，默认模型：${cfgProvider.value} / ${modelId}`
+    if (r.warnings && r.warnings.length) cfgMsg.value += `（提示：${r.warnings.join('；')}）`
+    emit('configSaved')
+    emit('notify', '模型配置已保存，下一条消息生效')
+    cfgAuth.value = await window.piBridge.configAuthCheck(cfgProvider.value)
+  } catch (e) {
+    cfgMsg.value = String(e.message || e)
+  } finally {
+    cfgBusy.value = false
+  }
+}
+
+async function checkCfgAuth() {
+  if (!window.piBridge || !window.piBridge.configAuthCheck) return
+  cfgAuth.value = { status: 'checking' }
+  try { cfgAuth.value = await window.piBridge.configAuthCheck(cfgProvider.value) }
+  catch (_) { cfgAuth.value = { status: 'invalid' } }
+}
+
+function authLabel(status) {
+  if (!status) return ''
+  if (status === 'checking') return '检测中…'
+  if (status === 'ready') return '凭证可用'
+  if (status === 'not_ready') return '还没有可用凭证'
+  if (status === 'invalid') return '凭证无效或检测失败'
+  if (status === 'unavailable') return '无法检测（Pi 未就绪）'
+  return status
+}
+
+function terminalLogin() {
+  const provider = cfgProvider.value
+  if (!provider || cfgIsCustom.value) return
+  const cmd = (window.piBridge && window.piBridge.configLoginCommand && window.piBridge.configLoginCommand(provider))
+    || ('pi auth login ' + provider)
+  emit('copyCmd', cmd)
+  const ok = window.piBridge && window.piBridge.openTerminalForProvider && window.piBridge.openTerminalForProvider(provider)
+  emit('notify', ok ? '已打开终端并复制命令，粘贴后回车' : '已复制登录命令，请在终端中运行')
+}
+
+async function removeCfgKey() {
+  if (!window.piBridge || !window.piBridge.configRemoveKey) return
+  const r = await window.piBridge.configRemoveKey(cfgProvider.value)
+  if (r && r.ok) {
+    emit('notify', r.removed ? '已清除该服务商的密钥' : '该服务商没有保存密钥')
+    cfg.value = window.piBridge.configState()
+  } else {
+    emit('notify', (r && r.error) || '清除失败')
+  }
+}
+
+// ---------- 数据清理 ----------
+const confirmClearAll = ref(false)
+let confirmClearTimer = null
+function requestClearAll() {
+  if (!confirmClearAll.value) {
+    confirmClearAll.value = true
+    confirmClearTimer = setTimeout(() => { confirmClearAll.value = false }, 4000)
+    return
+  }
+  confirmClearAll.value = false
+  clearTimeout(confirmClearTimer)
+  emit('clearAllSessions')
+}
+
+// ---------- 操作记录 ----------
+const auditRows = ref([])
+const auditRiskOnly = ref(false)
+const auditConfirmClear = ref(false)
+let auditClearTimer = null
+
+function loadAudit() {
+  try {
+    auditRows.value = (window.piBridge && window.piBridge.auditTail) ? (window.piBridge.auditTail(200) || []) : []
+  } catch (_) { auditRows.value = [] }
+}
+const auditVisible = computed(() =>
+  auditRiskOnly.value
+    ? auditRows.value.filter(r => r.risk || r.type === 'perm' || r.type === 'data')
+    : auditRows.value)
+const auditStats = computed(() => {
+  let writes = 0, execs = 0
+  for (const r of auditRows.value) {
+    if (r.type !== 'tool' || !r.tool) continue
+    if (r.tool.name === 'edit' || r.tool.name === 'write') writes++
+    if (r.tool.name === 'bash' || r.tool.name === 'powershell') execs++
+  }
+  return { writes, execs }
+})
+function fmtAuditTime(ts) {
+  if (!ts) return ''
+  const d = new Date(ts)
+  const p = n => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+function auditKind(r) {
+  if (r.type === 'tool') return (r.tool && r.tool.name) || 'tool'
+  if (r.type === 'run') return '对话'
+  if (r.type === 'perm') return '权限'
+  if (r.type === 'data') return '数据'
+  if (r.type === 'config') return '配置'
+  return r.type || ''
+}
+function isAuditRisk(r) {
+  return !!(r.risk || r.type === 'perm' || r.type === 'data')
+}
+function exportAudit() {
+  if (!window.piBridge || !window.piBridge.auditExport) return
+  const md = window.piBridge.auditExport(30)
+  const r = window.piBridge.saveTextFile && window.piBridge.saveTextFile('PiDeck-操作记录.md', md)
+  if (r && r.ok) emit('notify', '已导出：' + r.path)
+  else if (r && r.canceled) return
+  else emit('notify', '导出失败')
+}
+function openAuditDir() {
+  const dir = window.piBridge && window.piBridge.auditDir && window.piBridge.auditDir()
+  if (dir) emit('openPath', dir)
+  else emit('notify', '当前环境无法打开记录目录')
+}
+function clearAudit() {
+  if (!auditConfirmClear.value) {
+    auditConfirmClear.value = true
+    auditClearTimer = setTimeout(() => { auditConfirmClear.value = false }, 4000)
+    return
+  }
+  auditConfirmClear.value = false
+  clearTimeout(auditClearTimer)
+  const r = window.piBridge && window.piBridge.auditClear ? window.piBridge.auditClear() : null
+  loadAudit()
+  if (r && r.failed) emit('notify', `清空完成，${r.failed} 个文件未能删除`)
+  else emit('notify', '操作记录已清空')
+}
+
+function switchTab(id) {
+  settingsTab.value = id
+  if (id === 'diag') loadCfg()
+  if (id === 'audit') loadAudit()
+}
+function openTab(id) { switchTab(id) }
+
 function handleEsc() {
   if (editing.value) { editing.value = null; return true }
   return false
 }
-defineExpose({ handleEsc })
+defineExpose({ handleEsc, openTab })
 </script>
 
 <template>
@@ -355,7 +614,9 @@ defineExpose({ handleEsc })
           <div v-else class="ctx-info muted">未检测到 AGENTS.md / CLAUDE.md</div>
         </div>
         <div class="form-actions">
-          <button v-if="groups.length > 1" class="danger-link" @click="emit('deleteGroup', editing)"><Icon name="trash" :size="12" />删除这个分组</button>
+          <button v-if="groups.length > 1" class="danger-link" @click="requestDeleteGroup">
+            <Icon name="trash" :size="12" />{{ confirmDeleteGroup ? '再点一次确认删除（含该分组会话）' : '删除这个分组' }}
+          </button>
           <span class="spacer"></span>
           <button class="mini-btn" @click="editing = null">取消</button>
           <button class="primary-btn" @click="saveGroup">保存</button>
@@ -366,7 +627,7 @@ defineExpose({ handleEsc })
         <div class="tabs">
           <button
             v-for="t in SETTINGS_TABS" :key="t.id" class="tab sub"
-            :class="{ active: settingsTab === t.id }" @click="settingsTab = t.id"
+            :class="{ active: settingsTab === t.id }" @click="switchTab(t.id)"
           >{{ t.label }}</button>
         </div>
 
@@ -403,6 +664,11 @@ defineExpose({ handleEsc })
             <button class="choice" :class="{ on: sendKeyMode === 'enter' }" @click="emit('setSendKeyMode', 'enter')">Enter 发送</button>
             <button class="choice" :class="{ on: sendKeyMode === 'ctrl' }" @click="emit('setSendKeyMode', 'ctrl')">{{ isMac ? 'Cmd' : 'Ctrl' }}+回车 发送</button>
           </div>
+          <div class="field-label">数据</div>
+          <button class="mini-btn danger" @click="requestClearAll">
+            <Icon name="trash" :size="12" />{{ confirmClearAll ? '再点一次确认：清空所有对话' : '清空所有对话' }}
+          </button>
+          <span class="hint">同时删除 pi 侧的会话文件，无法撤销。</span>
         </div>
 
         <div v-else-if="settingsTab === 'groups'" class="pane">
@@ -416,11 +682,83 @@ defineExpose({ handleEsc })
           <button class="add-row" @click="addGroup"><Icon name="plus" :size="12" />新建分组</button>
         </div>
 
-        <div v-else class="pane">
+        <div v-else-if="settingsTab === 'diag'" class="pane">
+          <div class="cfg-status">
+            <span class="env-dot" :class="(cfg && cfg.defaultModel) ? 'ok' : 'warn'"></span>
+            <div class="cfg-status-text">
+              <strong>{{ !cfg ? '读取配置…' : (!cfg.ok ? '配置状态不可用' : (cfg.defaultModel ? '模型已配置' : '还没有默认模型')) }}</strong>
+              <div class="hint">
+                当前：{{ cfg && cfg.ok && cfg.defaultModel ? `${cfg.defaultProvider || '默认'} / ${cfg.defaultModel}` : '未设置' }}
+                <template v-if="cfg && cfg.ok && cfg.defaultThinkingLevel"> · 思考 {{ cfg.defaultThinkingLevel }}</template>
+              </div>
+            </div>
+            <span class="spacer"></span>
+            <button class="mini-btn" @click="loadCfg"><Icon name="refresh" :size="12" />刷新</button>
+          </div>
+
+          <div v-if="cfg && cfg.parseError" class="env-warn">
+            {{ cfg.parseError }}（已保留原文件，修复后重试；本次不会写入配置）
+          </div>
+
+          <template v-if="cfg && cfg.ok">
+            <div class="field-label">1. 选择服务商</div>
+            <div class="form-chips">
+              <button
+                v-for="p in cfgAllProviders" :key="p.id" class="choice"
+                :class="{ on: cfgProvider === p.id }" @click="selectProvider(p.id)"
+              >{{ p.name }}</button>
+            </div>
+            <span v-if="cfgPreset && cfgPreset.note" class="hint">{{ cfgPreset.note }}</span>
+
+            <div class="field-label">2. {{ cfgIsCustom ? '填写端点与密钥' : '粘贴 API Key' }}</div>
+            <input
+              v-model="cfgKey" class="mini-input" type="password" autocomplete="off"
+              :placeholder="cfgProviderInfo && cfgProviderInfo.hasKey ? '已保存（留空保持不变）' : (cfgProviderInfo && cfgProviderInfo.envSet ? '检测到环境变量，可留空' : '粘贴 API Key')"
+            />
+            <span v-if="cfgProviderInfo && cfgProviderInfo.envSet" class="hint">已检测到环境变量 {{ cfgProviderInfo.env }}（留空即可使用它）</span>
+            <span v-else-if="cfgProviderInfo && !cfgProviderInfo.hasKey" class="hint">如果已经在 pi 里登录过该服务商，这里可以留空。</span>
+            <span v-if="cfgPreset && cfgPreset.site" class="hint">
+              获取 Key：<a href="#" class="env-link" @click.prevent="emit('openLink', cfgPreset.site)">{{ cfgPreset.site }}</a>
+            </span>
+            <template v-if="cfgIsCustom">
+              <input v-model="cfgBaseUrl" class="mini-input" placeholder="Base URL，如 https://api.example.com/v1" />
+              <select v-model="cfgApi" class="mini-select">
+                <option v-for="a in cfg.apiValues" :key="a" :value="a">{{ a }}</option>
+              </select>
+            </template>
+
+            <div class="field-label">3. 选择默认模型</div>
+            <select v-if="cfgModels.length" v-model="cfgModelId" class="mini-select">
+              <option value="">请选择模型</option>
+              <option v-for="m in cfgModels" :key="m.model" :value="m.model">{{ m.model }}</option>
+              <option v-if="cfgModelId && !cfgModels.some(m => m.model === cfgModelId)" :value="cfgModelId">{{ cfgModelId }}</option>
+            </select>
+            <input v-else v-model="cfgModelId" class="mini-input" placeholder="模型 ID，如 deepseek-chat" />
+            <span class="hint">{{ cfgModels.length ? '列表来自 pi 当前可用的模型' : '还没有可用模型：先保存 Key，或直接手填模型 ID' }}</span>
+
+            <div class="cwd-row">
+              <select v-model="cfgThinking" class="mini-select">
+                <option v-for="lv in THINKING_LEVELS" :key="lv" :value="lv">{{ lv ? (THINKING_LABELS[lv] || lv) : '思考：保持默认' }}</option>
+              </select>
+              <button class="mini-btn" @click="loadCfgModels"><Icon name="refresh" :size="12" />刷新模型</button>
+            </div>
+
+            <div class="cfg-actions">
+              <button class="primary-btn" :disabled="cfgBusy" @click="saveCfg">{{ cfgBusy ? '保存中…' : '保存并设为默认' }}</button>
+              <button class="mini-btn" @click="checkCfgAuth">检测凭证</button>
+              <button v-if="cfgPreset && !cfgIsCustom" class="mini-btn" @click="terminalLogin">终端登录</button>
+              <button v-if="cfgProviderInfo && cfgProviderInfo.hasKey && !cfgIsCustom" class="mini-btn" @click="removeCfgKey">清除密钥</button>
+            </div>
+            <span v-if="cfgMsg" class="hint accent">{{ cfgMsg }}</span>
+            <span v-if="cfgAuth" class="hint" :class="{ warn: cfgAuth.status !== 'ready' }">凭证状态：{{ authLabel(cfgAuth.status) }}</span>
+            <span class="hint">保存前会自动备份；密钥写入本机 models.json，不会上传。</span>
+          </template>
+          <div v-else-if="cfg && !cfg.ok" class="env-warn">{{ cfg.error || '配置模块不可用' }}</div>
+
+          <div class="field-label">运行环境</div>
           <div v-if="envInfo && envInfo.ok" class="env-grid">
             <div class="env-row"><span>Node</span><code>{{ envInfo.nodeVersion || '—' }}</code></div>
             <div class="env-row"><span>pi CLI</span><code>{{ envInfo.piVersion ? 'v' + envInfo.piVersion : '—' }}</code></div>
-            <div class="env-row"><span>默认模型</span><code>{{ envInfo.defaultModel || '—' }}</code></div>
             <div class="env-row"><span>默认思考</span><code>{{ envInfo.defaultThinking || '—' }}</code></div>
             <div class="env-row"><span>pi 路径</span><code class="path" :title="envInfo.piPath">{{ envInfo.piPath }}</code></div>
           </div>
@@ -436,8 +774,35 @@ defineExpose({ handleEsc })
           </div>
           <div class="env-actions">
             <button class="mini-btn" @click="emit('openPath', envInfo && envInfo.agentDir)"><Icon name="folder" :size="12" />打开配置目录</button>
+            <button class="mini-btn" @click="emit('openPath', cfg && cfg.modelsPath)"><Icon name="external" :size="12" />打开 models.json</button>
             <button class="mini-btn" @click="emit('recheckEnv')"><Icon name="refresh" :size="12" />重新检测</button>
           </div>
+        </div>
+
+        <div v-else class="pane">
+          <div class="audit-summary">
+            <span>最近 {{ auditRows.length }} 条</span>
+            <span class="audit-stat risk">{{ auditStats.writes }} 次改文件</span>
+            <span class="audit-stat risk">{{ auditStats.execs }} 次执行命令</span>
+            <span class="spacer"></span>
+            <label class="audit-filter"><input type="checkbox" v-model="auditRiskOnly" />只看风险</label>
+            <button class="mini-btn" @click="loadAudit"><Icon name="refresh" :size="12" />刷新</button>
+          </div>
+          <div v-if="!auditVisible.length" class="audit-empty">{{ auditRows.length ? '没有符合条件的记录' : '还没有操作记录' }}</div>
+          <div v-else class="audit-list">
+            <div v-for="(r, i) in auditVisible" :key="i" class="audit-row" :class="{ risk: isAuditRisk(r) }">
+              <span class="audit-time">{{ fmtAuditTime(r.ts) }}</span>
+              <span class="audit-kind">{{ auditKind(r) }}</span>
+              <span class="audit-desc">{{ r.summary }}</span>
+              <span class="audit-group">{{ r.groupName || '' }}</span>
+            </div>
+          </div>
+          <div class="audit-actions">
+            <button class="mini-btn" @click="openAuditDir"><Icon name="folder" :size="12" />打开记录目录</button>
+            <button class="mini-btn" @click="exportAudit"><Icon name="download" :size="12" />导出 Markdown</button>
+            <button class="mini-btn danger" @click="clearAudit">{{ auditConfirmClear ? '再点一次确认清空' : '清空记录' }}</button>
+          </div>
+          <span class="hint">只保存在本机，不上传；不记录对话全文、完整文件内容与密钥（工具参数/结果仅保留截断摘要）。仅保留最近 30 天。</span>
         </div>
       </template>
     </div>

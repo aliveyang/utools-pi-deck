@@ -9,7 +9,7 @@ import HistoryDrawer from './components/HistoryDrawer.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import {
   listSessions, getSession, createSession, updateSession, deleteSession,
-  titleFromText, exportMarkdown, relTime,
+  clearAllSessions, titleFromText, exportMarkdown, relTime,
 } from './sessions.js'
 import { useToast } from './composables/useToast.js'
 import { usePrefs } from './composables/usePrefs.js'
@@ -55,6 +55,49 @@ function closePreview() { previewImage.value = '' }
 // 历史滑出面板
 const showHistory = ref(false)
 const sessionSearch = ref('')
+
+// 删除会话两步确认（避免误触连带删除 pi 侧会话文件）
+const deleteConfirmId = ref('')
+let deleteTimer = null
+function requestDeleteSession(id) {
+  if (deleteConfirmId.value === id) {
+    clearTimeout(deleteTimer)
+    deleteConfirmId.value = ''
+    removeSession(id)
+    return
+  }
+  deleteConfirmId.value = id
+  clearTimeout(deleteTimer)
+  deleteTimer = setTimeout(() => { deleteConfirmId.value = '' }, 4000)
+}
+
+// 模型凭证状态：空 = 未知，false = 当前默认模型凭证不可用
+const defaultAuthOk = ref(null)
+const needModelConfig = computed(() => {
+  if (!piStatus.value || !piStatus.value.ok || !envInfo.value) return false
+  if (!envInfo.value.ok) return false
+  // settings.json 没写默认模型时，再看 pi 实际生效的默认值，避免误报
+  if (!envInfo.value.defaultModel && !(defaults.value && (defaults.value.modelId || defaults.value.modelName))) return true
+  return defaultAuthOk.value === false
+})
+async function checkDefaultAuth() {
+  const provider = (envInfo.value && envInfo.value.defaultProvider) || ''
+  if (!provider || !window.piBridge || !window.piBridge.configAuthCheck) return
+  try {
+    const r = await window.piBridge.configAuthCheck(provider)
+    const st = r && r.status
+    // 只有明确未就绪/无效才触发提示；检测不可用（超时/未就绪）不误报
+    if (st === 'ready') defaultAuthOk.value = true
+    else if (st === 'not_ready' || st === 'invalid') defaultAuthOk.value = false
+    else defaultAuthOk.value = null
+  } catch (_) { defaultAuthOk.value = null }
+}
+function openConfigWizard() {
+  showSettings.value = true
+  nextTick(() => {
+    if (settingsModalEl.value && settingsModalEl.value.openTab) settingsModalEl.value.openTab('diag')
+  })
+}
 
 // 输入候选菜单（技能 / 文件）
 const showSkillMenu = ref(false)
@@ -199,6 +242,10 @@ let runHandle = null
 let cancelled = false
 let finalized = false
 let scrollScheduled = false
+// RPC 模式下历史会话改走单次调用的提示，每个会话只提示一次
+let historyFallbackNotified = false
+// 配置在回答生成中保存时，等收口后再重启引擎
+let pendingConfigRestart = false
 
 // 统一终态收口（幂等）：onDone / onError / cancel 都走这里，避免空指针与重复 persist
 function finalize(aborted, error) {
@@ -217,6 +264,10 @@ function finalize(aborted, error) {
   persistCurrent()
   refreshSessionsKeep()
   scrollChat()
+  if (pendingConfigRestart) {
+    pendingConfigRestart = false
+    restartEngineForConfig()
+  }
 }
 
 function onEsc() {
@@ -286,12 +337,14 @@ onMounted(async () => {
     detectContext()
     loadDefaults()
     loadEnv()
+    setTimeout(checkDefaultAuth, 600)
   }, 200)
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onGlobalKey)
   window.removeEventListener('pideck:enter', onEnterEvent)
+  clearTimeout(deleteTimer)
 })
 
 function onGlobalKey(e) {
@@ -389,6 +442,7 @@ function selectGroup(id) {
   activeId.value = id         // 再切换
   loadSkillsAsync()           // 异步，不阻塞切换
   detectContext()
+  historyFallbackNotified = false
   files.value = []            // @ 文件改为懒加载，清空旧的
   refreshSessions()
   restoreDraft()              // 最后恢复【新 id】的草稿
@@ -420,6 +474,7 @@ function loadSession(id) {
   if (!s) return
   currentSession.value = s
   errorMsg.value = ''
+  historyFallbackNotified = false
   resetPaging()
   closeHistory()
   nextTick(() => scrollChat(true))
@@ -434,14 +489,14 @@ function snapshotConfig(g) {
 function newChat() {
   if (running.value) return
   saveCurrentDraft()
-  // 懒创建：仅清空到新对话空态，首条消息发送时再落盘创建会话
+  // 只清对话视图：输入框与附件保留，避免误点「新对话」丢掉未发送内容
+  const kept = !!(inputText.value.trim() || images.value.length || attachedFiles.value.length)
   currentSession.value = null
   resetPaging()
-  inputText.value = ''
-  images.value = []
-  attachedFiles.value = []
   errorMsg.value = ''
+  historyFallbackNotified = false
   closeHistory()
+  if (kept) showToast('已开始新对话，输入内容已保留')
   nextTick(() => inputEl.value && inputEl.value.focus())
 }
 function removeSession(id) {
@@ -603,6 +658,8 @@ async function send() {
     resetPaging()
   }
   const session = currentSession.value
+  // 本会话在发送前是否已有历史轮次：决定 RPC 能否直接续接，否则回退单次调用
+  const hadHistory = session.messages.length > 0
   // 始终使用分组当前配置：用户改模型/思考后应立刻对新消息生效
   updateSession(session.id, { config: { ...g } })
 
@@ -644,6 +701,10 @@ async function send() {
         prompt, model: g.model || '', thinking: g.thinking || '', cwd: g.cwd || '', files: sendFiles,
         sessionId: session.piSessionId,
         tool: g.tool,
+        groupId: activeId.value,
+        groupName: (activeGroup.value && activeGroup.value.name) || '',
+        promptPreview: userText.slice(0, 80),
+        hasLocalHistory: hadHistory,
       },
       {
         onEvent: rec => {
@@ -682,6 +743,13 @@ async function send() {
         onError: msg => finalize(cancelled, cancelled ? '' : msg),
       }
     )
+    // 历史会话无法在常驻进程内续接，preload 已自动改用单次调用；这里只提示一次
+    if (runHandle && runHandle.mode === 'json' && engine.value === 'rpc' && hadHistory && !historyFallbackNotified) {
+      historyFallbackNotified = true
+      showToast(runHandle.sessionResumed === false
+        ? '长驻模式的上下文不落盘，本条作为新上下文开始'
+        : '历史会话改用单次调用，保证上下文续接')
+    }
   } catch (e) {
     finalize(false, String(e.message || e))
   }
@@ -788,6 +856,11 @@ function onSaveGroup(next) {
   else groups.value.push(next)
   saveGroups(groups.value)
   showToast('设置已保存')
+  if (window.piBridge && window.piBridge.auditRecord) {
+    try {
+      window.piBridge.auditRecord({ type: 'perm', groupId: next.id, groupName: next.name, perm: toolTitle(next.tool) })
+    } catch (_) {}
+  }
   loadSkillsAsync()
   detectContext()
   files.value = []
@@ -797,9 +870,7 @@ function onSaveGroup(next) {
 function onDeleteGroup(g) {
   if (groups.value.length <= 1) return
   const list = listSessions(g.id)
-  const count = list.length
-  if (count && !confirm(`删除「${g.name}」将同时删除其 ${count} 个会话（含 pi 侧会话文件）。确认删除？`)) return
-  // 连带清理该分组的会话与 pi 会话文件，避免堆积
+  // 连带清理该分组的会话与 pi 会话文件，避免堆积（删除已在设置页做过两步确认）
   for (const s of list) {
     deleteSession(s.id)
     if (s.piSessionId && window.piBridge && window.piBridge.deletePiSession) {
@@ -812,6 +883,42 @@ function onDeleteGroup(g) {
   else sessions.value = listSessions(activeId.value)
   closeSettings()
 }
+
+// 清空全部对话（含 pi 侧会话文件），由设置页两步确认后触发
+function clearAllConversations() {
+  if (running.value) { showToast('请先停止当前回答'); return }
+  const list = clearAllSessions()
+  for (const s of list) {
+    if (s.piSessionId && window.piBridge && window.piBridge.deletePiSession) {
+      try { window.piBridge.deletePiSession(s.piSessionId) } catch (_) {}
+    }
+  }
+  currentSession.value = null
+  sessions.value = []
+  closeHistory()
+  if (window.piBridge && window.piBridge.auditRecord) {
+    try { window.piBridge.auditRecord({ type: 'data', action: 'clear-sessions' }) } catch (_) {}
+  }
+  showToast(`已清空 ${list.length} 个对话`)
+}
+
+// 模型配置保存后：停掉旧常驻进程，让新配置在下一条消息生效
+function restartEngineForConfig() {
+  if (window.piBridge && window.piBridge.stopRpc) { try { window.piBridge.stopRpc() } catch (_) {} }
+  refreshModels()
+  loadDefaults(true)
+  loadEnv()
+  setTimeout(checkDefaultAuth, 300)
+  maybePrewarmRpc()
+}
+function onConfigSaved() {
+  if (running.value) {
+    pendingConfigRestart = true
+    showToast('新配置将在当前回答结束后生效')
+    return
+  }
+  restartEngineForConfig()
+}
 </script>
 
 <template>
@@ -820,8 +927,10 @@ function onDeleteGroup(g) {
       :pi-status="piStatus"
       :env-info="envInfo"
       :show-env-help="showEnvHelp"
+      :needs-config="needModelConfig"
       @toggle-help="showEnvHelp = !showEnvHelp"
       @recheck="recheckEnv"
+      @config="openConfigWizard"
       @open-link="openLink"
       @copy-cmd="copyCmd"
       @open-path="openPath"
@@ -859,7 +968,14 @@ function onDeleteGroup(g) {
           >
             <span class="history-title" role="button" tabindex="0" @click="loadSession(s.id)" @keydown.enter.prevent="loadSession(s.id)">{{ s.title }}</span>
             <span class="history-time">{{ relTime(s.updatedAt) }}</span>
-            <button class="history-del" title="删除" aria-label="删除会话" @click.stop="removeSession(s.id)"><Icon name="close" :size="11" /></button>
+            <button
+              class="history-del" :class="{ confirming: deleteConfirmId === s.id }"
+              :title="deleteConfirmId === s.id ? '再点一次确认删除' : '删除'"
+              :aria-label="deleteConfirmId === s.id ? '确认删除会话' : '删除会话'"
+              @click.stop="requestDeleteSession(s.id)"
+            >
+              <span v-if="deleteConfirmId === s.id">确认</span><Icon v-else name="close" :size="11" />
+            </button>
           </div>
           <div v-if="!filteredSessions.length" class="history-empty">{{ sessionSearch ? '没有匹配的会话' : '暂无对话' }}</div>
         </div>
@@ -890,6 +1006,7 @@ function onDeleteGroup(g) {
             <button class="rail-btn" @click="openHistory" title="历史对话">
               <Icon name="history" :size="13" /><span class="rb-label">历史</span><kbd class="rb-kbd">{{ historyKey }}</kbd>
             </button>
+            <button class="rail-btn icon-only" @click="exportCurrent" title="导出当前会话"><Icon name="download" :size="13" /></button>
             <button class="rail-btn icon-only" title="切换到经典布局" @click="setLayout('classic')"><Icon name="panel" :size="13" /></button>
             <button class="rail-btn icon-only" @click="openSettings" title="设置"><Icon name="settings" :size="14" /></button>
           </div>
@@ -988,9 +1105,10 @@ function onDeleteGroup(g) {
       :show="showHistory"
       :sessions="sessions"
       :current-session-id="currentSession ? currentSession.id : ''"
+      :confirm-delete-id="deleteConfirmId"
       @close="closeHistory"
       @select="loadSession"
-      @remove="removeSession"
+      @request-remove="requestDeleteSession"
     />
 
     <SettingsModal
@@ -1020,6 +1138,11 @@ function onDeleteGroup(g) {
       @refresh-models="refreshModels"
       @open-path="openPath"
       @recheck-env="recheckEnv"
+      @clear-all-sessions="clearAllConversations"
+      @config-saved="onConfigSaved"
+      @notify="showToast"
+      @copy-cmd="copyCmd"
+      @open-link="openLink"
     />
 
     <!-- 图片放大预览 -->

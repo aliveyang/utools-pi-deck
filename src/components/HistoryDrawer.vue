@@ -7,8 +7,9 @@ const props = defineProps({
   show: { type: Boolean, default: false },
   sessions: { type: Array, default: () => [] },
   currentSessionId: { type: String, default: '' },
+  confirmDeleteId: { type: String, default: '' },
 })
-const emit = defineEmits(['close', 'select', 'remove'])
+const emit = defineEmits(['close', 'select', 'requestRemove'])
 
 const searchEl = ref(null)
 const sessionSearch = ref('')
@@ -84,7 +85,14 @@ function isFocusedSession(s) {
           >
             <span class="h-title">{{ s.title }}</span>
             <span class="h-time">{{ relTime(s.updatedAt) }}</span>
-            <button class="h-del" title="删除" aria-label="删除会话" @click.stop="emit('remove', s.id)"><Icon name="close" :size="11" /></button>
+            <button
+              class="h-del" :class="{ confirming: confirmDeleteId === s.id }"
+              :title="confirmDeleteId === s.id ? '再点一次确认删除' : '删除'"
+              :aria-label="confirmDeleteId === s.id ? '确认删除会话' : '删除会话'"
+              @click.stop="emit('requestRemove', s.id)"
+            >
+              <span v-if="confirmDeleteId === s.id">确认</span><Icon v-else name="close" :size="11" />
+            </button>
           </div>
         </template>
         <div v-if="!filteredSessions.length" class="drawer-empty">{{ sessionSearch ? '没有匹配的会话' : '还没有对话' }}</div>

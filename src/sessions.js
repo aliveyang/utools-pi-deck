@@ -146,6 +146,14 @@ export function deleteSession(id) {
   return cur
 }
 
+// 清空全部会话（返回索引条目，供调用方清理 pi 侧文件）
+export function clearAllSessions() {
+  const idx = readIndex()
+  for (const e of idx) remove(itemKey(e.id))
+  writeIndex([])
+  return idx
+}
+
 
 export function titleFromText(text) {
   const clean = String(text || '').replace(/\s+/g, ' ').trim()

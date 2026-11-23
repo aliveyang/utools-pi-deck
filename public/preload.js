@@ -10,6 +10,12 @@ catch (e1) {
 let rpcEngine = null
 try { rpcEngine = require('./shared/rpc-engine.cjs') }
 catch (_) { try { rpcEngine = require('../shared/rpc-engine.cjs') } catch (_) {} }
+let auditCore = null
+try { auditCore = require('./shared/audit.cjs') }
+catch (_) { try { auditCore = require('../shared/audit.cjs') } catch (_) {} }
+let configCore = null
+try { configCore = require('./shared/config.cjs') }
+catch (_) { try { configCore = require('../shared/config.cjs') } catch (_) {} }
 
 // core 加载失败时不崩溃，降级为只暴露 resolvePi 错误信息
 const { spawn } = require('node:child_process')
@@ -35,6 +41,13 @@ if (!core) {
     cancel: () => {}, saveImage: () => { throw new Error('pi-core 加载失败') },
     pickFolder: () => null, validateCwd: () => false, effectiveCwd: p => p || os.homedir(), resolveCwd: p => p || os.homedir(),
     homedir: () => os.homedir(),
+    auditTail: () => [], auditExport: () => '', auditDir: () => '', auditClear: () => ({ removed: 0, failed: 0 }), auditRecord: () => false,
+    configState: () => ({ ok: false, error: 'pi-core 加载失败' }),
+    configSave: () => ({ ok: false, error: 'pi-core 加载失败' }),
+    configRemoveKey: () => ({ ok: false, error: 'pi-core 加载失败' }),
+    configAuthCheck: () => Promise.resolve({ status: 'unavailable' }),
+    configLoginCommand: () => '',
+    openTerminalForProvider: () => false,
   }
 } else {
   boot()
@@ -147,6 +160,98 @@ function openExternal(url) {
   return false
 }
 
+// ---------- 操作审计（失败绝不影响主流程） ----------
+function toolSummary(t) {
+  if (!t) return '无工具'
+  const bits = [(t.list || []).join(',') || '无内置工具']
+  bits.push(t.mcp === 'off' ? 'MCP 关' : t.mcp === 'all' ? 'MCP 全部' : 'MCP ' + (t.mcpServers || '未指定'))
+  if (t.ext) bits.push('扩展开')
+  if (t.skills === 'off') bits.push('技能关')
+  else if (t.skills === 'some') bits.push('技能 ' + (t.skillPaths || []).length + ' 个')
+  if (t.context) bits.push('项目规范')
+  if (t.trust) bits.push('项目配置')
+  return bits.join(' · ')
+}
+function isRiskTool(name) {
+  // 只读类之外的都算风险：覆盖 MCP / 扩展带来的写文件、执行命令等工具
+  return !['read', 'grep', 'find', 'ls'].includes(String(name || ''))
+}
+function auditRecord(entry) {
+  if (!auditCore) return false
+  try { return auditCore.record(entry) } catch (_) { return false }
+}
+// 包装 handlers：工具级立即落盘，运行结束补一条汇总
+function wrapHandlers(opts, handlers, ctx) {
+  const h = handlers || {}
+  const started = new Map()
+  let usage = null
+  let finished = false
+  const base = {
+    groupId: opts.groupId || '',
+    groupName: opts.groupName || '',
+    cwd: opts.cwd || '',
+    perm: toolSummary(opts.tool),
+    promptPreview: opts.promptPreview || '',
+  }
+  return {
+    ...h,
+    onUsage: u => { usage = u; h.onUsage && h.onUsage(u) },
+    onTool: (phase, name, payload, id) => {
+      const key = id || ('name:' + name)
+      if (phase === 'start') {
+        started.set(key, { args: payload, ts: Date.now() })
+      } else {
+        const s = started.get(key) || {}
+        started.delete(key)
+        auditRecord({
+          type: 'tool', ...base, engine: ctx.engine, risk: isRiskTool(name),
+          tool: { name, args: s.args, result: payload, durationMs: s.ts ? Date.now() - s.ts : 0 },
+        })
+      }
+      h.onTool && h.onTool(phase, name, payload, id)
+    },
+    onDone: payload => {
+      if (finished) return
+      finished = true
+      auditRecord({ type: 'run', ...base, engine: ctx.engine, usage, aborted: !!(payload && payload.aborted) })
+      h.onDone && h.onDone(payload)
+    },
+    onError: msg => {
+      if (finished) return
+      finished = true
+      auditRecord({ type: 'run', ...base, engine: ctx.engine, usage, error: String(msg || '') })
+      h.onError && h.onError(msg)
+    },
+  }
+}
+
+// 打开终端执行登录命令：Windows 写临时 .cmd 规避引号转义，macOS 走 AppleScript
+function openTerminal(command) {
+  const safeCmd = String(command || '').trim()
+  if (!safeCmd) return false
+  try {
+    if (process.platform === 'win32') {
+      const file = path.join(os.tmpdir(), 'pideck-login.cmd')
+      fs.writeFileSync(file, `@echo off\r\n${safeCmd}\r\n`, { encoding: 'utf8', mode: 0o600 })
+      // start 的第一个参数是窗口标题（空串）；文件路径加引号以兼容含空格的 %TEMP%
+      const child = spawn('cmd.exe', ['/c', 'start', '', 'cmd.exe', '/k', `"${file}"`], {
+        detached: true, stdio: 'ignore', windowsHide: false,
+      })
+      child.on('error', () => {})
+      child.unref()
+      return true
+    }
+    if (process.platform === 'darwin') {
+      const script = `tell application "Terminal" to do script ${JSON.stringify(safeCmd)}`
+      const child = spawn('osascript', ['-e', script], { detached: true, stdio: 'ignore' })
+      child.on('error', () => {})
+      child.unref()
+      return true
+    }
+    return false
+  } catch (_) { return false }
+}
+
 // ---------- Pi 调用 ----------
 let currentChild = null
 let activeRpcCancel = null
@@ -158,9 +263,15 @@ function run(opts, handlers) {
   const cfg = loadConfig()
   // RPC 引擎：已预热且无非图片附件时走长驻进程；否则回退 JSON 模式并懒预热
   const canRpc = !(rpcEngine && rpcEngine.hasNonImageFiles && rpcEngine.hasNonImageFiles(opts.files))
-  if (cfg.engine === 'rpc' && rpcEngine && canRpc) {
+  // 历史会话只有在常驻进程已持有同一会话时才走 RPC；否则强制单次调用，保证落盘会话续接
+  const rpcHasSession = (canRpc && rpcEngine && rpcEngine.hasSession)
+    ? rpcEngine.hasSession(opts.cwd, opts, opts.sessionId) : false
+  const mustUseJson = !!opts.hasLocalHistory && !rpcHasSession
+  const ctx = { engine: 'json' }
+  const wrapped = wrapHandlers(opts, handlers, ctx)
+  if (cfg.engine === 'rpc' && rpcEngine && canRpc && !mustUseJson) {
     if (!rpcEngine.isReady(opts.cwd, opts)) {
-      // 懒预热：本条回退 JSON，后台建立长驻进程，下一条消息起零冷启动
+      // 懒预热：本条回退 JSON，后台建立长驻进程，下一条新会话起零冷启动
       try { rpcEngine.prewarm(opts.cwd, opts).catch(() => {}) } catch (_) {}
     } else {
       try {
@@ -171,10 +282,11 @@ function run(opts, handlers) {
           if (rpcHandle && rpcHandle.cancel) rpcHandle.cancel()
         }
         activeRpcCancel = doCancel
+        ctx.engine = 'rpc'
         rpcHandle = rpcEngine.prompt(opts.cwd, opts, {
-          ...handlers,
-          onDone: payload => { clearActive(); handlers.onDone && handlers.onDone(payload) },
-          onError: msg => { clearActive(); handlers.onError && handlers.onError(msg) },
+          ...wrapped,
+          onDone: payload => { clearActive(); wrapped.onDone && wrapped.onDone(payload) },
+          onError: msg => { clearActive(); wrapped.onError && wrapped.onError(msg) },
         })
         return { cancel: doCancel, mode: 'rpc' }
       } catch (_) {
@@ -184,6 +296,9 @@ function run(opts, handlers) {
     }
   }
 
+  ctx.engine = 'json'
+  // 该会话是否已落盘：RPC 产生历史没有磁盘文件，回退 JSON 时模型看不到旧上下文
+  const sessionResumed = mustUseJson && core.hasPiSession ? core.hasPiSession(opts.sessionId) : true
   const { node } = resolvePi()
   const args = core.buildArgs(opts)
 
@@ -201,12 +316,12 @@ function run(opts, handlers) {
   const finish = (payload) => {
     if (settled) return
     settled = true
-    handlers.onDone && handlers.onDone(payload)
+    wrapped.onDone && wrapped.onDone(payload)
   }
 
   child.stdout.on('data', chunk => {
     pushChunk(buf, chunk, rec => {
-      const settled = core.mapPiEvent(rec, handlers)
+      const settled = core.mapPiEvent(rec, wrapped)
       if (settled) finish({ aborted: false })
     })
   })
@@ -223,7 +338,7 @@ function run(opts, handlers) {
   child.on('error', err => {
     settled = true
     release()
-    handlers.onError && handlers.onError(String(err && err.message || err))
+    wrapped.onError && wrapped.onError(String(err && err.message || err))
   })
   child.on('close', code => {
     release()
@@ -232,10 +347,10 @@ function run(opts, handlers) {
       if (aborted) finish({ aborted: true })
       else {
         const msg = stderr.trim()
-        handlers.onError && handlers.onError(msg ? `pi 退出（code ${code}）：${msg.slice(-1200)}` : `pi 退出（code ${code}）`)
+        wrapped.onError && wrapped.onError(msg ? `pi 退出（code ${code}）：${msg.slice(-1200)}` : `pi 退出（code ${code}）`)
       }
     } else {
-      handlers.onClose && handlers.onClose(code)
+      wrapped.onClose && wrapped.onClose(code)
     }
   })
 
@@ -246,7 +361,7 @@ function run(opts, handlers) {
       aborted = true
       release()
       try { child.kill() } catch (_) {}
-      handlers.onError && handlers.onError('pi 运行超时（15 分钟），已终止')
+      wrapped.onError && wrapped.onError('pi 运行超时（15 分钟），已终止')
     }
   }, 15 * 60 * 1000)
   child.on('close', () => clearTimeout(timer))
@@ -259,6 +374,7 @@ function run(opts, handlers) {
       try { child.kill() } catch (_) {}
     },
     mode: 'json',
+    sessionResumed,
   }
 }
 
@@ -338,6 +454,19 @@ window.piBridge = {
     return rpcEngine.prewarm(cwd, core.applyLeanSystemPrompt(flags || {}))
   },
   stopRpc: () => (rpcEngine ? rpcEngine.stop() : null),
+  // 操作审计：本地 JSONL，脱敏、按天分片
+  auditTail: n => (auditCore ? auditCore.tail(n) : []),
+  auditExport: days => (auditCore ? auditCore.exportMd(days) : ''),
+  auditDir: () => (auditCore ? auditCore.dir() : ''),
+  auditClear: () => (auditCore ? auditCore.clear() : { removed: 0, failed: 0 }),
+  auditRecord,
+  // pi 配置：读写 settings.json / models.json（不回传密钥）
+  configState: () => (configCore ? { ok: true, ...configCore.getState() } : { ok: false, error: '配置模块加载失败' }),
+  configSave: input => (configCore ? configCore.save(input) : { ok: false, error: '配置模块加载失败' }),
+  configRemoveKey: provider => (configCore ? configCore.removeKey(provider) : { ok: false, error: '配置模块加载失败' }),
+  configAuthCheck: provider => (configCore ? configCore.authCheck(provider) : Promise.resolve({ status: 'unavailable' })),
+  configLoginCommand: provider => (configCore ? configCore.loginCommand(provider) : ''),
+  openTerminalForProvider: provider => (configCore ? openTerminal(configCore.loginCommand(provider)) : false),
   resolvePi: () => {
     try { const r = resolvePi(); return { ok: true, ...r } }
     catch (e) { return { ok: false, error: String(e.message || e) } }
