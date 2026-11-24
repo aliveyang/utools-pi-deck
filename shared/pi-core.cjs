@@ -7,8 +7,24 @@ const { execFileSync, spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
 
 // ---------- pi 定位（多平台） ----------
+const PI_INSTALL_CMD = 'npm i -g @earendil-works/pi-coding-agent'
 let _piCache = null
 let _nodeCache = null
+let _overrides = { nodePath: '', piCliPath: '' }
+
+function resetPiCache() {
+  _piCache = null
+  _nodeCache = null
+  _modelsCache = null
+  _modelsAt = 0
+}
+
+function setPathOverrides(patch) {
+  const p = patch && typeof patch === 'object' ? patch : {}
+  if ('nodePath' in p) _overrides.nodePath = String(p.nodePath || '').trim()
+  if ('piCliPath' in p) _overrides.piCliPath = String(p.piCliPath || '').trim()
+  resetPiCache()
+}
 
 function nodeMajor(cmd) {
   try {
@@ -18,17 +34,54 @@ function nodeMajor(cmd) {
   } catch (_) { return null }
 }
 
+function parseSemverTag(name) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(name || ''))
+  return m ? [+m[1], +m[2], +m[3]] : null
+}
+
+function listVersionDirsDesc(root, relBin) {
+  try {
+    if (!root || !fs.existsSync(root)) return []
+    const dirs = fs.readdirSync(root, { withFileTypes: true })
+      .filter(d => d.isDirectory() && parseSemverTag(d.name))
+      .sort((a, b) => {
+        const va = parseSemverTag(a.name), vb = parseSemverTag(b.name)
+        return (vb[0] - va[0]) || (vb[1] - va[1]) || (vb[2] - va[2])
+      })
+    return dirs.map(d => path.join(root, d.name, relBin))
+  } catch (_) { return [] }
+}
+
 function findNode() {
   if (_nodeCache) return _nodeCache
-  const candidates = [
+  const home = os.homedir()
+  const rawCandidates = [
+    _overrides.nodePath,
     process.env.PIDECK_NODE,
-    path.join(os.homedir(), 'AppData', 'Roaming', 'npm', 'node.exe'),
+    // Windows 版本管理器与常见安装路径
+    process.env.NVM_SYMLINK ? path.join(process.env.NVM_SYMLINK, 'node.exe') : '',
+    ...listVersionDirsDesc(process.env.NVM_HOME || path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'nvm'), 'node.exe'),
+    path.join(home, '.volta', 'bin', 'node.exe'),
+    path.join(home, 'scoop', 'shims', 'node.exe'),
+    ...listVersionDirsDesc(path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'fnm', 'node-versions'), path.join('installation', 'node.exe')),
+    path.join(home, 'AppData', 'Roaming', 'npm', 'node.exe'),
     'C:\\Program Files\\nodejs\\node.exe',
     'C:\\Program Files (x86)\\nodejs\\node.exe',
-    '/usr/local/bin/node', '/usr/bin/node',
+    // macOS / Linux 版本管理器与系统路径
+    '/opt/homebrew/bin/node',
+    '/usr/local/bin/node',
+    '/usr/bin/node',
+    path.join(home, '.volta', 'bin', 'node'),
+    ...listVersionDirsDesc(path.join(home, '.nvm', 'versions', 'node'), path.join('bin', 'node')),
+    ...listVersionDirsDesc(path.join(home, '.fnm', 'node-versions'), path.join('installation', 'bin', 'node')),
     'node',
   ].filter(Boolean)
-  for (const cmd of candidates) {
+
+  const seen = new Set()
+  for (const cmd of rawCandidates) {
+    if (seen.has(cmd)) continue
+    seen.add(cmd)
+    if (cmd !== 'node' && !fs.existsSync(cmd)) continue
     const v = nodeMajor(cmd)
     if (v && (v.major > 22 || (v.major === 22 && v.minor >= 19))) { _nodeCache = cmd; return cmd }
   }
@@ -36,18 +89,30 @@ function findNode() {
   err.code = 'NODE_MISSING'
   throw err
 }
+
 function findPiCli() {
   if (_piCache) return _piCache
+  const home = os.homedir()
+  const pkgCli = path.join('@earendil-works', 'pi-coding-agent', 'dist', 'bundle', 'cli.js')
+  const relCli = path.join('node_modules', pkgCli)
+  const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming')
+  const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local')
   const candidates = [
+    _overrides.piCliPath,
     process.env.PIDECK_PI_CLI,
-    path.join(os.homedir(), 'AppData', 'Roaming', 'npm', 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'bundle', 'cli.js'),
-    path.join(os.homedir(), '.local', 'share', 'pnpm', 'global', 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'bundle', 'cli.js'),
-    '/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js',
-    '/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js',
+    path.join(appData, 'npm', relCli),
+    path.join(home, '.local', 'share', 'pnpm', 'global', relCli),
+    path.join(localAppData, 'pnpm', 'global', '5', relCli),
+    path.join(home, 'scoop', 'persist', 'nodejs', relCli),
+    path.join(home, '.volta', 'tools', 'image', 'packages', '@earendil-works', 'pi-coding-agent', 'lib', relCli),
+    process.env.NVM_SYMLINK ? path.join(process.env.NVM_SYMLINK, relCli) : '',
+    ...listVersionDirsDesc(process.env.NVM_HOME || path.join(appData, 'nvm'), relCli),
+    '/usr/local/lib/' + relCli,
+    '/opt/homebrew/lib/' + relCli,
+    ...listVersionDirsDesc(path.join(home, '.nvm', 'versions', 'node'), path.join('lib', relCli)),
   ].filter(Boolean)
   // PATH 兜底：where / which pi（兼容 Windows npm shim 与 macOS/Linux 符号链接）
   if (!candidates.some(p => fs.existsSync(p))) {
-    const relCli = path.join('node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'bundle', 'cli.js')
     for (const cmd of ['where', 'which']) {
       try {
         const lines = execFileSync(cmd, ['pi'], { encoding: 'utf8', windowsHide: true, timeout: 5000 })
@@ -72,7 +137,7 @@ function findPiCli() {
   }
   const found = candidates.find(p => fs.existsSync(p))
   if (!found) {
-    const err = new Error(`未找到 pi CLI。请安装：npm i -g @earendil-works/pi-coding-agent\n或设置环境变量 PIDECK_PI_CLI 指向 cli.js`)
+    const err = new Error(`未找到 pi CLI。请安装：${PI_INSTALL_CMD}\n或设置环境变量 PIDECK_PI_CLI 指向 cli.js`)
     err.code = 'PI_MISSING'
     throw err
   }
@@ -81,8 +146,9 @@ function findPiCli() {
 }
 
 function resolvePi() {
+  const node = findNode()
   const cli = findPiCli()
-  return { node: findNode(), cli }
+  return { node, cli }
 }
 
 // ---------- pi 事件 → 统一回调映射 ----------
@@ -295,47 +361,36 @@ function listFiles(cwd, query) {
 //   templates: bool,                  提示词模板
 //   trust: bool,                      项目级 .pi 配置（--approve / --no-approve）
 // }
-const TOOL_NAMES = ['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash', 'powershell']
+const READ_TOOL_NAMES = ['read', 'grep', 'find', 'ls']
+const RISK_TOOL_NAMES = ['edit', 'write', 'bash', 'powershell']
+const TOOL_NAMES = [...READ_TOOL_NAMES, ...RISK_TOOL_NAMES]
 const PRESET_LISTS = {
   text: [],
-  read: ['read', 'grep', 'find', 'ls'],
-  edit: ['read', 'grep', 'find', 'ls', 'edit', 'write'],
-  full: ['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash', 'powershell'],
+  read: [...READ_TOOL_NAMES],
+  edit: [...READ_TOOL_NAMES, 'edit', 'write'],
+  full: [...TOOL_NAMES],
 }
 
-// 老数据（perm + lean 布尔）→ 精细结构
-function normalizeTool(tool, opts) {
-  const o = opts || {}
-  if (tool && Array.isArray(tool.list)) {
-    return {
-      list: tool.list.filter(n => TOOL_NAMES.includes(n)),
-      mcp: tool.mcp || 'off',
-      mcpServers: tool.mcpServers || '',
-      ext: !!tool.ext,
-      skills: tool.skills || 'off',
-      skillPaths: Array.isArray(tool.skillPaths) ? tool.skillPaths.filter(Boolean) : [],
-      context: !!tool.context,
-      templates: !!tool.templates,
-      trust: typeof tool.trust === 'boolean' ? tool.trust : !!o.trustProject,
-    }
-  }
-  const p = o.perm || (o.noTools ? 'text' : 'full')
+// 规范化工具权限结构（缺失时默认最安全的只读档）
+function normalizeTool(tool) {
+  const t = (tool && typeof tool === 'object') ? tool : {}
+  const list = Array.isArray(t.list) ? t.list.filter(n => TOOL_NAMES.includes(n)) : PRESET_LISTS.read.slice()
   return {
-    list: (PRESET_LISTS[p] || PRESET_LISTS.full).slice(),
-    mcp: o.noMcp ? 'off' : (p === 'full' ? 'all' : 'off'),
-    mcpServers: '',
-    ext: p === 'full',
-    skills: o.noSkills ? 'off' : 'all',
-    skillPaths: [],
-    context: !o.noContextFiles,
-    templates: !o.noPromptTemplates,
-    trust: !!o.trustProject,
+    list,
+    mcp: t.mcp === 'all' || t.mcp === 'servers' ? t.mcp : 'off',
+    mcpServers: typeof t.mcpServers === 'string' ? t.mcpServers : '',
+    ext: !!t.ext,
+    skills: t.skills === 'all' || t.skills === 'some' ? t.skills : 'off',
+    skillPaths: Array.isArray(t.skillPaths) ? t.skillPaths.filter(Boolean) : [],
+    context: !!t.context,
+    templates: !!t.templates,
+    trust: !!t.trust,
   }
 }
 
 // 精细结构 → pi argv
-function buildPermArgs(tool, opts) {
-  const t = normalizeTool(tool, opts)
+function buildPermArgs(tool) {
+  const t = normalizeTool(tool)
   const args = []
   const servers = String(t.mcpServers || '').split(',').map(x => x.trim()).filter(Boolean)
   // "指定 server" 但没填名字时不能当成"全部"放行，按关闭处理
@@ -367,13 +422,14 @@ function buildPermArgs(tool, opts) {
   if (!t.templates) args.push('-np')
   // --approve / --no-approve 仅控制项目级 .pi 配置信任；默认传 --no-approve（不自动信任）
   if (t.trust === true) args.push('--approve')
-  else if (t.trust === false) args.push('--no-approve')
+  else args.push('--no-approve')
   return args
 }
 
-// 兼容旧调用：只关心"有没有工具"（纯文本要替换 system prompt）
-function permFlags(perm, opts) {
-  const t = normalizeTool(opts && opts.tool, { ...(opts || {}), perm })
+// 判断是否纯文本无工具（禁工具且无 MCP/扩展时需替换 system prompt）
+function permFlags(toolOrOpts) {
+  const src = (toolOrOpts && toolOrOpts.tool !== undefined) ? toolOrOpts.tool : toolOrOpts
+  const t = normalizeTool(src)
   const servers = String(t.mcpServers || '').split(',').map(x => x.trim()).filter(Boolean)
   const mcpOff = t.mcp === 'off' || (t.mcp === 'servers' && !servers.length)
   return { noTools: !t.list.length && mcpOff && !t.ext }
@@ -381,7 +437,7 @@ function permFlags(perm, opts) {
 
 function applyLeanSystemPrompt(opts) {
   const o = opts || {}
-  return (permFlags(o.perm, o).noTools && !o.systemPrompt) ? { ...o, systemPrompt: LEAN_SYSTEM_PROMPT } : o
+  return (permFlags(o.tool).noTools && !o.systemPrompt) ? { ...o, systemPrompt: LEAN_SYSTEM_PROMPT } : o
 }
 
 // ---------- spawn 参数构造（统一 argv 规则） ----------
@@ -394,7 +450,7 @@ function buildArgs(opts) {
   if (opts.model && safe(opts.model)) args.push('--model', safe(opts.model))
   if (opts.thinking && safe(opts.thinking)) args.push('--thinking', safe(opts.thinking))
   // 工具 / 资源 / 上下文：全部由精细档位决定
-  args.push(...buildPermArgs(opts.tool, opts))
+  args.push(...buildPermArgs(opts.tool))
   // 禁工具时必须替换 system prompt：否则 pi 仍自称 coding assistant 可执行命令，
   // 模型会输出原始工具调用标记（如 <||DSML||>）而非正常回答
   if (opts.systemPrompt) args.push('--system-prompt', opts.systemPrompt)
@@ -422,8 +478,7 @@ function getDefaults(cwd) {
     const child = spawn(node, [cli, '--mode', 'rpc', '--no-session'], {
       cwd: effectiveCwd(cwd), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     })
-    let buf = ''
-    const dec = new StringDecoder('utf8')
+    const buf = makeLineBuffer()
     let done = false
     let timeout = null
     const finish = data => {
@@ -435,12 +490,7 @@ function getDefaults(cwd) {
       resolve(data)
     }
     child.stdout.on('data', chunk => {
-      buf += dec.write(chunk)
-      let nl
-      while ((nl = buf.indexOf('\n')) !== -1) {
-        const line = buf.slice(0, nl); buf = buf.slice(nl + 1)
-        if (!line.trim()) continue
-        let rec; try { rec = JSON.parse(line) } catch (_) { continue }
+      pushChunk(buf, chunk, rec => {
         if (rec.type === 'response' && rec.command === 'get_state' && rec.success !== false) {
           const d = rec.data || {}
           finish({
@@ -449,7 +499,7 @@ function getDefaults(cwd) {
             thinkingLevel: d.thinkingLevel || '',
           })
         }
-      }
+      })
     })
     child.stderr.on('data', () => {})
     child.on('error', e => finish({ error: String(e.message || e) }))
@@ -515,25 +565,31 @@ function deletePiSession(sessionId, root) {
 function readJsonSafe(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch (_) { return null }
 }
-function getEnv() {
+function getEnv(deps) {
+  const probeNode = (deps && deps.findNode) || findNode
+  const probePi = (deps && deps.findPiCli) || findPiCli
   const env = {
     ok: false, errorCode: '', error: '',
     nodePath: '', nodeVersion: '', piPath: '', piVersion: '',
     agentDir: agentDir(),
     configs: [], defaultModel: '', defaultProvider: '', defaultThinking: '',
   }
+  let nodeErr = null
+  let piErr = null
   try {
-    const { node, cli } = resolvePi()
-    env.nodePath = node
-    env.piPath = cli
-    env.ok = true
+    env.nodePath = probeNode()
     try {
-      const v = execFileSync(node, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 5000 }).trim()
+      const v = execFileSync(env.nodePath, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 5000 }).trim()
       env.nodeVersion = v
     } catch (_) {}
+  } catch (e) {
+    nodeErr = e
+  }
+  try {
+    env.piPath = probePi()
     try {
       // cli 位于 .../pi-coding-agent/dist/bundle/cli.js → 向上找 package.json
-      let d = path.dirname(cli)
+      let d = path.dirname(env.piPath)
       for (let i = 0; i < 5; i++) {
         const pkg = path.join(d, 'package.json')
         if (fs.existsSync(pkg)) {
@@ -546,8 +602,14 @@ function getEnv() {
       }
     } catch (_) {}
   } catch (e) {
-    env.errorCode = e.code || ''
-    env.error = String(e.message || e)
+    piErr = e
+  }
+  if (!nodeErr && !piErr) {
+    env.ok = true
+  } else {
+    const firstErr = nodeErr || piErr
+    env.errorCode = firstErr.code || ''
+    env.error = String(firstErr.message || firstErr)
   }
   // 配置文件状态（不含密钥内容）
   const files = [
@@ -602,8 +664,10 @@ function detectContextFiles(cwd) {
 }
 
 module.exports = {
-  resolvePi,
+  PI_INSTALL_CMD,
+  READ_TOOL_NAMES, RISK_TOOL_NAMES, TOOL_NAMES, PRESET_LISTS,
+  resolvePi, resetPiCache, setPathOverrides,
   makeLineBuffer, pushChunk, makeTextStream, validateCwd, effectiveCwd, resolveCwd, defaultWorkspace,
-  parseSkillMd, scanSkillsDir, listSkills, parseModelsOutput, listModels, listFiles, buildArgs, buildPermArgs, normalizeTool, permFlags, applyLeanSystemPrompt, PRESET_LISTS, TOOL_NAMES, detectContextFiles, LEAN_SYSTEM_PROMPT, getDefaults, findPiSession, hasPiSession, deletePiSession, getEnv, mapPiEvent, agentDir,
+  parseSkillMd, scanSkillsDir, listSkills, parseModelsOutput, listModels, listFiles, buildArgs, buildPermArgs, normalizeTool, permFlags, applyLeanSystemPrompt, detectContextFiles, LEAN_SYSTEM_PROMPT, getDefaults, findPiSession, hasPiSession, deletePiSession, getEnv, mapPiEvent, agentDir,
   os, path, fs,
 }

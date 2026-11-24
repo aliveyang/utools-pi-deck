@@ -19,7 +19,7 @@ function toolSummary(t) {
 
 function isRiskTool(name) {
   // 只读类之外的都算风险：覆盖 MCP / 扩展带来的写文件、执行命令等工具
-  return !['read', 'grep', 'find', 'ls'].includes(String(name || ''))
+  return !defaultCore.READ_TOOL_NAMES.includes(String(name || ''))
 }
 
 function createRunner(deps = {}) {

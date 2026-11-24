@@ -1,19 +1,25 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import { loadGroups, saveGroups, loadActiveId, saveActiveId, loadDrafts, saveDrafts, PRESET_LABEL, TOOL_PRESETS, presetOf } from './groups.js'
-import { readCache, readLocal, writeLocal, purgeLegacyDbCache } from './storage.js'
+import { loadGroups, saveGroups, loadActiveId, saveActiveId, loadDrafts, saveDrafts, TOOL_PRESETS } from './groups.js'
+import { readCache } from './storage.js'
+import { isRiskyTool, activeRiskSummary, toolSummary } from './constants.js'
 import Icon from './components/Icon.vue'
+import Sidebar from './components/Sidebar.vue'
+import TopRail from './components/TopRail.vue'
+import StatusReadout from './components/StatusReadout.vue'
 import TurnList from './components/TurnList.vue'
+import Composer from './components/Composer.vue'
 import EnvBanner from './components/EnvBanner.vue'
 import HistoryDrawer from './components/HistoryDrawer.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import {
   listSessions, getSession, createSession, updateSession, deleteSession,
-  clearAllSessions, titleFromText, exportMarkdown, relTime,
+  clearAllSessions, titleFromText, exportMarkdown,
 } from './sessions.js'
 import { useToast } from './composables/useToast.js'
 import { usePrefs } from './composables/usePrefs.js'
 import { usePiEnv } from './composables/usePiEnv.js'
+import { useConfirm } from './composables/useConfirm.js'
 
 const groups = ref(loadGroups())
 const activeId = ref(loadActiveId())
@@ -22,7 +28,7 @@ const activeGroup = computed(() => groups.value.find(g => g.id === activeId.valu
 const sessions = ref([])
 const currentSession = ref(null)
 const messages = computed(() => currentSession.value ? currentSession.value.messages : [])
-// 长会话分页渲染：只挂载最近若干条，避免数百条消息的 DOM 拖慢滚动
+
 const PAGE_SIZE = 60
 const visibleCount = ref(PAGE_SIZE)
 const hiddenCount = computed(() => Math.max(0, messages.value.length - visibleCount.value))
@@ -32,7 +38,6 @@ function showEarlier() {
   const el = chatEl.value
   const prevHeight = el ? el.scrollHeight : 0
   visibleCount.value += PAGE_SIZE
-  // 保持视觉位置：加载后把滚动位置下移新增高度
   nextTick(() => { if (el) el.scrollTop += el.scrollHeight - prevHeight })
 }
 function resetPaging() { visibleCount.value = PAGE_SIZE }
@@ -40,127 +45,111 @@ function resetPaging() { visibleCount.value = PAGE_SIZE }
 const inputText = ref('')
 const images = ref([])
 const attachedFiles = ref([])
+const files = ref([])
 const running = ref(false)
-const runPhase = ref('')        // spawning | connecting | generating
+const runPhase = ref('') // spawning | connecting | generating
 const errorMsg = ref('')
 const showSettings = ref(false)
+const showHistory = ref(false)
+const previewImage = ref('')
+
 const settingsModalEl = ref(null)
 const chatEl = ref(null)
-const inputEl = ref(null)
-const sideSearchEl = ref(null)
-const previewImage = ref('')
-function showPreview(src) { if (src) previewImage.value = src }
-function closePreview() { previewImage.value = '' }
+const sidebarEl = ref(null)
+const composerEl = ref(null)
 
-// 历史滑出面板
-const showHistory = ref(false)
-const sessionSearch = ref('')
+const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || '')
+const historyKey = isMac ? '⌘K' : 'Ctrl K'
 
-// 删除会话两步确认（避免误触连带删除 pi 侧会话文件）
-const deleteConfirmId = ref('')
-let deleteTimer = null
+const { pendingKey: deleteConfirmId, confirm: confirmDelete, reset: resetDeleteConfirm } = useConfirm()
 function requestDeleteSession(id) {
-  if (deleteConfirmId.value === id) {
-    clearTimeout(deleteTimer)
-    deleteConfirmId.value = ''
-    removeSession(id)
-    return
-  }
-  deleteConfirmId.value = id
-  clearTimeout(deleteTimer)
-  deleteTimer = setTimeout(() => { deleteConfirmId.value = '' }, 4000)
+  confirmDelete(id, () => removeSession(id))
 }
 
-// 模型凭证状态：空 = 未知，false = 当前默认模型凭证不可用
+// 模型凭证状态
 const defaultAuthOk = ref(null)
 const needModelConfig = computed(() => {
-  if (!piStatus.value || !piStatus.value.ok || !envInfo.value) return false
-  if (!envInfo.value.ok) return false
-  // settings.json 没写默认模型时，再看 pi 实际生效的默认值，避免误报
+  if (!piStatus.value || !piStatus.value.ok || !envInfo.value || !envInfo.value.ok) return false
   if (!envInfo.value.defaultModel && !(defaults.value && (defaults.value.modelId || defaults.value.modelName))) return true
   return defaultAuthOk.value === false
 })
+
+const onboardingState = computed(() => {
+  if (!piStatus.value) return ''
+  if (!piStatus.value.ok) {
+    if (envInfo.value && envInfo.value.errorCode === 'NODE_MISSING') return 'need-node'
+    return 'need-pi'
+  }
+  if (needModelConfig.value) return 'need-model'
+  return ''
+})
+
 async function checkDefaultAuth() {
   const provider = (envInfo.value && envInfo.value.defaultProvider) || ''
   if (!provider || !window.piBridge || !window.piBridge.configAuthCheck) return
   try {
     const r = await window.piBridge.configAuthCheck(provider)
     const st = r && r.status
-    // 只有明确未就绪/无效才触发提示；检测不可用（超时/未就绪）不误报
     if (st === 'ready') defaultAuthOk.value = true
     else if (st === 'not_ready' || st === 'invalid') defaultAuthOk.value = false
     else defaultAuthOk.value = null
   } catch (_) { defaultAuthOk.value = null }
 }
-function openConfigWizard() {
+
+function openSettingsTab(tabId, opts) {
   showSettings.value = true
   nextTick(() => {
-    if (settingsModalEl.value && settingsModalEl.value.openTab) settingsModalEl.value.openTab('diag')
+    if (settingsModalEl.value && settingsModalEl.value.openTab) settingsModalEl.value.openTab(tabId, opts)
   })
 }
-
-// 输入候选菜单（技能 / 文件）
-const showSkillMenu = ref(false)
-const skillFilter = ref('')
-const files = ref([])
-const showFileMenu = ref(false)
-const fileFilter = ref('')
-const menuIndex = ref(0)
-
-const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || '')
-const historyKey = isMac ? '⌘K' : 'Ctrl K'
 
 function effectiveGroupCwd(g) {
   return (g && g.cwd) || defaultCwd.value || ''
 }
 
-// ---- 组合式模块 ----
 const { toast, showToast, copyText } = useToast()
 const {
   defaultCwd, setDefaultCwd, commitDefaultCwd, pickDefaultCwd,
-  sendKeyMode, setSendKeyMode, displayCwd, fmtSize,
-  layout, setLayout,
+  sendKeyMode, setSendKeyMode, displayCwd, layout, setLayout,
 } = usePrefs({
   showToast,
   onCwdChange: () => {
-    detectContext()
     loadSkillsAsync()
     files.value = []
     if (engine.value === 'rpc') maybePrewarmRpc()
   },
 })
+
 const {
-  models, skills, piStatus, engine, contextFiles, defaults, envInfo, showEnvHelp,
-  loadDefaults, detectContext, loadModelsAsync, refreshModels, loadSkillsAsync,
-  loadEnv, recheckEnv, prewarmActive, setEngine, openPath, openExternal,
+  models, skills, piStatus, engine, rpcStatus, defaults, envInfo, showEnvHelp,
+  loadDefaults, loadModelsAsync, refreshModels, loadSkillsAsync,
+  loadEnv, recheckEnv, installPi, prewarmActive, setEngine, openPath, openExternal,
 } = usePiEnv({
   getCwd: () => effectiveGroupCwd(activeGroup.value),
-  // 预热进程按分组的工具权限区分（不同配置不能复用同一进程）
   getLean: () => ({ tool: toolForSend(activeGroup.value) }),
   showToast,
+  copyText,
 })
 
 const sendKeyChip = computed(() => sendKeyMode.value === 'enter' ? 'Enter' : (isMac ? '⌘+↵' : 'Ctrl+↵'))
 function toggleSendKey() {
   setSendKeyMode(sendKeyMode.value === 'enter' ? 'ctrl' : 'enter')
 }
-
-// 后台预热 RPC 长驻进程（配置启用时）；关窗/重新进入时由 handleEnter 再次预热
 function maybePrewarmRpc() {
   if (engine.value !== 'rpc' || !window.piBridge || !window.piBridge.prewarmRpc) return
   prewarmActive().catch(() => {})
 }
 
-// 空态：按分组给一句定位 + 可直接点的示例
+// 空态引导文案
 const EMPTY_COPY = {
   chat: { desc: '纯文本对话，不带工具和项目规范', chips: ['解释这段代码', '给这个函数起个名字', '把这段话写得更简洁'] },
-  translate: { desc: '把内容翻译成目标语言，只输出译文', chips: ['把下面内容翻译成目标语言：\n', '翻译下面这段话：\n'] },
+  translate: { desc: '自动识别中英文并互译，只输出译文', chips: ['帮我把下面这段技术文档翻成英文：\n', 'Translate the following paragraph:\n'] },
   agent: { desc: '默认只读工具，可在分组设置中按需放开编辑与命令执行', chips: ['看看这个项目的结构', '帮我定位这个报错', '写个脚本整理下载目录'] },
 }
 const emptyCopy = computed(() => {
   const g = activeGroup.value || {}
   const base = EMPTY_COPY[g.kind] || EMPTY_COPY.chat
-  if (g.kind === 'translate' && g.targetLang) {
+  if (g.kind === 'translate' && g.targetLang && g.targetLang !== '中英互译') {
     return {
       desc: `把内容翻译成${g.targetLang}，只输出译文`,
       chips: [`把下面内容翻译成${g.targetLang}：\n`, '翻译下面这段话：\n'],
@@ -170,71 +159,7 @@ const emptyCopy = computed(() => {
 })
 function fillChip(text) {
   inputText.value = text
-  nextTick(() => {
-    const el = inputEl.value
-    if (!el) return
-    el.focus()
-    el.selectionStart = el.selectionEnd = text.length
-  })
-}
-
-const THINKING_LABELS = {
-  off: '不思考', minimal: '极简', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高',
-}
-const modelReadout = computed(() => {
-  const g = activeGroup.value || {}
-  if (g.model) return String(g.model).split('/').pop()
-  const raw = (defaults.value && (defaults.value.modelName || defaults.value.modelId)) || ''
-  return raw ? String(raw).split('·')[0].trim() : '默认模型'
-})
-const thinkReadout = computed(() => {
-  const g = activeGroup.value || {}
-  if (g.thinking) return THINKING_LABELS[g.thinking] || g.thinking
-  const lv = (defaults.value || {}).thinkingLevel
-  return lv ? (THINKING_LABELS[lv] || lv) : '默认思考'
-})
-
-const menuItems = computed(() =>
-  showSkillMenu.value ? filteredSkills.value : showFileMenu.value ? filteredFiles.value : [])
-
-function onComposerKeydown(e) {
-  // 输入法组合中（中文拼音选词）按 Enter 是确认候选，不能当发送
-  if (e.isComposing || e.keyCode === 229) return
-  // 候选菜单优先接管方向键与确认键
-  if (showSkillMenu.value || showFileMenu.value) {
-    if (e.key === 'ArrowDown') { e.preventDefault(); moveMenu(1); return }
-    if (e.key === 'ArrowUp') { e.preventDefault(); moveMenu(-1); return }
-    if (e.key === 'Escape') { e.preventDefault(); closeMenus(); return }
-    if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
-      const item = menuItems.value[menuIndex.value]
-      if (item) {
-        e.preventDefault()
-        if (showSkillMenu.value) insertSkill(item)
-        else insertFile(item)
-        return
-      }
-    }
-  }
-  const isCtrl = e.ctrlKey || e.metaKey
-  if (sendKeyMode.value === 'enter') {
-    // Enter 发送，Shift+Enter 换行
-    if (e.key === 'Enter' && !e.shiftKey && !isCtrl) { e.preventDefault(); send() }
-  } else {
-    if (e.key === 'Enter' && isCtrl) { e.preventDefault(); send() }
-  }
-}
-function moveMenu(delta) {
-  const n = menuItems.value.length
-  if (!n) return
-  menuIndex.value = Math.min(n - 1, Math.max(0, menuIndex.value + delta))
-  nextTick(() => {
-    const el = document.querySelector('.suggest-item.active')
-    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' })
-  })
-}
-function closeMenus() {
-  showSkillMenu.value = false
-  showFileMenu.value = false
+  composerEl.value && composerEl.value.focusInput(text.length)
 }
 
 let currentAssistant = null
@@ -242,12 +167,9 @@ let runHandle = null
 let cancelled = false
 let finalized = false
 let scrollScheduled = false
-// RPC 模式下历史会话改走单次调用的提示，每个会话只提示一次
 let historyFallbackNotified = false
-// 配置在回答生成中保存时，等收口后再重启引擎
 let pendingConfigRestart = false
 
-// 统一终态收口（幂等）：onDone / onError / cancel 都走这里，避免空指针与重复 persist
 function finalize(aborted, error) {
   if (finalized) return
   finalized = true
@@ -271,27 +193,13 @@ function finalize(aborted, error) {
 }
 
 function onEsc() {
-  if (previewImage.value) { closePreview(); return }
-  if (showSkillMenu.value || showFileMenu.value) { closeMenus(); return }
-  if (showHistory.value) { closeHistory(); return }
+  if (previewImage.value) { previewImage.value = ''; return }
+  if (composerEl.value && composerEl.value.hasOpenMenu()) { composerEl.value.closeMenus(); return }
+  if (showHistory.value) { showHistory.value = false; return }
   if (showSettings.value) {
-    if (!(settingsModalEl.value && settingsModalEl.value.handleEsc())) closeSettings()
-    return
+    if (!(settingsModalEl.value && settingsModalEl.value.handleEsc())) showSettings.value = false
   }
 }
-
-const filteredSkills = computed(() => {
-  const q = skillFilter.value.toLowerCase()
-  return q ? skills.value.filter(s => s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q)) : skills.value
-})
-const filteredFiles = computed(() => {
-  const q = fileFilter.value.toLowerCase()
-  return q ? files.value.filter(f => f.path.toLowerCase().includes(q)).slice(0, 40) : files.value.slice(0, 40)
-})
-const filteredSessions = computed(() => {
-  const q = sessionSearch.value.toLowerCase()
-  return q ? sessions.value.filter(s => (s.title || '').toLowerCase().includes(q)) : sessions.value
-})
 
 function onEnterEvent(e) {
   const q = window.__pideckEnterQueue
@@ -300,19 +208,16 @@ function onEnterEvent(e) {
   handleEnter(e.detail || e)
 }
 
-onMounted(async () => {
-  // T0 输入层：只做同步必需项，保证 <100ms 可输入
+onMounted(() => {
   models.value = readCache('models') || []
   skills.value = readCache('skills') || []
   piStatus.value = null
   refreshSessions()
   restoreDraft()
-  noticePermOnce()
   window.addEventListener('pideck:enter', onEnterEvent)
-  // 早于本组件挂载的进入事件由 preload 缓存在这里，补放一次
   const queued = window.__pideckEnterQueue || []
   while (queued.length) onEnterEvent({ detail: queued[0] })
-  // 随用即走：关窗/退出时立即强制存草稿；进程终止时同步停止运行中任务与常驻进程
+
   window.utools && window.utools.onPluginOut && window.utools.onPluginOut(isKill => {
     clearTimeout(draftTimer)
     saveCurrentDraft()
@@ -323,36 +228,32 @@ onMounted(async () => {
       }
       return
     }
-    // 关窗隐藏到后台时：运行中不停，防止打断生成
     if (!running.value && window.piBridge && window.piBridge.stopRpc) {
       try { window.piBridge.stopRpc() } catch (_) {}
     }
   })
-  nextTick(() => inputEl.value && inputEl.value.focus())
-  // 读取运行引擎配置
+
+  composerEl.value && composerEl.value.focusInput()
   if (window.piBridge && window.piBridge.getConfig) {
     engine.value = (window.piBridge.getConfig() || {}).engine || 'json'
   }
   window.addEventListener('keydown', onGlobalKey)
-  // T1/T2 后台：延迟到输入就绪后异步刷新，不阻塞首屏
+
   setTimeout(() => {
-    purgeLegacyDbCache()
     loadModelsAsync()
     loadSkillsAsync()
     if (window.piBridge && window.piBridge.resolvePi) piStatus.value = window.piBridge.resolvePi()
-    // 打开时后台预热 RPC 长驻进程（配置启用时）
     maybePrewarmRpc()
-    detectContext()
     loadDefaults()
     loadEnv()
     setTimeout(checkDefaultAuth, 600)
-  }, 200)
+  }, 150)
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onGlobalKey)
   window.removeEventListener('pideck:enter', onEnterEvent)
-  clearTimeout(deleteTimer)
+  resetDeleteConfirm()
 })
 
 function onGlobalKey(e) {
@@ -361,9 +262,8 @@ function onGlobalKey(e) {
   if (!mod) return
   if (e.key === 'k' || e.key === 'K') {
     e.preventDefault()
-    // 经典布局没有滑出面板：直接聚焦侧栏搜索
-    if (layout.value === 'classic') { sideSearchEl.value && sideSearchEl.value.focus(); return }
-    if (showHistory.value) closeHistory()
+    if (layout.value === 'classic') { sidebarEl.value && sidebarEl.value.focusSearch(); return }
+    if (showHistory.value) showHistory.value = false
     else openHistory()
     return
   }
@@ -377,70 +277,57 @@ function openHistory() {
   if (!sessions.value.length) { showToast('还没有对话'); return }
   showHistory.value = true
 }
-function closeHistory() { showHistory.value = false }
-
-function copyCmd(text) { copyText(text) }
-// 外链统一走系统浏览器（uTools 内 target=_blank 常被拦）
-function openLink(url) { openExternal(url) }
-
 function refreshFiles() {
   if (!window.piBridge || !window.piBridge.listFiles) return
   try { files.value = window.piBridge.listFiles(effectiveGroupCwd(activeGroup.value)) || [] } catch (_) { files.value = [] }
 }
 function refreshSessions() {
-  // 每次打开默认新建对话（不续接上次），历史仍可点开
   sessions.value = listSessions(activeId.value)
   currentSession.value = null
 }
 
 function handleEnter(action) {
-  if (running.value) {
-    showToast('当前回答生成中，请先停止')
-    return
-  }
+  if (running.value) { showToast('当前回答生成中，请先停止'); return }
   const code = String(action.code || '')
   const type = String(action.type || '')
   const payload = action.payload
 
-  // 先切分组，再清空输入与目标分组草稿（避免先清旧分组、切入后再把目标分组草稿恢复出来）
   if (code === 'translate') {
     const t = groups.value.find(g => g.kind === 'translate' || g.id === 'translate' || g.name === '翻译')
     if (t) selectGroup(t.id)
     else showToast('未找到翻译分组，请在设置中创建')
-  } else if (code === 'chat') {
-    const t = groups.value.find(g => g.kind === 'chat' || g.id === 'chat')
-    if (t) selectGroup(t.id)
-  } else if (code === 'agent') {
-    const t = groups.value.find(g => g.kind === 'agent' || g.id === 'agent')
+  } else if (code === 'chat' || code === 'agent') {
+    const t = groups.value.find(g => g.kind === code || g.id === code)
     if (t) selectGroup(t.id)
   }
 
-  // uTools 窗口复用，重新进入不会重新 mount：显式回到新对话态
   sessionRiskConfirmed.value = false
   pendingRiskConfirm.value = false
+  pendingRegenerate = false
   refreshSessions()
   resetPaging()
-  closeHistory()
+  showHistory.value = false
   maybePrewarmRpc()
 
   inputText.value = ''
   const drafts = loadDrafts(); drafts[activeId.value] = ''; saveDrafts(drafts)
   errorMsg.value = ''
-  closePreview()
+  previewImage.value = ''
   images.value = []
   attachedFiles.value = []
 
-  // uTools 中 type === 'text' 的 payload 是触发关键词本身（如 "pi"/"翻译"），仅 over/regex 才是匹配文本
   if ((type === 'over' || type === 'regex') && typeof payload === 'string') inputText.value = payload
   if (type === 'img' && payload) {
     const dataUrl = typeof payload === 'string'
       ? (payload.startsWith('data:') ? payload : payload.startsWith('file:') || /^[A-Za-z]:[\\/]/.test(payload) ? '' : 'data:image/png;base64,' + payload)
       : (payload.dataUrl || (payload.base64 ? 'data:image/png;base64,' + payload.base64 : ''))
     if (dataUrl) addImage(dataUrl)
-    else if (typeof payload === 'string' && payload) attachedFiles.value.push(payload)
+    else if (typeof payload === 'string' && payload) addAttachedFile(payload)
   }
-  if (type === 'files' && Array.isArray(payload)) attachedFiles.value = payload.map(p => p.path || p).filter(Boolean)
-  nextTick(() => inputEl.value && inputEl.value.focus())
+  if (type === 'files' && Array.isArray(payload)) {
+    for (const p of payload) addAttachedFile(p && p.path ? p.path : p)
+  }
+  composerEl.value && composerEl.value.focusInput()
 }
 
 function selectGroup(id) {
@@ -448,22 +335,20 @@ function selectGroup(id) {
     if (running.value && id !== activeId.value) showToast('先停止当前回答再切换分组')
     return
   }
-  saveCurrentDraft()          // 先用【旧 id】保存当前草稿
-  activeId.value = id         // 再切换
+  saveCurrentDraft()
+  activeId.value = id
   sessionRiskConfirmed.value = false
   pendingRiskConfirm.value = false
-  loadSkillsAsync()           // 异步，不阻塞切换
-  detectContext()
+  pendingRegenerate = false
+  loadSkillsAsync()
   historyFallbackNotified = false
-  files.value = []            // @ 文件改为懒加载，清空旧的
+  files.value = []
   refreshSessions()
-  restoreDraft()              // 最后恢复【新 id】的草稿
+  restoreDraft()
   if (engine.value === 'rpc') maybePrewarmRpc()
 }
-// activeId 持久化统一由 watch 处理，避免重复写
 watch(activeId, id => saveActiveId(id))
 
-// 草稿节流持久化
 let draftTimer = null
 watch(inputText, () => {
   clearTimeout(draftTimer)
@@ -479,7 +364,6 @@ function restoreDraft() {
   inputText.value = d[activeId.value] || ''
 }
 
-// 会话操作
 function loadSession(id) {
   if (running.value) return
   const s = getSession(id)
@@ -488,11 +372,13 @@ function loadSession(id) {
   errorMsg.value = ''
   sessionRiskConfirmed.value = false
   pendingRiskConfirm.value = false
+  pendingRegenerate = false
   historyFallbackNotified = false
   resetPaging()
-  closeHistory()
+  showHistory.value = false
   nextTick(() => scrollChat(true))
 }
+
 function snapshotConfig(g) {
   return {
     prompt: g.prompt || '', model: g.model || '', thinking: g.thinking || '',
@@ -500,27 +386,28 @@ function snapshotConfig(g) {
     tool: toolForSend(g),
   }
 }
+
 function newChat() {
   if (running.value) return
   saveCurrentDraft()
-  // 只清对话视图：输入框与附件保留，避免误点「新对话」丢掉未发送内容
   const kept = !!(inputText.value.trim() || images.value.length || attachedFiles.value.length)
   currentSession.value = null
   resetPaging()
   errorMsg.value = ''
   sessionRiskConfirmed.value = false
   pendingRiskConfirm.value = false
+  pendingRegenerate = false
   historyFallbackNotified = false
-  closeHistory()
+  showHistory.value = false
   if (kept) showToast('已开始新对话，输入内容已保留')
-  nextTick(() => inputEl.value && inputEl.value.focus())
+  composerEl.value && composerEl.value.focusInput()
 }
+
 function removeSession(id) {
   if (running.value) { showToast('请先停止当前回答'); return }
   const s = getSession(id)
   if (!s) return
   deleteSession(id)
-  // 同步删除 pi 侧会话文件，避免在 ~/.pi/agent/sessions 下堆积
   if (s.piSessionId && window.piBridge && window.piBridge.deletePiSession) {
     try { window.piBridge.deletePiSession(s.piSessionId) } catch (_) {}
   }
@@ -528,20 +415,19 @@ function removeSession(id) {
   if (currentSession.value && currentSession.value.id === id) {
     currentSession.value = sessions.value.length ? getSession(sessions.value[0].id) : null
   }
-  if (!sessions.value.length) closeHistory()
+  if (!sessions.value.length) showHistory.value = false
 }
+
 function exportCurrent() {
   if (!currentSession.value) return showToast('没有可导出的会话')
   const md = exportMarkdown(currentSession.value)
   const name = `${(currentSession.value.title || 'session').replace(/[\\/:*?"<>|]/g, '_')}.md`
-  // 优先走 uTools 原生保存（Electron 下 a[download] 行为不可靠）
   if (window.piBridge && window.piBridge.saveTextFile) {
     const r = window.piBridge.saveTextFile(name, md)
     if (r && r.ok) return showToast('已保存：' + r.path)
     if (r && r.canceled) return
     if (r && !r.unsupported) return showToast('保存失败：' + (r.error || '未知错误'))
   }
-  // 降级：浏览器 Blob 下载
   const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
@@ -551,27 +437,18 @@ function exportCurrent() {
   showToast('已导出 Markdown')
 }
 
-// 输入
-// 同一张图可能被 uTools 预置 + 手动粘贴各加一次，按 dataUrl 去重
 function addImage(dataUrl) {
   if (!dataUrl || images.value.some(i => i.dataUrl === dataUrl)) return
   images.value.push({ name: 'pasted-image', dataUrl })
 }
-let pendingImageReads = []
-function onPaste(e) {
-  const items = e.clipboardData && e.clipboardData.items
-  if (!items) return
-  for (const it of items) {
-    if (it.type && it.type.startsWith('image/')) {
-      const file = it.getAsFile()
-      if (file) readImageFile(file)
-    }
-  }
+function addAttachedFile(filePath) {
+  const p = String(filePath || '').trim()
+  if (p && !attachedFiles.value.includes(p)) attachedFiles.value.push(p)
 }
+let pendingImageReads = []
 function readImageFile(file) {
   const MAX = 20 * 1024 * 1024
   if (file.size > MAX) { showToast(`图片过大（${(file.size / 1048576).toFixed(1)}MB），上限 20MB`); return }
-  // FileReader 异步：粘贴后立刻发送必须等读完成，否则这一轮发出去的是空图
   const readTask = new Promise(resolve => {
     const reader = new FileReader()
     reader.onload = () => { addImage(reader.result); resolve() }
@@ -580,49 +457,6 @@ function readImageFile(file) {
   })
   pendingImageReads.push(readTask)
   readTask.finally(() => { pendingImageReads = pendingImageReads.filter(p => p !== readTask) })
-}
-function removeImage(i) { images.value.splice(i, 1) }
-function removeFile(i) { attachedFiles.value.splice(i, 1) }
-
-function onInput(e) {
-  const before = inputText.value.slice(0, e.target.selectionStart)
-  const skillM = /(?:^|[\s(（])\/([a-zA-Z0-9-]*)$/.exec(before)
-  const fileM = /(?:^|[\s(（])@([^\s]*)$/.exec(before)
-  if (skillM) {
-    showSkillMenu.value = true; showFileMenu.value = false
-    skillFilter.value = skillM[1]; menuIndex.value = 0
-  } else if (fileM) {
-    showFileMenu.value = true; showSkillMenu.value = false
-    fileFilter.value = fileM[1]; menuIndex.value = 0
-    if (!files.value.length) refreshFiles()   // 懒加载：首次输入 @ 才扫描工作区
-  } else { closeMenus() }
-}
-function insertSkill(skill) {
-  const el = inputEl.value
-  const v = inputText.value
-  const caret = el ? el.selectionStart : v.length
-  const before = v.slice(0, caret), after = v.slice(caret)
-  const m = /(?:^|[\s(（])\/[a-zA-Z0-9-]*$/.exec(before)
-  const start = m ? before.indexOf('/', m.index) : caret
-  const prefix = (m && /[\s(（]/.test(before[m.index])) ? before.slice(0, m.index + 1) : before.slice(0, start)
-  inputText.value = `${prefix}/skill:${skill.name} ${after}`
-  closeMenus(); skillFilter.value = ''
-  const pos = (prefix + `/skill:${skill.name} `).length
-  nextTick(() => { el.focus(); el.selectionStart = el.selectionEnd = pos })
-}
-function insertFile(f) {
-  const el = inputEl.value
-  const v = inputText.value
-  const caret = el ? el.selectionStart : v.length
-  const before = v.slice(0, caret), after = v.slice(caret)
-  const m = /(?:^|[\s(（])@[^\s]*$/.exec(before)
-  const start = m ? before.indexOf('@', m.index) : caret
-  const prefix = (m && /[\s(（]/.test(before[m.index])) ? before.slice(0, m.index + 1) : before.slice(0, start)
-  const token = `@${f.path} `
-  inputText.value = `${prefix}${token}${after}`
-  closeMenus(); fileFilter.value = ''
-  const pos = (prefix + token).length
-  nextTick(() => { el.focus(); el.selectionStart = el.selectionEnd = pos })
 }
 
 function truncateToolResult(val) {
@@ -639,108 +473,43 @@ function truncateToolResult(val) {
   }
 }
 
-// 调用 pi
 const sessionRiskConfirmed = ref(false)
 const pendingRiskConfirm = ref(false)
+let pendingRegenerate = false
+const riskSummaryText = computed(() => activeRiskSummary(activeGroup.value && activeGroup.value.tool))
 
-function isRiskyTool(tool) {
-  const t = tool || {}
-  const list = Array.isArray(t.list) ? t.list : []
-  return list.some(n => n === 'edit' || n === 'write' || n === 'bash' || n === 'powershell') || !!t.trust
-}
-const activeRiskSummary = computed(() => {
-  const t = (activeGroup.value && activeGroup.value.tool) || {}
-  const list = Array.isArray(t.list) ? t.list : []
-  const items = []
-  if (list.some(n => n === 'edit' || n === 'write')) items.push('修改文件（edit/write）')
-  if (list.some(n => n === 'bash' || n === 'powershell')) items.push('执行命令（bash/powershell）')
-  if (t.trust) items.push('信任项目级 .pi 配置（--approve）')
-  return items.join('、')
-})
 function confirmRiskSend() {
   sessionRiskConfirmed.value = true
   pendingRiskConfirm.value = false
-  send()
+  if (pendingRegenerate) {
+    pendingRegenerate = false
+    regenerate()
+  } else {
+    send()
+  }
 }
 function cancelRiskSend() {
   pendingRiskConfirm.value = false
+  pendingRegenerate = false
 }
 
-let sending = false
-async function send() {
-  if (running.value || sending) return
-  if (pendingImageReads.length) {
-    sending = true
-    try { await Promise.all(pendingImageReads) } finally { sending = false }
-    if (running.value) return
-  }
-  if (!inputText.value.trim() && !images.value.length && !attachedFiles.value.length) return
-  if (!window.piBridge || !window.piBridge.run) {
-    errorMsg.value = 'preload 桥未加载，需在 uTools 中运行'
-    return
-  }
-  if (isRiskyTool(activeGroup.value && activeGroup.value.tool) && !sessionRiskConfirmed.value) {
-    pendingRiskConfirm.value = true
-    return
-  }
-  pendingRiskConfirm.value = false
-  const userText = inputText.value.trim()
-  const outImages = [...images.value]
-  const outFiles = [...attachedFiles.value]
-  const g = snapshotConfig(activeGroup.value)
-
-  // 局部命名 sendFiles：避免遮蔽外层 @ 文件菜单的 files ref
-  let sendFiles = [...outFiles]
-  const imagePaths = []
-  for (const img of outImages) {
-    try { const p = window.piBridge.saveImage(img.dataUrl); imagePaths.push(p); sendFiles.push(p) }
-    catch (e) { errorMsg.value = String(e.message || e); return }
-  }
-
-  // 懒创建会话：图片落盘等前置校验通过后再创建会话并入库
-  if (!currentSession.value || currentSession.value.groupId !== activeId.value) {
-    const created = createSession(activeId.value, g)
-    currentSession.value = created
-    sessions.value = listSessions(activeId.value)
-    resetPaging()
-  }
-  const session = currentSession.value
-  // 本会话在发送前是否已有历史轮次：决定 RPC 能否直接续接，否则回退单次调用
-  const hadHistory = session.messages.length > 0
-  // 始终使用分组当前配置：用户改模型/思考后应立刻对新消息生效
-  updateSession(session.id, { config: { ...g } })
-
-  // 提示词：分组前缀 + 翻译目标语言 + 用户输入
+function buildPromptText(g, userText) {
   let prefix = (g.prompt && g.prompt.trim()) ? g.prompt.trim() : ''
-  if (g.targetLang && g.targetLang.trim()) prefix += `\n目标语言：${g.targetLang.trim()}`
-  const prompt = prefix
+  const lang = (g.targetLang || '').trim()
+  if (lang === '中英互译') prefix += '\n目标语言：若输入主要为中文则译为英文，若为外文则译为中文。'
+  else if (lang) prefix += `\n目标语言：${lang}`
+  return prefix
     ? `${prefix}\n\n---\n\n${userText || '请处理上方附带的内容。'}`
     : (userText || '请描述这张图片。')
+}
 
-  const fileNames = outFiles.map(f => String(f).split(/[\\/]/).pop()).filter(Boolean)
-  // 只存图片数量与本地路径引用，不存 base64（避免存储膨胀）
-  const imageRefs = outImages.length ? { imageCount: outImages.length, imagePaths } : {}
-  const fileRefs = fileNames.length ? { fileNames } : {}
-  const fallbackUserText = outImages.length ? '(图片)' : '(附件)'
-  session.messages.push({ role: 'user', text: userText || fallbackUserText, ...imageRefs, ...fileRefs })
-  if (session.title === '新对话') session.title = titleFromText(userText || fallbackUserText)
-  currentAssistant = { role: 'assistant', text: '', thinking: '', tools: [], error: '', aborted: false }
-  session.messages.push(currentAssistant)
-  updateSession(session.id, { messages: session.messages, title: session.title })
-
-  inputText.value = ''
-  images.value = []
-  attachedFiles.value = []
-  errorMsg.value = ''
-  closeMenus()
-  const d = loadDrafts(); d[activeId.value] = ''; saveDrafts(d)
+function dispatchRun(session, g, { prompt, promptPreview, sendFiles, hadHistory }) {
   cancelled = false
   finalized = false
   running.value = true
   runPhase.value = 'spawning'
   scrollChat(true)
-  // 发送后保持输入焦点，便于连续对话
-  nextTick(() => inputEl.value && inputEl.value.focus())
+  composerEl.value && composerEl.value.focusInput()
 
   try {
     runHandle = window.piBridge.run(
@@ -750,14 +519,14 @@ async function send() {
         tool: g.tool,
         groupId: activeId.value,
         groupName: (activeGroup.value && activeGroup.value.name) || '',
-        promptPreview: userText.slice(0, 80),
+        promptPreview,
         hasLocalHistory: hadHistory,
       },
       {
         onEvent: rec => {
           if (finalized) return
-          if (rec.type === 'agent_start' || rec.type === 'turn_start') {
-            if (runPhase.value === 'spawning') runPhase.value = 'connecting'
+          if ((rec.type === 'agent_start' || rec.type === 'turn_start') && runPhase.value === 'spawning') {
+            runPhase.value = 'connecting'
           }
         },
         onText: delta => {
@@ -782,28 +551,128 @@ async function send() {
             if (t) t.result = truncateToolResult(payload)
           }
         },
-        onUsage: usage => {
-          if (finalized) return
-          session.usage = usage
-        },
+        onUsage: usage => { if (!finalized) session.usage = usage },
         onDone: payload => finalize(!!(payload && payload.aborted), ''),
         onError: msg => finalize(cancelled, cancelled ? '' : msg),
-      }
+      },
     )
-    // 历史会话无法在常驻进程内续接，preload 已自动改用单次调用；这里只提示一次
     if (runHandle && runHandle.mode === 'json' && engine.value === 'rpc' && hadHistory && !historyFallbackNotified) {
       historyFallbackNotified = true
       showToast(runHandle.sessionResumed === false
-        ? '长驻模式的上下文不落盘，本条作为新上下文开始'
-        : '历史会话改用单次调用，保证上下文续接')
+        ? '极速模式不跨会话保留上下文，本条作为新对话开始'
+        : '历史会话已自动使用标准模式续接上下文')
     }
   } catch (e) {
     finalize(false, String(e.message || e))
   }
 }
 
+let sending = false
+async function send() {
+  if (running.value || sending) return
+  if (pendingImageReads.length) {
+    sending = true
+    try { await Promise.all(pendingImageReads) } finally { sending = false }
+    if (running.value) return
+  }
+  if (!inputText.value.trim() && !images.value.length && !attachedFiles.value.length) return
+  if (!window.piBridge || !window.piBridge.run) {
+    errorMsg.value = 'preload 桥未加载，需在 uTools 中运行'
+    return
+  }
+  if (isRiskyTool(activeGroup.value && activeGroup.value.tool) && !sessionRiskConfirmed.value) {
+    pendingRegenerate = false
+    pendingRiskConfirm.value = true
+    return
+  }
+  pendingRiskConfirm.value = false
+  const userText = inputText.value.trim()
+  const outImages = [...images.value]
+  const outFiles = [...attachedFiles.value]
+  const g = snapshotConfig(activeGroup.value)
+
+  const sendFiles = [...outFiles]
+  const imagePaths = []
+  for (const img of outImages) {
+    try { const p = window.piBridge.saveImage(img.dataUrl); imagePaths.push(p); sendFiles.push(p) }
+    catch (e) { errorMsg.value = String(e.message || e); return }
+  }
+
+  if (!currentSession.value || currentSession.value.groupId !== activeId.value) {
+    currentSession.value = createSession(activeId.value, g)
+    sessions.value = listSessions(activeId.value)
+    resetPaging()
+  }
+  const session = currentSession.value
+  const hadHistory = session.messages.length > 0
+  updateSession(session.id, { config: { ...g } })
+
+  const prompt = buildPromptText(g, userText)
+  const fileNames = outFiles.map(f => String(f).split(/[\\/]/).pop()).filter(Boolean)
+  const imageRefs = outImages.length ? { imageCount: outImages.length, imagePaths } : {}
+  const fileRefs = fileNames.length ? { fileNames, filePaths: outFiles } : {}
+  const fallbackUserText = outImages.length ? '(图片)' : '(附件)'
+  session.messages.push({ role: 'user', text: userText || fallbackUserText, ...imageRefs, ...fileRefs })
+  if (session.title === '新对话') session.title = titleFromText(userText || fallbackUserText)
+  currentAssistant = { role: 'assistant', text: '', thinking: '', tools: [], error: '', aborted: false }
+  session.messages.push(currentAssistant)
+  updateSession(session.id, { messages: session.messages, title: session.title })
+
+  inputText.value = ''
+  images.value = []
+  attachedFiles.value = []
+  errorMsg.value = ''
+  composerEl.value && composerEl.value.closeMenus()
+  const d = loadDrafts(); d[activeId.value] = ''; saveDrafts(d)
+
+  dispatchRun(session, g, {
+    prompt,
+    promptPreview: userText.slice(0, 80),
+    sendFiles,
+    hadHistory,
+  })
+}
+
+function regenerate() {
+  if (running.value || !currentSession.value) return
+  if (!window.piBridge || !window.piBridge.run) return
+  const msgs = currentSession.value.messages || []
+  let userIdx = -1
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i] && msgs[i].role === 'user') { userIdx = i; break }
+  }
+  if (userIdx < 0) return
+  if (isRiskyTool(activeGroup.value && activeGroup.value.tool) && !sessionRiskConfirmed.value) {
+    pendingRegenerate = true
+    pendingRiskConfirm.value = true
+    return
+  }
+  const userMsg = msgs[userIdx]
+  const rawUserText = (userMsg.text === '(图片)' || userMsg.text === '(附件)') ? '' : (userMsg.text || '')
+  const sendFiles = [...new Set([
+    ...(Array.isArray(userMsg.filePaths) ? userMsg.filePaths : []),
+    ...(Array.isArray(userMsg.imagePaths) ? userMsg.imagePaths : []),
+  ].filter(Boolean))]
+  const g = snapshotConfig(activeGroup.value)
+
+  // 移除上一轮末尾的 assistant 回复并新建一条占位
+  currentSession.value.messages.splice(userIdx + 1)
+  currentAssistant = { role: 'assistant', text: '', thinking: '', tools: [], error: '', aborted: false }
+  currentSession.value.messages.push(currentAssistant)
+  updateSession(currentSession.value.id, { config: { ...g }, messages: currentSession.value.messages })
+
+  dispatchRun(currentSession.value, g, {
+    prompt: buildPromptText(g, rawUserText),
+    promptPreview: rawUserText.slice(0, 80),
+    sendFiles,
+    hadHistory: userIdx > 0,
+  })
+}
+
 function persistCurrent() {
-  if (currentSession.value) updateSession(currentSession.value.id, { messages: currentSession.value.messages, usage: currentSession.value.usage })
+  if (currentSession.value) {
+    updateSession(currentSession.value.id, { messages: currentSession.value.messages, usage: currentSession.value.usage })
+  }
 }
 function refreshSessionsKeep() {
   const id = currentSession.value && currentSession.value.id
@@ -815,8 +684,6 @@ function refreshSessionsKeep() {
 }
 function cancel() {
   cancelled = true
-  // 先 finalize（此时 currentAssistant 仍在，能正确标记 aborted），再 kill 子进程
-  // 注意：finalize 会把 runHandle 置空，必须先缓存句柄，否则 RPC 模式的 cancel 永远走不到
   const handle = runHandle
   finalize(true, '')
   if (handle && handle.cancel) { try { handle.cancel() } catch (_) {} }
@@ -827,7 +694,6 @@ function scrollChat(force) {
   nextTick(() => {
     const el = chatEl.value
     if (!el) return
-    // 用户上滑查看历史时不强制拽回底部（除非明确要求）
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
     if (force || nearBottom) el.scrollTop = el.scrollHeight
   })
@@ -837,31 +703,14 @@ function scrollChatThrottled() {
   scrollScheduled = true
   requestAnimationFrame(() => { scrollScheduled = false; scrollChat(false) })
 }
-function usageText(session) {
-  const u = session && session.usage
+const usageLine = computed(() => {
+  const u = currentSession.value && currentSession.value.usage
   if (!u || !u.totalTokens) return ''
   const c = u.cost && Number(u.cost.total)
   const cost = c ? ` · $${c.toFixed(4)}` : ''
   return `${u.totalTokens} tokens${cost}`
-}
-const usageLine = computed(() => usageText(currentSession.value))
+})
 
-function openSettings() { showSettings.value = true }
-function closeSettings() { showSettings.value = false }
-
-function toolTitle(t) {
-  if (!t) return ''
-  const bits = []
-  bits.push((t.list || []).length ? (t.list || []).join(', ') : '无工具')
-  bits.push(t.mcp === 'off' ? 'MCP 关' : t.mcp === 'all' ? 'MCP 全部' : 'MCP ' + (t.mcpServers || '未指定'))
-  if (t.ext) bits.push('扩展开')
-  if (t.skills === 'off') bits.push('技能关')
-  else if (t.skills === 'some') bits.push('技能 ' + (t.skillNames || []).length + ' 个')
-  if (t.context) bits.push('项目规范')
-  if (t.trust) bits.push('项目配置')
-  return bits.join(' · ')
-}
-// 发送时把技能名解析成目录，供 pi 的 --skill 显式加载
 function toolForSend(g) {
   const src = (g && g.tool) || TOOL_PRESETS.read
   const t = {
@@ -875,54 +724,60 @@ function toolForSend(g) {
     if (g && g.cwd && (!activeGroup.value || g.cwd !== activeGroup.value.cwd) && window.piBridge && window.piBridge.listSkills) {
       try { pool = window.piBridge.listSkills(effectiveGroupCwd(g)) || pool } catch (_) {}
     }
-    t.skillPaths = (t.skillNames || [])
-      .map(n => (pool.find(x => x.name === n) || {}).dir)
-      .filter(Boolean)
+    t.skillPaths = (t.skillNames || []).map(n => (pool.find(x => x.name === n) || {}).dir).filter(Boolean)
   } else {
     t.skillPaths = []
   }
   return t
 }
-const activePermLabel = computed(() => PRESET_LABEL[presetOf(activeGroup.value && activeGroup.value.tool)] || '自定义')
-const activeHasExec = computed(() => {
-  const t = (activeGroup.value && activeGroup.value.tool) || {}
-  return ((t.list) || []).some(n => n === 'bash' || n === 'powershell') || !!t.trust
-})
 
-// 升级后一次性提示：工具权限默认收紧了
-function noticePermOnce() {
-  try {
-    if (readLocal('pideck.permNotice.v1', false)) return
-    writeLocal('pideck.permNotice.v1', true)
-    setTimeout(() => showToast('工具权限已默认设为「只读」，可在分组设置里放开'), 900)
-  } catch (_) {}
-}
-
-function onSaveGroup(next) {
+function onSaveGroup(next, silent) {
   const idx = groups.value.findIndex(g => g.id === next.id)
+  const prev = idx >= 0 ? groups.value[idx] : null
+  const prevPerm = prev ? toolSummary(prev.tool) : ''
+  const nextPerm = toolSummary(next.tool)
+  const permChanged = !prev || prevPerm !== nextPerm
+  const cwdChanged = !prev || (prev.cwd || '') !== (next.cwd || '')
+
   if (idx >= 0) groups.value.splice(idx, 1, next)
   else groups.value.push(next)
   saveGroups(groups.value)
-  showToast('设置已保存')
-  if (window.piBridge && window.piBridge.auditRecord) {
+  if (!silent) showToast('设置已保存')
+  if (permChanged && window.piBridge && window.piBridge.auditRecord) {
     try {
-      window.piBridge.auditRecord({ type: 'perm', groupId: next.id, groupName: next.name, perm: toolTitle(next.tool) })
+      window.piBridge.auditRecord({ type: 'perm', groupId: next.id, groupName: next.name, perm: nextPerm })
     } catch (_) {}
   }
-  loadSkillsAsync()
-  detectContext()
-  files.value = []
-  if (next.id === activeId.value) {
+  if (cwdChanged || permChanged) {
+    loadSkillsAsync()
+    files.value = []
+  }
+  if (next.id === activeId.value && (permChanged || cwdChanged)) {
     sessionRiskConfirmed.value = false
     pendingRiskConfirm.value = false
     if (engine.value === 'rpc') maybePrewarmRpc()
   }
 }
 
+function onQuickUpdateGroup(patch) {
+  if (!activeGroup.value || running.value) return
+  onSaveGroup({ ...activeGroup.value, ...patch }, true)
+  showToast('已更新当前分组配置')
+}
+
+function pickGroupCwd() {
+  if (!activeGroup.value || running.value) return
+  if (window.utools && typeof window.utools.showOpenDialog === 'function' && window.piBridge && window.piBridge.pickFolder) {
+    const dir = window.piBridge.pickFolder()
+    if (dir) onQuickUpdateGroup({ cwd: dir })
+    return
+  }
+  openSettingsTab('groups', { editGroupId: activeGroup.value.id })
+}
+
 function onDeleteGroup(g) {
   if (groups.value.length <= 1) return
   const list = listSessions(g.id)
-  // 连带清理该分组的会话与 pi 会话文件，避免堆积（删除已在设置页做过两步确认）
   for (const s of list) {
     deleteSession(s.id)
     if (s.piSessionId && window.piBridge && window.piBridge.deletePiSession) {
@@ -933,10 +788,9 @@ function onDeleteGroup(g) {
   saveGroups(groups.value)
   if (activeId.value === g.id) { activeId.value = groups.value[0].id; saveActiveId(activeId.value); refreshSessions() }
   else sessions.value = listSessions(activeId.value)
-  closeSettings()
+  showSettings.value = false
 }
 
-// 清空全部对话（含 pi 侧会话文件），由设置页两步确认后触发
 function clearAllConversations() {
   if (running.value) { showToast('请先停止当前回答'); return }
   const list = clearAllSessions()
@@ -947,14 +801,13 @@ function clearAllConversations() {
   }
   currentSession.value = null
   sessions.value = []
-  closeHistory()
+  showHistory.value = false
   if (window.piBridge && window.piBridge.auditRecord) {
     try { window.piBridge.auditRecord({ type: 'data', action: 'clear-sessions' }) } catch (_) {}
   }
   showToast(`已清空 ${list.length} 个对话`)
 }
 
-// 模型配置保存后：停掉旧常驻进程，让新配置在下一条消息生效
 function restartEngineForConfig() {
   if (window.piBridge && window.piBridge.stopRpc) { try { window.piBridge.stopRpc() } catch (_) {} }
   refreshModels()
@@ -982,183 +835,123 @@ function onConfigSaved() {
       :needs-config="needModelConfig"
       @toggle-help="showEnvHelp = !showEnvHelp"
       @recheck="recheckEnv"
-      @config="openConfigWizard"
-      @open-link="openLink"
-      @copy-cmd="copyCmd"
+      @install-pi="installPi"
+      @config="openSettingsTab('diag')"
+      @open-link="openExternal"
+      @copy-cmd="copyText"
       @open-path="openPath"
     />
 
     <div class="shell">
-      <!-- 经典布局：左侧栏 -->
-      <aside v-if="layout === 'classic'" class="sidebar">
-        <div class="side-head">
-          <span class="side-logo"><Icon name="pi" :size="13" :stroke="1.9" /></span>
-          <span class="side-brand">PiDeck</span>
-        </div>
-        <button class="new-chat-btn" @click="newChat"><Icon name="plus" :size="13" />新对话</button>
-
-        <div class="side-section">
-          <div class="side-label">分组</div>
-          <button
-            v-for="g in groups" :key="g.id" class="side-group"
-            :class="{ active: g.id === activeId }" @click="selectGroup(g.id)"
-          >{{ g.name }}</button>
-        </div>
-
-        <div class="side-section history-section">
-          <div class="side-label row">
-            <span>最近对话</span>
-            <button class="export-btn" title="导出当前会话" @click="exportCurrent"><Icon name="download" :size="12" /></button>
-          </div>
-          <label class="search-wrap">
-            <Icon name="search" :size="12" class="search-ico" />
-            <input ref="sideSearchEl" v-model="sessionSearch" class="session-search" placeholder="搜索会话" />
-          </label>
-          <div
-            v-for="s in filteredSessions" :key="s.id" class="history-item"
-            :class="{ active: currentSession && currentSession.id === s.id }"
-          >
-            <span class="history-title" role="button" tabindex="0" @click="loadSession(s.id)" @keydown.enter.prevent="loadSession(s.id)">{{ s.title }}</span>
-            <span class="history-time">{{ relTime(s.updatedAt) }}</span>
-            <button
-              class="history-del" :class="{ confirming: deleteConfirmId === s.id }"
-              :title="deleteConfirmId === s.id ? '再点一次确认删除' : '删除'"
-              :aria-label="deleteConfirmId === s.id ? '确认删除会话' : '删除会话'"
-              @click.stop="requestDeleteSession(s.id)"
-            >
-              <span v-if="deleteConfirmId === s.id">确认</span><Icon v-else name="close" :size="11" />
-            </button>
-          </div>
-          <div v-if="!filteredSessions.length" class="history-empty">{{ sessionSearch ? '没有匹配的会话' : '暂无对话' }}</div>
-        </div>
-
-        <div class="side-spacer"></div>
-        <div class="side-foot">
-          <button class="side-settings" @click="openSettings"><Icon name="settings" :size="13" />设置</button>
-          <button class="side-icon-btn" title="切换到控制台布局" @click="setLayout('console')"><Icon name="panel" :size="13" /></button>
-        </div>
-      </aside>
+      <Sidebar
+        v-if="layout === 'classic'"
+        ref="sidebarEl"
+        :groups="groups"
+        :active-id="activeId"
+        :sessions="sessions"
+        :current-session-id="currentSession ? currentSession.id : ''"
+        :confirm-delete-id="deleteConfirmId"
+        @new-chat="newChat"
+        @select-group="selectGroup"
+        @load-session="loadSession"
+        @request-delete-session="requestDeleteSession"
+        @export-current="exportCurrent"
+        @open-settings="showSettings = true"
+        @switch-layout="setLayout('console')"
+      />
 
       <div class="shell-main">
-        <!-- 控制台布局：顶栏 -->
-        <header v-if="layout === 'console'" class="rail">
-          <span class="brand-mark"><Icon name="pi" :size="11" :stroke="2" /></span>
-          <span class="brand-name">PiDeck</span>
-          <nav class="rail-tabs" role="tablist">
-            <button
-              v-for="g in groups" :key="g.id" class="tab" role="tab"
-              :class="{ active: g.id === activeId }" :aria-selected="g.id === activeId"
-              @click="selectGroup(g.id)"
-            >{{ g.name }}</button>
-          </nav>
-          <div class="rail-actions">
-            <button class="rail-btn" @click="newChat" title="新对话">
-              <Icon name="plus" :size="13" /><span class="rb-label">新对话</span>
-            </button>
-            <button class="rail-btn" @click="openHistory" title="历史对话">
-              <Icon name="history" :size="13" /><span class="rb-label">历史</span><kbd class="rb-kbd">{{ historyKey }}</kbd>
-            </button>
-            <button class="rail-btn icon-only" @click="exportCurrent" title="导出当前会话"><Icon name="download" :size="13" /></button>
-            <button class="rail-btn icon-only" title="切换到经典布局" @click="setLayout('classic')"><Icon name="panel" :size="13" /></button>
-            <button class="rail-btn icon-only" @click="openSettings" title="设置"><Icon name="settings" :size="14" /></button>
-          </div>
-        </header>
+        <TopRail
+          v-if="layout === 'console'"
+          :groups="groups"
+          :active-id="activeId"
+          :history-key="historyKey"
+          @select-group="selectGroup"
+          @new-chat="newChat"
+          @open-history="openHistory"
+          @export-current="exportCurrent"
+          @switch-layout="setLayout('classic')"
+          @open-settings="showSettings = true"
+        />
 
-        <!-- 经典布局：标题条 -->
         <header v-else class="panel-head">
           <span class="panel-title">{{ activeGroup && activeGroup.name }}</span>
-          <span class="panel-meta">
-            <span class="meta-model">{{ modelReadout }}</span>
-            <span class="meta-sep"></span>
-            <span>{{ thinkReadout }}</span>
-            <span class="meta-sep"></span>
-            <span class="meta-perm" :class="{ risky: activeHasExec }" :title="toolTitle(activeGroup && activeGroup.tool)">{{ activePermLabel }}</span>
-            <span class="meta-sep meta-path-sep"></span>
-            <span class="meta-path" :title="displayCwd(activeGroup && activeGroup.cwd)">{{ displayCwd(activeGroup && activeGroup.cwd) }}</span>
-          </span>
+          <StatusReadout
+            v-if="activeGroup"
+            variant="header"
+            :group="activeGroup"
+            :models="models"
+            :defaults="defaults"
+            :cwd-label="displayCwd(activeGroup.cwd)"
+            :disabled="running"
+            @update-group="onQuickUpdateGroup"
+            @pick-cwd="pickGroupCwd"
+            @open-group-settings="openSettingsTab('groups', { editGroupId: activeGroup.id })"
+          />
         </header>
 
         <div ref="chatEl" class="chat">
           <TurnList
             :variant="layout"
             :session-id="currentSession ? currentSession.id : ''"
-            :visible="visibleMessages" :total="messages.length"
-            :hidden-count="hiddenCount" :page-size="PAGE_SIZE"
-            :running="running" :run-phase="runPhase" :usage="usageLine"
-            :error="errorMsg" :empty-desc="emptyCopy.desc" :chips="emptyCopy.chips"
+            :visible="visibleMessages"
+            :total="messages.length"
+            :hidden-count="hiddenCount"
+            :page-size="PAGE_SIZE"
+            :running="running"
+            :run-phase="runPhase"
+            :usage="usageLine"
+            :error="errorMsg"
+            :empty-desc="emptyCopy.desc"
+            :chips="emptyCopy.chips"
             :send-key-chip="sendKeyChip"
-            @earlier="showEarlier" @chip="fillChip" @copy="copyText" @link="openLink" @preview="showPreview"
+            :onboarding-state="onboardingState"
+            :env-info="envInfo"
+            @earlier="showEarlier"
+            @chip="fillChip"
+            @copy="copyText"
+            @link="openExternal"
+            @preview="previewImage = $event"
+            @regenerate="regenerate"
+            @install-pi="installPi"
+            @open-config="openSettingsTab('diag')"
+            @recheck-env="recheckEnv"
           />
         </div>
 
-        <!-- 输入区：命令行形态，读数与发送键同一行 -->
-        <div class="composer">
-          <div v-if="pendingRiskConfirm" class="risk-confirm-bar">
-            <div class="risk-confirm-text">
-              <strong>当前分组启用了高风险权限</strong>：{{ activeRiskSummary }}；工作区：<code>{{ displayCwd(activeGroup && activeGroup.cwd) }}</code>
-            </div>
-            <div class="risk-confirm-actions">
-              <button class="mini-btn" @click="cancelRiskSend">取消</button>
-              <button class="mini-btn danger" @click="confirmRiskSend">确认执行</button>
-            </div>
-          </div>
-          <div class="composer-inner">
-            <div v-if="images.length || attachedFiles.length" class="attachments">
-              <div v-for="(img, i) in images" :key="'i'+i" class="thumb">
-                <img :src="img.dataUrl" alt="已粘贴图片" title="点击放大" @click="showPreview(img.dataUrl)" /><button class="thumb-x" aria-label="移除图片" @click="removeImage(i)"><Icon name="close" :size="10" :stroke="2" /></button>
-              </div>
-              <div v-for="(f, i) in attachedFiles" :key="'f'+i" class="file-chip">
-                {{ f.split(/[\\/]/).pop() }}<button class="thumb-x" aria-label="移除附件" @click="removeFile(i)"><Icon name="close" :size="10" :stroke="2" /></button>
-              </div>
-            </div>
-
-            <div v-if="showSkillMenu" class="suggest-menu">
-              <div class="suggest-head">技能</div>
-              <button
-                v-for="(s, si) in filteredSkills" :key="s.name" class="suggest-item"
-                :class="{ active: si === menuIndex }" @click="insertSkill(s)" @mouseenter="menuIndex = si"
-              >
-                <span class="suggest-name">/skill:{{ s.name }}</span>
-                <span class="suggest-desc">{{ s.description }}</span>
-              </button>
-              <div v-if="!filteredSkills.length" class="suggest-empty">无匹配技能</div>
-            </div>
-            <div v-if="showFileMenu" class="suggest-menu">
-              <div class="suggest-head">文件<span class="suggest-path">{{ displayCwd(activeGroup && activeGroup.cwd) }}</span></div>
-              <button
-                v-for="(f, fi) in filteredFiles" :key="f.path" class="suggest-item"
-                :class="{ active: fi === menuIndex }" @click="insertFile(f)" @mouseenter="menuIndex = fi"
-              >
-                <span class="suggest-name">{{ f.dir ? '[目录] ' : '' }}{{ f.path }}</span>
-              </button>
-              <div v-if="!filteredFiles.length" class="suggest-empty">无匹配文件</div>
-            </div>
-
-            <div class="prompt-row">
-              <span class="prompt-caret">›</span>
-              <textarea
-                ref="inputEl" v-model="inputText" class="input" rows="2"
-                placeholder="给 pi 发消息，/ 技能，@ 文件"
-                @paste="onPaste" @input="onInput" @keydown="onComposerKeydown"
-              />
-            </div>
-            <div class="composer-bar">
-              <div class="readout">
-                <span class="ro ro-perm" :class="{ risky: activeHasExec }" :title="toolTitle(activeGroup && activeGroup.tool)">{{ activePermLabel }}</span>
-                <span class="ro-sep"></span>
-                <span class="ro ro-model" :title="modelReadout">{{ modelReadout }}</span>
-                <span class="ro-sep"></span>
-                <span class="ro">{{ thinkReadout }}</span>
-                <span class="ro-sep ro-path-sep"></span>
-                <span class="ro ro-path" :title="displayCwd(activeGroup && activeGroup.cwd)">{{ displayCwd(activeGroup && activeGroup.cwd) }}</span>
-              </div>
-              <span class="spacer"></span>
-              <button class="sendkey" @click="toggleSendKey" title="点击切换发送键">{{ sendKeyMode === 'enter' ? 'Enter 发送' : (isMac ? 'Cmd+回车 发送' : 'Ctrl+回车 发送') }}</button>
-              <button v-if="running" class="send-btn stop" @click="cancel" title="停止"><Icon name="stop" :size="12" /></button>
-              <button v-else class="send-btn" @click="send" :disabled="!inputText.trim() && !images.length && !attachedFiles.length" title="发送"><Icon name="send" :size="14" :stroke="1.9" /></button>
-            </div>
-          </div>
-        </div>
+        <Composer
+          ref="composerEl"
+          v-model="inputText"
+          :variant="layout"
+          :images="images"
+          :attached-files="attachedFiles"
+          :skills="skills"
+          :files="files"
+          :active-group="activeGroup"
+          :models="models"
+          :defaults="defaults"
+          :cwd-label="displayCwd(activeGroup && activeGroup.cwd)"
+          :running="running"
+          :send-key-mode="sendKeyMode"
+          :is-mac="isMac"
+          :pending-risk-confirm="pendingRiskConfirm"
+          :active-risk-summary="riskSummaryText"
+          @send="send"
+          @cancel="cancel"
+          @confirm-risk="confirmRiskSend"
+          @cancel-risk="cancelRiskSend"
+          @read-image-file="readImageFile"
+          @remove-image="images.splice($event, 1)"
+          @add-file="addAttachedFile"
+          @remove-file="attachedFiles.splice($event, 1)"
+          @request-files="refreshFiles"
+          @preview="previewImage = $event"
+          @toggle-send-key="toggleSendKey"
+          @update-group="onQuickUpdateGroup"
+          @pick-cwd="pickGroupCwd"
+          @open-group-settings="activeGroup && openSettingsTab('groups', { editGroupId: activeGroup.id })"
+          @notify="showToast"
+        />
       </div>
     </div>
 
@@ -1167,7 +960,7 @@ function onConfigSaved() {
       :sessions="sessions"
       :current-session-id="currentSession ? currentSession.id : ''"
       :confirm-delete-id="deleteConfirmId"
-      @close="closeHistory"
+      @close="showHistory = false"
       @select="loadSession"
       @request-remove="requestDeleteSession"
     />
@@ -1181,13 +974,13 @@ function onConfigSaved() {
       :defaults="defaults"
       :env-info="envInfo"
       :engine="engine"
+      :rpc-status="rpcStatus"
       :layout="layout"
       :default-cwd="defaultCwd"
       :send-key-mode="sendKeyMode"
       :is-mac="isMac"
       :display-cwd="displayCwd"
-      :fmt-size="fmtSize"
-      @close="closeSettings"
+      @close="showSettings = false"
       @set-layout="setLayout"
       @set-engine="setEngine"
       @commit-default-cwd="commitDefaultCwd"
@@ -1199,16 +992,16 @@ function onConfigSaved() {
       @refresh-models="refreshModels"
       @open-path="openPath"
       @recheck-env="recheckEnv"
+      @install-pi="installPi"
       @clear-all-sessions="clearAllConversations"
       @config-saved="onConfigSaved"
       @notify="showToast"
-      @copy-cmd="copyCmd"
-      @open-link="openLink"
+      @copy-cmd="copyText"
+      @open-link="openExternal"
     />
 
-    <!-- 图片放大预览 -->
-    <div v-if="previewImage" class="lightbox" @click.self="closePreview">
-      <button class="lightbox-close" @click="closePreview" title="关闭（Esc）"><Icon name="close" :size="16" /></button>
+    <div v-if="previewImage" class="lightbox" @click.self="previewImage = ''">
+      <button class="lightbox-close" @click="previewImage = ''" title="关闭（Esc）"><Icon name="close" :size="16" /></button>
       <img :src="previewImage" alt="图片预览" @click.stop />
     </div>
 

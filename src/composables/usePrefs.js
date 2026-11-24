@@ -1,4 +1,4 @@
-// 用户偏好：默认工作目录、发送键、界面布局、展示辅助
+// 用户偏好：默认工作目录、发送键、界面布局
 import { ref } from 'vue'
 import { read, write } from '../storage.js'
 
@@ -7,7 +7,6 @@ const DEFAULT_CWD_KEY = 'pideck.defaultCwd.v1'
 const LAYOUT_KEY = 'pideck.layout.v1'
 
 export function usePrefs({ showToast, onCwdChange }) {
-  // 全局默认工作目录：分组 cwd 留空时优先用它
   const defaultCwd = ref(read(DEFAULT_CWD_KEY, '') || '')
 
   function setDefaultCwd(dir) {
@@ -39,13 +38,10 @@ export function usePrefs({ showToast, onCwdChange }) {
   function displayCwd(cwd) {
     const dir = cwd || defaultCwd.value
     if (!window.piBridge) return dir || '~'
-    // 展示用纯计算路径（resolveCwd），避免仅渲染就触发默认工作区 ~/MyPiDeck 落盘创建
     if (window.piBridge.resolveCwd) return window.piBridge.resolveCwd(dir)
     return window.piBridge.effectiveCwd ? window.piBridge.effectiveCwd(dir) : (dir || '~')
   }
 
-  // 两套界面：console = 顶栏 + 转录式；classic = 左侧栏 + 气泡
-  // 默认沿用用户熟悉的经典布局
   const layout = ref(read(LAYOUT_KEY, 'classic') === 'console' ? 'console' : 'classic')
   function setLayout(next) {
     const v = next === 'console' ? 'console' : 'classic'
@@ -54,15 +50,10 @@ export function usePrefs({ showToast, onCwdChange }) {
     write(LAYOUT_KEY, v)
     showToast(v === 'console' ? '已切换到控制台布局' : '已切换到经典布局')
   }
-  function toggleLayout() { setLayout(layout.value === 'console' ? 'classic' : 'console') }
-
-  function fmtSize(n) {
-    return n < 1024 ? n + 'B' : (n / 1024).toFixed(1) + 'KB'
-  }
 
   return {
     defaultCwd, setDefaultCwd, commitDefaultCwd, pickDefaultCwd,
-    sendKeyMode, setSendKeyMode, displayCwd, fmtSize,
-    layout, setLayout, toggleLayout,
+    sendKeyMode, setSendKeyMode, displayCwd,
+    layout, setLayout,
   }
 }

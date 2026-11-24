@@ -86,9 +86,9 @@ describe('buildPermArgs 权限档位 → pi argv', () => {
 
 describe('permFlags / applyLeanSystemPrompt', () => {
   it('无内置工具但开了 MCP 或扩展时，noTools 为 false 且不替换 systemPrompt', () => {
-    expect(core.permFlags('', { tool: tool({ list: [], mcp: 'all' }) })).toEqual({ noTools: false })
-    expect(core.permFlags('', { tool: tool({ list: [], ext: true }) })).toEqual({ noTools: false })
-    expect(core.permFlags('', { tool: tool({ list: [] }) })).toEqual({ noTools: true })
+    expect(core.permFlags({ tool: tool({ list: [], mcp: 'all' }) })).toEqual({ noTools: false })
+    expect(core.permFlags({ tool: tool({ list: [], ext: true }) })).toEqual({ noTools: false })
+    expect(core.permFlags({ tool: tool({ list: [] }) })).toEqual({ noTools: true })
 
     const withMcp = core.applyLeanSystemPrompt({ prompt: 'hi', tool: tool({ list: [], mcp: 'all' }) })
     expect(withMcp.systemPrompt).toBeUndefined()
@@ -127,23 +127,43 @@ describe('parseModelsOutput 与 listFiles 符号链接', () => {
   })
 })
 
-describe('normalizeTool 旧数据（perm+lean 布尔）映射', () => {
-  it('perm=read + noMcp/noSkills → mcp/skills 关闭', () => {
-    const t = core.normalizeTool(undefined, { perm: 'read', noMcp: true, noSkills: true })
+describe('normalizeTool 规范化与路径覆盖', () => {
+  it('未传 tool 时默认最安全只读档且其余全关', () => {
+    const t = core.normalizeTool(undefined)
     expect(t.list).toEqual(['read', 'grep', 'find', 'ls'])
     expect(t.mcp).toBe('off')
     expect(t.skills).toBe('off')
-    expect(t.context).toBe(true)   // 未勾 noContextFiles
-  })
-
-  it('无 perm 且 noTools → 纯文本', () => {
-    const t = core.normalizeTool(undefined, { noTools: true })
-    expect(t.list).toEqual([])
+    expect(t.context).toBe(false)
+    expect(t.trust).toBe(false)
   })
 
   it('list 内非法工具名被过滤', () => {
-    const t = core.normalizeTool(tool({ list: ['read', 'rm-rf', 'bash'] }), {})
+    const t = core.normalizeTool(tool({ list: ['read', 'rm-rf', 'bash'] }))
     expect(t.list).toEqual(['read', 'bash'])
+  })
+
+  it('setPathOverrides 可覆盖并恢复测试路径', () => {
+    expect(core.PI_INSTALL_CMD).toContain('@earendil-works/pi-coding-agent')
+    core.setPathOverrides({ nodePath: process.execPath, piCliPath: fakeCli })
+    expect(core.resolvePi()).toEqual({ node: process.execPath, cli: fakeCli })
+    core.setPathOverrides({ nodePath: '', piCliPath: '' })
+    expect(core.resolvePi()).toEqual({ node: process.execPath, cli: fakeCli })
+  })
+
+  it('getEnv 独立探测 Node 与 pi CLI，缺失 pi 时仍保留 nodePath 与 nodeVersion', () => {
+    const env = core.getEnv({
+      findNode: () => process.execPath,
+      findPiCli: () => {
+        const err = new Error('未找到 pi CLI')
+        err.code = 'PI_MISSING'
+        throw err
+      },
+    })
+    expect(env.ok).toBe(false)
+    expect(env.errorCode).toBe('PI_MISSING')
+    expect(env.nodePath).toBe(process.execPath)
+    expect(env.nodeVersion).toMatch(/^v\d+/)
+    expect(env.piPath).toBe('')
   })
 })
 

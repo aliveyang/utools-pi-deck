@@ -1,18 +1,15 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { read, write, remove } from '../src/storage.js'
+import { write, remove } from '../src/storage.js'
 import {
   listSessions, getSession, createSession, updateSession, deleteSession,
   titleFromText, exportMarkdown, fitSessionBudget,
 } from '../src/sessions.js'
 
 const IDX_KEY = 'pideck.sessions.idx'
-const LEGACY_KEY = 'pideck.sessions.v1'
 const ITEM_PREFIX = 'pideck.session.'
 
 beforeEach(() => {
   remove(IDX_KEY)
-  remove(LEGACY_KEY)
-  // 清掉全部单会话 key
   for (const k of Object.keys(localStorage)) {
     if (k.startsWith(ITEM_PREFIX)) remove(k)
   }
@@ -31,7 +28,7 @@ describe('会话 CRUD 与索引', () => {
 
     const listed = listSessions('chat')
     expect(listed.find(e => e.id === s.id)).toBeTruthy()
-    expect(listed[0].messages).toBeUndefined()   // 索引不含 messages
+    expect(listed[0].messages).toBeUndefined()
 
     deleteSession(s.id)
     expect(getSession(s.id)).toBeNull()
@@ -48,18 +45,7 @@ describe('会话 CRUD 与索引', () => {
   })
 })
 
-describe('旧数据迁移与索引重建', () => {
-  it('legacy v1 大数组 → 每会话独立 key + 索引，旧 key 清除', () => {
-    write(LEGACY_KEY, [
-      { id: 'old-1', groupId: 'chat', title: '旧会话', messages: [{ role: 'user', text: 'hi' }], createdAt: 1, updatedAt: 2 },
-      { id: 'old-2', groupId: 'agent', title: '旧二', messages: [], createdAt: 1, updatedAt: 3 },
-    ])
-    const list = listSessions()
-    expect(list.map(s => s.id).sort()).toEqual(['old-1', 'old-2'])
-    expect(read(LEGACY_KEY, null)).toBeNull()   // 迁移后删除旧 key
-    expect(getSession('old-1').messages.length).toBe(1)   // messages 完整保留在单会话 key
-  })
-
+describe('索引重建', () => {
   it('索引被清空后：从单会话 key 重建，不丢会话', () => {
     const a = createSession('chat', {})
     const b = createSession('agent', {})
@@ -77,7 +63,6 @@ describe('旧数据迁移与索引重建', () => {
 
   it('空索引 [] 直接返回空数组，不重复触发扫描重建', () => {
     write(IDX_KEY, [])
-    // 即使存在孤立项，空数组表示合法无记录状态，不应每次列表扫描触发重建
     write(ITEM_PREFIX + 'orphan-1', { id: 'orphan-1', groupId: 'chat', title: '孤立', messages: [] })
     expect(listSessions()).toEqual([])
   })

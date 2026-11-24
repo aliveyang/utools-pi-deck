@@ -28,14 +28,15 @@ PiDeck/
 │  ├─ config.cjs           # ~/.pi/agent/{settings,models}.json 读写（密钥不回传渲染层）
 │  └─ local-store.cjs      # 本地临时缓存、本机配置/状态、临时图片落盘/清理、安全校验
 ├─ src/                    # Vue 3 + Vite 前端界面层
-│  ├─ App.vue              # 主面板、对话调度、高风险首次发送确认
+│  ├─ App.vue              # 主面板协调层、对话调度、高风险首次发送确认
+│  ├─ constants.js         # 全局共享常量与风险判定纯函数
 │  ├─ storage.js           # 存储分级封装（dbStorage 仅存用户数据；缓存走本地目录）
-│  ├─ groups.js            # 分组与工具权限模型及旧数据迁移
+│  ├─ groups.js            # 分组与工具权限模型
 │  ├─ sessions.js          # 会话分 key 存储 + 索引维护与损坏重建
 │  ├─ format.js            # 先转义后渲染的轻量 Markdown → HTML
-│  ├─ dev-bridge.js        # 无 uTools 时的浏览器预览 mock 桥（需与 preload 对齐）
-│  ├─ components/          # UI 组件（TurnList / HistoryDrawer / SettingsModal / EnvBanner / Icon）
-│  └─ composables/         # 组合式状态（usePiEnv / usePrefs / useToast）
+│  ├─ dev-bridge.js        # 无 uTools 时的浏览器预览 mock 桥（与 preload 对齐）
+│  ├─ components/          # UI 组件（Sidebar/TopRail/StatusReadout/Composer/TurnList/HistoryDrawer/SettingsModal+4Tab/EnvBanner/Icon）
+│  └─ composables/         # 组合式状态（usePiEnv / usePrefs / useToast / useConfirm / useSessionFilter）
 ├─ tests/                  # Vitest 单元测试
 ├─ .agents/skills/         # 项目级 AI 开发与审核自检 Skills
 │  ├─ utools-plugin-dev/
@@ -121,17 +122,16 @@ PiDeck/
 | 数据类别 | 存储机制 / API | 生命周期 | 账号云同步 | PiDeck 示例 |
 | --- | --- | --- | --- | --- |
 | **用户数据** | `utools.db` / `utools.dbStorage` | 长期 | **是** | 分组配置（`pideck.groups.v1`）、激活分组、用户偏好、会话索引与消息（`pideck.session.<id>`） |
-| **应用本地数据** | `utools.getPluginLocalDataPath()`（降级 `~/.pideck/`） | 长期（本机） | **否** | 操作审计 JSONL（`audit/`）、本地引擎配置（`config.json`）、高频草稿与本地标记（`state.json`：`pideck.drafts.v1`、`pideck.permNotice.v1`） |
-| **临时 / 可重建缓存** | `utools.getPluginTempPath()`（降级 `os.tmpdir()` / 浏览器 `localStorage`） | 运行期 / 短期 | **否** | 模型列表缓存（`models`）、技能列表缓存（`skills`）、默认配置缓存（`defaults`）、剪贴板粘贴临时图片（24h 清理）、终端登录临时脚本 |
+| **应用本地数据** | `utools.getPluginLocalDataPath()`（降级 `~/.pideck/`） | 长期（本机） | **否** | 操作审计 JSONL（`audit/`）、本地引擎与路径覆盖配置（`config.json`）、高频草稿（`state.json`：`pideck.drafts.v1`） |
+| **临时 / 可重建缓存** | `utools.getPluginTempPath()`（降级 `os.tmpdir()` / 浏览器 `localStorage`） | 运行期 / 短期 | **否** | 模型列表缓存（`models`）、技能列表缓存（`skills`）、默认配置缓存（`defaults`）、剪贴板粘贴临时图片（24h 清理）、终端登录/安装临时脚本 |
 | **用户导出文件** | `utools.showSaveDialog()` / `utools.getPath('downloads')` | 用户管理 | **否** | 会话 Markdown 导出、操作记录导出 |
 
 ### 强制规则
 
 1. **严禁向 `utools.db` / `utools.dbStorage` 写入非用户数据**：禁止写入缓存、日志、高频草稿/临时标记、搜索索引、临时数据、Base64 大图片、操作记录或下载文件。
-2. **旧缓存清理**：升级若曾误写入 `dbStorage` 的缓存或高频本地键，应在后台初始化时通过 `purgeLegacyDbCache()` 主动迁移并移除。
-3. **IPC 序列化契约**：向 `utools.dbStorage.setItem` 写入时必须先 `JSON.stringify`，避免 Vue Reactive Proxy 经过 Electron IPC 克隆失败；读取时兼容旧对象与 JSON 字符串。
-4. **单文档上限与拆分**：`utools.db` 单文档最大 **1 MB**，更新已有文档需携带最新 `_rev`；集合型数据（如历史会话）必须按单条分 key 存储并维护轻量索引（参考 `src/sessions.js`），写入前通过 `fitSessionBudget()` 控制在 850 KB 以内，避免超限失败与同步冲突。
-5. **本地与临时目录边界**：`getPluginLocalDataPath()` 在卸载后仍可能保留，需自行做版本兼容与空间清理；`getPluginTempPath()` 在插件退出或 uTools 退出时会被系统清理，不得存重要持久数据。
+2. **IPC 序列化契约**：向 `utools.dbStorage.setItem` 写入时必须先 `JSON.stringify`，避免 Vue Reactive Proxy 经过 Electron IPC 克隆失败；读取时兼容旧对象与 JSON 字符串。
+3. **单文档上限与拆分**：`utools.db` 单文档最大 **1 MB**，更新已有文档需携带最新 `_rev`；集合型数据（如历史会话）必须按单条分 key 存储并维护轻量索引（参考 `src/sessions.js`），写入前通过 `fitSessionBudget()` 控制在 850 KB 以内，避免超限失败与同步冲突。
+4. **本地与临时目录边界**：`getPluginLocalDataPath()` 在卸载后仍可能保留，需自行做版本兼容与空间清理；`getPluginTempPath()` 在插件退出或 uTools 退出时会被系统清理，不得存重要持久数据。
 
 ---
 

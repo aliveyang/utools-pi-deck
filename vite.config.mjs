@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { piDevApi } from './dev-server-plugin.mjs'
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -13,10 +13,11 @@ function copyCore() {
     name: 'pideck-copy-core',
     apply: 'build',
     closeBundle() {
+      const sharedDir = resolve(ROOT, 'shared')
       const outDir = resolve(ROOT, 'dist', 'shared')
       mkdirSync(outDir, { recursive: true })
-      for (const name of ['pi-core.cjs', 'rpc-engine.cjs', 'audit.cjs', 'config.cjs', 'local-store.cjs', 'runner.cjs']) {
-        copyFileSync(resolve(ROOT, 'shared', name), resolve(outDir, name))
+      for (const name of readdirSync(sharedDir)) {
+        if (name.endsWith('.cjs')) copyFileSync(resolve(sharedDir, name), resolve(outDir, name))
       }
       // 生产包去掉开发态入口
       const pjPath = resolve(ROOT, 'dist', 'plugin.json')

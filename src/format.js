@@ -1,5 +1,5 @@
 // 轻量 Markdown → HTML（先转义再生成标签，防 XSS）
-// 支持：代码块（剥离语言名）、行内代码、加粗、标题、有序/无序列表、http(s) 链接
+// 支持：代码块（剥离语言名并带显式复制按钮）、行内代码、加粗、标题、有序/无序列表、http(s) 链接
 export function formatText(text) {
   if (!text) return ''
   const codeBlocks = []
@@ -35,12 +35,13 @@ export function formatText(text) {
     .replace(/^## (.+)$/gm, '<h2>$1</h2>')
     .replace(/^# (.+)$/gm, '<h1>$1</h1>')
     .replace(/\n/g, '<br>')
-  // 还原代码块（保留原始换行，不再转 <br>）与行内代码
+  // 还原代码块（带显式复制按钮，保留原始换行）与行内代码
   s = s
-    .replace(/\u0000CODE(\d+)\u0000/g, (_, i) => `<pre><code>${codeBlocks[+i] || ''}</code></pre>`)
+    .replace(/\u0000CODE(\d+)\u0000/g, (_, i) =>
+      `<div class="code-block"><button type="button" class="code-copy-btn" data-copy-code="1">复制</button><pre><code>${codeBlocks[+i] || ''}</code></pre></div>`)
     .replace(/\u0001IC(\d+)\u0001/g, (_, i) => `<code>${inlineCodes[+i] || ''}</code>`)
   // 清理块级元素紧邻的多余 <br>
   return s
-    .replace(/(<\/(?:h[1-3]|ul|ol|pre)>)<br>/g, '$1')
-    .replace(/<br>(<(?:h[1-3]|ul|ol|pre)>)/g, '$1')
+    .replace(/(<\/(?:h[1-3]|ul|ol|pre|div)>)<br>/g, '$1')
+    .replace(/<br>(<(?:h[1-3]|ul|ol|pre)|<div class="code-block">)/g, '$1')
 }

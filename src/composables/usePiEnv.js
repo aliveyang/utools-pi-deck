@@ -1,14 +1,14 @@
-// Pi 运行环境：引擎、模型、技能、默认值、环境诊断
+// Pi 运行环境：引擎、模型、技能、默认值、环境诊断与终端一键安装
 import { ref } from 'vue'
 import { readCache, writeCache } from '../storage.js'
+import { PI_INSTALL_CMD } from '../constants.js'
 
-export function usePiEnv({ getCwd, showToast, getLean }) {
+export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
   const models = ref([])
   const skills = ref([])
   const piStatus = ref(null)
   const engine = ref('json')
   const rpcStatus = ref('')
-  const contextFiles = ref([])
   const defaults = ref({ modelId: '', modelName: '', thinkingLevel: '' })
   const envInfo = ref(null)
   const showEnvHelp = ref(false)
@@ -24,12 +24,6 @@ export function usePiEnv({ getCwd, showToast, getLean }) {
     } catch (_) {}
   }
 
-  function detectContext() {
-    if (!window.piBridge || !window.piBridge.detectContextFiles) return
-    try { contextFiles.value = window.piBridge.detectContextFiles(getCwd()) || [] }
-    catch (_) { contextFiles.value = [] }
-  }
-
   async function loadModelsAsync() {
     try {
       let list = null
@@ -42,7 +36,6 @@ export function usePiEnv({ getCwd, showToast, getLean }) {
   async function refreshModels() {
     try {
       let list = null
-      // 优先异步版本：同步 execFile 会阻塞 UI ~1.5s（preload 内与渲染层同线程）
       if (window.piBridge && window.piBridge.listModelsAsync) list = await window.piBridge.listModelsAsync()
       else if (window.piBridge && window.piBridge.refreshModels) list = window.piBridge.refreshModels()
       else if (window.piBridge && window.piBridge.listModels) list = window.piBridge.listModels()
@@ -63,16 +56,34 @@ export function usePiEnv({ getCwd, showToast, getLean }) {
     if (!window.piBridge || !window.piBridge.getEnv) return
     try {
       envInfo.value = window.piBridge.getEnv()
-      // 环境未就绪时默认展开安装引导
       if (envInfo.value && !envInfo.value.ok) showEnvHelp.value = true
     } catch (_) { envInfo.value = null }
   }
 
   function recheckEnv() {
+    if (window.piBridge && window.piBridge.resetPiCache) {
+      try { window.piBridge.resetPiCache() } catch (_) {}
+    }
     loadEnv()
     if (window.piBridge && window.piBridge.resolvePi) piStatus.value = window.piBridge.resolvePi()
-    if (envInfo.value && envInfo.value.ok) showToast('检测通过，Pi 可用')
-    else showToast('仍未检测到，请确认安装后重启 uTools')
+    if (envInfo.value && envInfo.value.ok) {
+      showEnvHelp.value = false
+      loadModelsAsync()
+      loadDefaults(true)
+      showToast('检测通过，Pi 可用')
+    } else {
+      showToast('仍未检测到，可在设置中手动指定路径或安装后重启 uTools')
+    }
+  }
+
+  function installPi() {
+    const ok = window.piBridge && window.piBridge.installPiInTerminal && window.piBridge.installPiInTerminal()
+    if (ok) {
+      showToast('已打开终端开始安装，完成后点击「重新检测」')
+      return
+    }
+    if (copyText) copyText(PI_INSTALL_CMD)
+    showToast('已复制安装命令，请在终端中运行')
   }
 
   function prewarmActive() {
@@ -89,20 +100,20 @@ export function usePiEnv({ getCwd, showToast, getLean }) {
       if (window.piBridge.prewarmRpc) {
         prewarmActive().then(ok => {
           rpcStatus.value = ok ? 'ready' : 'failed'
-          showToast(ok ? 'RPC 引擎已就绪' : 'RPC 预热失败，将回退单次调用')
+          showToast(ok ? '已开启极速模式并完成预热' : '极速预热失败，将自动使用标准模式')
         })
       }
     } else {
       if (window.piBridge.stopRpc) window.piBridge.stopRpc()
       rpcStatus.value = ''
-      showToast('已切换为单次调用')
+      showToast('已切换为标准模式')
     }
   }
 
   function openPath(p) {
     if (!p) return
     if (!window.piBridge || !window.piBridge.openPath || !window.piBridge.openPath(p)) {
-      showToast('当前环境无法打开文件管理器（可在浏览器预览中手动打开）')
+      showToast('当前环境无法打开文件管理器')
     }
   }
 
@@ -122,11 +133,9 @@ export function usePiEnv({ getCwd, showToast, getLean }) {
     window.open(href, '_blank', 'noopener,noreferrer')
   }
 
-  function ctxLabel(c) { return c.global ? '全局' : '项目' }
-
   return {
-    models, skills, piStatus, engine, rpcStatus, contextFiles, defaults, envInfo, showEnvHelp,
-    loadDefaults, detectContext, loadModelsAsync, refreshModels, loadSkillsAsync,
-    loadEnv, recheckEnv, prewarmActive, setEngine, openPath, openExternal, ctxLabel,
+    models, skills, piStatus, engine, rpcStatus, defaults, envInfo, showEnvHelp,
+    loadDefaults, loadModelsAsync, refreshModels, loadSkillsAsync,
+    loadEnv, recheckEnv, installPi, prewarmActive, setEngine, openPath, openExternal,
   }
 }

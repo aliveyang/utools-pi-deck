@@ -1,7 +1,6 @@
 // RPC 长驻引擎：按 cwd + 权限 + systemPrompt 维护 pi --mode rpc 子进程，预热后发送零冷启动
 // 失败/不存活/含非图片附件时由调用方回退 JSON 模式
 const childProcess = require('node:child_process')
-const { StringDecoder } = require('node:string_decoder')
 const defaultCore = require('./pi-core.cjs')
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'avif'])
@@ -97,7 +96,7 @@ function createRpcEngine(deps = {}) {
       sessionId: '',
       defaultModel: '', defaultThinking: '',
       curModel: '', curThinking: '',
-      buf: '', decoder: new StringDecoder('utf8'),
+      lineBuf: core.makeLineBuffer(),
       pending: new Map(), listeners: new Set(),
       readyPromise: null,
     }
@@ -114,15 +113,7 @@ function createRpcEngine(deps = {}) {
       for (const l of e.listeners) { try { l(rec) } catch (_) {} }
     }
     child.stdout.on('data', chunk => {
-      e.buf += e.decoder.write(chunk)
-      let nl
-      while ((nl = e.buf.indexOf('\n')) !== -1) {
-        let line = e.buf.slice(0, nl); e.buf = e.buf.slice(nl + 1)
-        if (line.endsWith('\r')) line = line.slice(0, -1)
-        if (!line.trim()) continue
-        let rec; try { rec = JSON.parse(line) } catch (_) { continue }
-        handle(rec)
-      }
+      core.pushChunk(e.lineBuf, chunk, handle)
     })
     child.stderr.on('data', () => {})
     const die = () => {

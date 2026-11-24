@@ -1,12 +1,10 @@
 // 会话持久化：按会话分 key 存储，避免全量读写放大
 // - pideck.session.<id>   单个会话（含 messages）
 // - pideck.sessions.idx   索引数组（仅轻量字段，用于列表）
-// 旧数据（pideck.sessions.v1 大数组）首次访问时自动迁移
 import { read, write, remove } from './storage.js'
 
 const IDX_KEY = 'pideck.sessions.idx'
 const ITEM_PREFIX = 'pideck.session.'
-const LEGACY_KEY = 'pideck.sessions.v1'
 const MAX_SESSION_BYTES = 850 * 1024   // 留足余量，避免触发 utools.db 单文档 1 MB 上限
 
 function jsonByteLength(obj) {
@@ -48,9 +46,6 @@ export function fitSessionBudget(session, maxBytes = MAX_SESSION_BYTES) {
   return out
 }
 
-// 清理已废弃的 lastSession 记录（旧版本只写不读，升级后一次性移除）
-try { remove('pideck.lastSession.v1') } catch (_) {}
-
 function itemKey(id) { return ITEM_PREFIX + id }
 
 function stripMessages(s) {
@@ -61,24 +56,7 @@ function stripMessages(s) {
   }
 }
 
-// 旧数据迁移：大数组 → 每会话单独 key + 索引（只迁移一次）
-function migrateLegacy() {
-  const legacy = read(LEGACY_KEY, null)
-  if (!Array.isArray(legacy) || !legacy.length) return []
-  const idx = []
-  for (const s of legacy) {
-    if (!s || !s.id) continue
-    try { write(itemKey(s.id), s) } catch (_) {}
-    idx.push(stripMessages(s))
-  }
-  writeIndex(idx)
-  remove(LEGACY_KEY)
-  return idx
-}
-
 // 枚举存储后端里所有单会话 key（索引丢失时用于重建）
-// 注意：allDocs 在 utools.db 上（dbStorage 只有 getItem/setItem/removeItem），
-// dbStorage 底层即 db，键即文档 _id，按前缀过滤枚举
 function listItemIds() {
   const ids = []
   try {
@@ -115,9 +93,6 @@ function rebuildIndex() {
 function readIndex() {
   const arr = read(IDX_KEY, null)
   if (Array.isArray(arr)) return arr
-  const migrated = migrateLegacy()
-  if (migrated.length) return migrated
-  // 索引不存在/损坏：磁盘若还有会话则重建，避免会话"集体消失"
   return rebuildIndex()
 }
 function writeIndex(idx) { write(IDX_KEY, idx) }
@@ -146,10 +121,8 @@ export function createSession(groupId, config) {
   const session = {
     id,
     groupId,
-    // 创建时快照配置，续接会话用快照而非当前分组，避免配置漂移
     config: config ? { ...config } : {},
     title: '新对话',
-    // pi session id：字母数字 . _ -，首尾必须为字母数字
     piSessionId: 'pideck-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
     messages: [],
     usage: null,
@@ -166,7 +139,6 @@ export function updateSession(id, patch) {
   if (!cur) return null
   const next = fitSessionBudget({ ...cur, ...patch, updatedAt: Date.now() })
   write(itemKey(id), next)
-  // 索引只同步影响列表展示的字段，不搬运 messages
   upsertIndex({
     id,
     updatedAt: next.updatedAt,
@@ -178,7 +150,6 @@ export function updateSession(id, patch) {
   return next
 }
 
-// 返回被删除的会话（含 piSessionId），供调用方清理 pi 侧会话文件
 export function deleteSession(id) {
   const cur = getSession(id)
   remove(itemKey(id))
@@ -186,14 +157,12 @@ export function deleteSession(id) {
   return cur
 }
 
-// 清空全部会话（返回索引条目，供调用方清理 pi 侧文件）
 export function clearAllSessions() {
   const idx = readIndex()
   for (const e of idx) remove(itemKey(e.id))
   writeIndex([])
   return idx
 }
-
 
 export function titleFromText(text) {
   const clean = String(text || '').replace(/\s+/g, ' ').trim()

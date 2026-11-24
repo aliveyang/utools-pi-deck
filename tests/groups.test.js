@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { TOOL_PRESETS, PRESET_LABEL, presetOf, migrateGroups, DEFAULT_GROUPS, loadGroups, saveGroups } from '../src/groups.js'
+import { TOOL_PRESETS, PRESET_LABEL, presetOf, normalizeGroup, DEFAULT_GROUPS, loadGroups, saveGroups } from '../src/groups.js'
 
 describe('presetOf 反推预设名', () => {
   it('四个预设各归其位', () => {
@@ -13,48 +13,38 @@ describe('presetOf 反推预设名', () => {
     expect(presetOf({ ...TOOL_PRESETS.read, list: ['read'] })).toBe('custom')
     expect(presetOf({ ...TOOL_PRESETS.read, mcp: 'all' })).toBe('custom')
     expect(presetOf({ ...TOOL_PRESETS.read, trust: true })).toBe('custom')
-    expect(presetOf(null)).toBe('read')   // 缺省视为 read
+    expect(presetOf(null)).toBe('read')
   })
 })
 
-describe('migrateGroups 旧数据迁移', () => {
-  it('补 kind/lean/tool；无 perm 老数据智能体降级为只读', () => {
-    const out = migrateGroups([{ id: 'agent', name: '智能体', prompt: '', thinking: '' }])
-    expect(out[0].kind).toBe('agent')
-    expect(out[0].tool.list).toEqual(TOOL_PRESETS.read.list)
-    expect(out[0].tool.mcp).toBe('off')
-    expect(out[0].tool.ext).toBe(false)
+describe('normalizeGroup 分组规范化', () => {
+  it('补齐缺失基础字段且默认使用安全最小权限', () => {
+    const g1 = normalizeGroup({ id: 'agent', name: '智能体' })
+    expect(g1.kind).toBe('agent')
+    expect(g1.tool.list).toEqual(TOOL_PRESETS.read.list)
+    expect(g1.tool.mcp).toBe('off')
+    expect(g1.tool.ext).toBe(false)
+
+    const g2 = normalizeGroup({ id: 'chat', name: '对话' })
+    expect(g2.kind).toBe('chat')
+    expect(g2.tool.list).toEqual([])
   })
 
-  it('perm=text 老数据映射为纯文本档', () => {
-    const out = migrateGroups([{ id: 'chat', perm: 'text', lean: {} }])
-    expect(out[0].kind).toBe('chat')
-    expect(out[0].tool.list).toEqual([])
-    expect(out[0].lean.noTools).toBe(true)
-  })
-
-  it('老数据缺智能体分组 → 自动追加', () => {
-    const out = migrateGroups([{ id: 'chat', kind: 'chat', lean: {} }])
-    expect(out.some(g => g.kind === 'agent')).toBe(true)
-  })
-
-  it('尊重用户已配置的 lean，不覆盖', () => {
-    const out = migrateGroups([{ id: 'chat', kind: 'chat', lean: { noSkills: true, noMcp: true, noContextFiles: true, noTools: false } }])
-    expect(out[0].lean.noTools).toBe(false)
-  })
-
-  it('翻译组 thinking 空时补 off', () => {
-    const out = migrateGroups([{ id: 'translate', kind: 'translate', lean: {}, thinking: '' }])
-    expect(out[0].thinking).toBe('off')
+  it('过滤非法工具名与非法 mcp 值', () => {
+    const g = normalizeGroup({ id: 'g1', tool: { list: ['read', 'rm-rf'], mcp: 'invalid', skills: 'bad' } })
+    expect(g.tool.list).toEqual(['read'])
+    expect(g.tool.mcp).toBe('off')
+    expect(g.tool.skills).toBe('off')
   })
 })
 
 describe('DEFAULT_GROUPS 默认三分组', () => {
-  it('chat/translate 纯文本，agent 只读', () => {
+  it('chat/translate 纯文本且默认中英互译，agent 只读', () => {
     const byId = Object.fromEntries(DEFAULT_GROUPS.map(g => [g.id, g]))
     expect(byId.chat.tool.list).toEqual([])
     expect(byId.translate.tool.list).toEqual([])
-    expect(byId.translate.targetLang).toBe('英文')
+    expect(byId.translate.targetLang).toBe('中英互译')
+    expect(byId.translate.thinking).toBe('off')
     expect(byId.agent.tool.list).toEqual(TOOL_PRESETS.read.list)
   })
 })

@@ -92,6 +92,8 @@ window.piBridge = {
   cancel: () => { if (activeCtrl) activeCtrl.abort() },
   saveImage,
   pickFolder: () => null,
+  pickFiles: () => null,
+  pickExecutable: () => null,
   validateCwd: p => !!(p),
   effectiveCwd: devCwd,
   resolveCwd: devCwd,
@@ -122,12 +124,35 @@ window.piBridge = {
       return true
     } catch (_) { return false }
   },
+  // 本地缓存与本机状态（与 preload 签名对齐，走浏览器 localStorage 隔离前缀）
+  readCache: key => {
+    try {
+      const raw = localStorage.getItem('pideck.devcache.' + key)
+      if (!raw) return null
+      const e = JSON.parse(raw)
+      return (e && typeof e.t === 'number' && Date.now() - e.t <= 5 * 60 * 1000) ? (e.data ?? null) : null
+    } catch (_) { return null }
+  },
+  writeCache: (key, data) => {
+    try { localStorage.setItem('pideck.devcache.' + key, JSON.stringify({ t: Date.now(), data })); return true }
+    catch (_) { return false }
+  },
+  readLocal: (key, fallback) => {
+    try { const raw = localStorage.getItem(key); return raw == null ? fallback : JSON.parse(raw) }
+    catch (_) { return fallback }
+  },
+  writeLocal: (key, value) => {
+    try { localStorage.setItem(key, JSON.stringify(value)); return true }
+    catch (_) { return false }
+  },
   // dev 模式不启用 RPC（走 dev-server JSON），保留接口形状一致
   getConfig: () => ({ engine: 'json' }),
   setConfig: () => ({}),
   prewarmRpc: () => Promise.resolve(false),
   stopRpc: () => {},
   resolvePi: () => syncGet('/resolve') || { ok: false, error: 'dev API 不可用' },
+  resetPiCache: () => { try { syncPost('/reset-cache') } catch (_) {} },
+  installPiInTerminal: () => false,
   homedir: () => homedir,
   // dev 预览不读写真实 pi 配置与审计目录
   auditTail: () => [],

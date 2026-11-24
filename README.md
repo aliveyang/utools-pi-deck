@@ -30,20 +30,20 @@ uTools 内的 [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi
 
 设置 → **环境与模型**：
 
-1. 选择服务商：DeepSeek / OpenAI / Anthropic / Gemini / OpenRouter / 自定义端点（中转站、Ollama、LM Studio）
-2. 粘贴 API Key；订阅型服务商可点「终端登录」，插件会打开终端并复制 `pi auth login <provider>` 命令
-3. 点「刷新模型」从 pi 当前可用的模型里选择默认模型（也可手填模型 ID），保存即生效
+1. 选择服务商：DeepSeek / 阿里云百炼 / 硅基流动 / 智谱 GLM / 月之暗面 Kimi / OpenAI / Anthropic / Gemini / OpenRouter / 本地 Ollama / 自定义端点（可保存多个自定义网关与中转站）
+2. 粘贴 API Key（本地 Ollama 可留空）；订阅型服务商可点「终端登录」；未装 pi CLI 时可点「终端一键安装」或手动指定 Node/pi 路径
+3. 点「刷新模型」从可用模型或推荐列表里选择默认模型（也可手填模型 ID），保存即生效
 
 保存只修改 `models.json` 的目标 provider 与 `settings.json` 的 `defaultProvider` / `defaultModel` / 思考强度，写前自动备份原文件（保留最近 5 份）。密钥以明文保存在本机 `models.json`，不会上传；也可手动改用环境变量或 `$ENV` 插值。保存后会重启长驻 RPC 进程，新配置从下一条消息生效。
 
-环境横幅会在「pi 已安装但没有可用模型/凭证」时提示，点「去配置」直达该页。
+环境横幅与首屏空态引导会在「Node/pi 未就绪或缺少可用模型凭证」时展示三步准备向导，支持一键终端安装、手动指定路径与直达配置。
 
-## 运行引擎（设置 → 对话默认）
+## 运行引擎（设置 → 对话默认 → 响应模式）
 
-| 引擎 | 行为 | 会话语义 |
+| 模式 | 行为 | 会话语义 |
 |---|---|---|
-| 单次调用（默认） | 每条消息 spawn 一次 `pi --mode json --session-id` | 上下文由 pi 落盘（`~/.pi/agent/sessions`），可跨次续接 |
-| 长驻预热（RPC） | 打开插件后台预热 `pi --mode rpc` 长驻进程，发送零冷启动；未就绪/失败自动回退单次调用 | 上下文仅存进程内存：切换会话时自动重置，进程被回收（10 分钟空闲 / 超出 3 个 / 关窗）后**不续接** |
+| 标准模式（默认） | 每条消息 spawn 一次 `pi --mode json --session-id` | 上下文由 pi 落盘（`~/.pi/agent/sessions`），可跨次续接 |
+| 极速模式（后台预热） | 打开插件后台预热 `pi --mode rpc` 长驻进程，发送零冷启动；未就绪/失败自动回退标准模式 | 上下文仅存进程内存：切换会话时自动重置，进程被回收（10 分钟空闲 / 超出 3 个 / 关窗）后**不续接** |
 
 RPC 的会话隔离：同一长驻进程在多个 PiDeck 会话间切换时会先重置进程内对话（实测验证），不会互相串上下文；但历史轮次不落盘，进程回收后从新开始。需要可靠的跨次记忆请用单次调用。
 
@@ -78,20 +78,21 @@ npm test          # vitest 单测（纯函数：权限拼参 / Markdown 转义 /
 ├─ public/plugin.json     uTools 插件描述（入口/关键字/图片/文件指令）
 ├─ public/preload.js      渲染层 ↔ Node/uTools 薄桥接层（piBridge）
 ├─ public/logo.png        原创插件图标（256×256 RGBA PNG）
-├─ shared/pi-core.cjs     pi 定位、JSONL 解析、权限拼参、扫描、诊断（三调用方共用）
+├─ shared/pi-core.cjs     pi 多路径探测（含 nvm/fnm/volta/scoop）、JSONL 解析、权限拼装、扫描、诊断
 ├─ shared/rpc-engine.cjs  RPC 长驻引擎（按 cwd+配置 维护进程，new_session 会话隔离）
-├─ shared/runner.cjs      进程调度、审计包装、异步模型列表与终端登录逻辑
+├─ shared/runner.cjs      进程调度、审计包装、异步模型列表与终端安装/登录逻辑
 ├─ shared/local-store.cjs 本地缓存、本机配置/状态、临时图片落盘/清理、外链与路径安全校验
 ├─ shared/audit.cjs       操作记录（本地 JSONL、脱敏、按天分片、30 天保留）
-├─ shared/config.cjs      pi 配置读写（settings/models、备份、apiKey 不落渲染层）
-├─ dev-server-plugin.mjs  dev-only vite 中间件：/__pideck/api/*（SSE 流式）
+├─ shared/config.cjs      pi 配置读写（主流国内/海外/本地预设、多自定义端点、备份、apiKey 不落渲染层）
+├─ dev-server-plugin.mjs  dev-only vite 中间件：/__pideck/api/*（复用 runner.cjs 提供 SSE 流式）
 ├─ AGENTS.md              项目级 uTools 插件开发规范与提审自检标准
 ├─ .agents/skills/        官方 uTools 开发规范与提交前自检 Skills
-├─ src/App.vue            主界面（双布局、设置、发送/取消/收口、高风险确认）
-├─ src/components/        TurnList（消息流）、SettingsModal（分组 / 环境与模型 / 操作记录）、Icon（图标系统）
-├─ src/composables/       usePiEnv（环境/模型/技能）、usePrefs（偏好）、useToast
-├─ src/sessions.js        会话持久化（单会话分 key + 索引、体积预算裁剪、旧数据自动迁移/重建）
-├─ src/groups.js          分组与工具权限数据模型
-├─ src/format.js          轻量 Markdown → HTML（先转义再生成标签，防 XSS）
+├─ src/App.vue            主界面协调层（双布局调度、发送/重新生成/取消、高风险确认）
+├─ src/constants.js       共享常量与风险判定纯函数
+├─ src/components/        Sidebar / TopRail / StatusReadout / Composer / TurnList / HistoryDrawer / SettingsModal(+4个子Tab) / EnvBanner / Icon
+├─ src/composables/       usePiEnv / usePrefs / useToast / useConfirm / useSessionFilter
+├─ src/sessions.js        会话持久化（单会话分 key + 索引、体积预算裁剪、索引损坏自动重建）
+├─ src/groups.js          分组与工具权限数据模型（翻译默认中英互译）
+├─ src/format.js          轻量 Markdown → HTML（先转义再生成标签，代码块带显式复制按钮）
 └─ src/storage.js         存储分级契约（dbStorage 仅存用户数据；本地状态/缓存分离）
 ```

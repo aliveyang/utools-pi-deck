@@ -2,9 +2,9 @@
 // 安全约束：只回传 hasKey / keyKind，绝不把 apiKey 原文交给渲染层；写前备份、原子写
 const fs = require('node:fs')
 const path = require('node:path')
-const os = require('node:os')
 const { execFile } = require('node:child_process')
 const defaultCore = require('./pi-core.cjs')
+const localStore = require('./local-store.cjs')
 
 const SETTINGS_FILE = 'settings.json'
 const MODELS_FILE = 'models.json'
@@ -12,19 +12,20 @@ const API_VALUES = ['openai-completions', 'openai-responses', 'anthropic-message
 const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i
 const BACKUP_KEEP = 5
 
-// 内置 provider：只写 apiKey，模型目录由 pi 自带
+// 内置与常用 OpenAI 兼容服务商预设（builtin: true 表示模型目录由 pi 自带）
 const PROVIDER_PRESETS = [
   { id: 'deepseek', name: 'DeepSeek', builtin: true, env: 'DEEPSEEK_API_KEY', site: 'https://platform.deepseek.com/api_keys', note: '国内直连，价格低' },
+  { id: 'dashscope', name: '阿里云百炼', builtin: false, baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', api: 'openai-completions', env: 'DASHSCOPE_API_KEY', site: 'https://bailian.console.aliyun.com/', models: ['qwen-plus', 'qwen-max', 'qwen-turbo', 'qwq-plus'], note: '阿里云通义千问 OpenAI 兼容接口' },
+  { id: 'siliconflow', name: '硅基流动', builtin: false, baseUrl: 'https://api.siliconflow.cn/v1', api: 'openai-completions', env: '', site: 'https://cloud.siliconflow.cn/account/ak', models: ['deepseek-ai/DeepSeek-V3', 'deepseek-ai/DeepSeek-R1', 'Qwen/Qwen2.5-72B-Instruct'], note: '国内高速聚合 DeepSeek / Qwen 等开源模型' },
+  { id: 'zhipu', name: '智谱 GLM', builtin: false, baseUrl: 'https://open.bigmodel.cn/api/paas/v4', api: 'openai-completions', env: '', site: 'https://open.bigmodel.cn/usercenter/apikeys', models: ['glm-4-plus', 'glm-4-air', 'glm-4-flash'], note: '智谱清言开放平台' },
+  { id: 'moonshot', name: '月之暗面 Kimi', builtin: false, baseUrl: 'https://api.moonshot.cn/v1', api: 'openai-completions', env: '', site: 'https://platform.moonshot.cn/console/api-keys', models: ['kimi-k2-0711-preview', 'moonshot-v1-8k', 'moonshot-v1-32k'], note: 'Kimi 开放平台' },
   { id: 'openai', name: 'OpenAI', builtin: true, env: 'OPENAI_API_KEY', site: 'https://platform.openai.com/api-keys', note: '' },
   { id: 'anthropic', name: 'Anthropic Claude', builtin: true, env: 'ANTHROPIC_API_KEY', site: 'https://console.anthropic.com/settings/keys', note: '订阅用户建议用终端登录', oauth: true },
   { id: 'google', name: 'Google Gemini', builtin: true, env: 'GEMINI_API_KEY', site: 'https://aistudio.google.com/apikey', note: '' },
   { id: 'openrouter', name: 'OpenRouter', builtin: true, env: 'OPENROUTER_API_KEY', site: 'https://openrouter.ai/keys', note: '一个 Key 可用多家模型' },
-  { id: 'custom', name: '自定义端点', builtin: false, env: '', site: '', note: '中转站 / Ollama / LM Studio' },
+  { id: 'ollama', name: '本地 Ollama', builtin: false, optionalKey: true, baseUrl: 'http://127.0.0.1:11434/v1', api: 'openai-completions', env: '', site: 'https://ollama.com', models: ['qwen2.5:7b', 'deepseek-r1:8b', 'llama3.2'], note: '本机免费离线运行，无需真实 API Key' },
+  { id: 'custom', name: '+ 自定义端点', builtin: false, isCustomTemplate: true, env: '', site: '', note: '中转站 / LM Studio / 企业网关，可自定义标识保存多个' },
 ]
-
-function agentDirDefault() {
-  return process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent')
-}
 
 function readJson(file, fallback) {
   const r = readJsonResult(file)
@@ -79,21 +80,9 @@ function keyKind(value) {
 }
 
 function writeJsonAtomic(file, data) {
-  const tmp = `${file}.pideck-tmp-${process.pid}`
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-  const text = JSON.stringify(data, null, 2) + '\n'
-  try {
-    fs.writeFileSync(tmp, text, { mode: 0o600 })
-    try {
-      fs.renameSync(tmp, file)
-    } catch (_) {
-      fs.writeFileSync(file, text, { mode: 0o600 })
-    }
-  } finally {
-    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp) } catch (_) {}
+  if (!localStore.writeJsonAtomic(file, data, { pretty: true, mode: 0o600 })) {
+    throw new Error(`写入 ${path.basename(file)} 失败`)
   }
-  // 配置文件可能含密钥，尽量收紧权限（Windows 上 chmod 影响有限但不报错）
-  try { fs.chmodSync(file, 0o600) } catch (_) {}
 }
 
 function pruneBackups(file) {
@@ -121,7 +110,7 @@ function backupFile(file, now) {
 
 function createConfig(options) {
   const opts = options || {}
-  const agentDir = opts.agentDir || agentDirDefault()
+  const agentDir = opts.agentDir || defaultCore.agentDir()
   const now = opts.now || Date.now
   const resolvePi = opts.resolvePi || defaultCore.resolvePi
   const settingsPath = path.join(agentDir, SETTINGS_FILE)
@@ -136,21 +125,23 @@ function createConfig(options) {
     const providers = []
     const seen = new Set()
     for (const preset of PROVIDER_PRESETS) {
-      if (preset.id === 'custom') continue
+      if (preset.isCustomTemplate) continue
       seen.add(preset.id)
       const cur = saved[preset.id] || {}
       providers.push({
         id: preset.id,
         name: cur.name || preset.name,
-        builtin: true,
+        builtin: !!preset.builtin,
         preset: true,
+        optionalKey: !!preset.optionalKey,
         hasKey: keyKind(cur.apiKey) !== 'none',
         keyKind: keyKind(cur.apiKey),
-        baseUrl: cur.baseUrl || '',
-        api: cur.api || '',
+        baseUrl: cur.baseUrl || preset.baseUrl || '',
+        api: cur.api || preset.api || 'openai-completions',
         models: Array.isArray(cur.models) ? cur.models.map(m => m && m.id).filter(Boolean) : [],
-        site: preset.site,
-        env: preset.env,
+        suggestedModels: Array.isArray(preset.models) ? preset.models.slice() : [],
+        site: preset.site || '',
+        env: preset.env || '',
         envSet: !!(preset.env && process.env[preset.env]),
         note: preset.note || '',
         oauth: !!preset.oauth,
@@ -163,11 +154,13 @@ function createConfig(options) {
         name: cur.name || id,
         builtin: false,
         preset: false,
+        optionalKey: false,
         hasKey: keyKind(cur.apiKey) !== 'none',
         keyKind: keyKind(cur.apiKey),
         baseUrl: cur.baseUrl || '',
-        api: cur.api || '',
+        api: cur.api || 'openai-completions',
         models: Array.isArray(cur.models) ? cur.models.map(m => m && m.id).filter(Boolean) : [],
+        suggestedModels: [],
         site: '',
         env: '',
         envSet: false,
@@ -195,8 +188,10 @@ function createConfig(options) {
   function save(input) {
     const req = input || {}
     const provider = String(req.provider || '').trim()
-    if (!PROVIDER_ID_RE.test(provider)) return { ok: false, error: 'provider 名称不合法' }
-    const preset = PROVIDER_PRESETS.find(p => p.id === provider)
+    if (!PROVIDER_ID_RE.test(provider) || provider === 'custom') {
+      return { ok: false, error: 'provider 标识不合法（请使用字母、数字、横线或下划线）' }
+    }
+    const preset = PROVIDER_PRESETS.find(p => p.id === provider && !p.isCustomTemplate)
     const isBuiltin = !!(preset && preset.builtin)
     const apiKey = typeof req.apiKey === 'string' ? req.apiKey.trim() : ''
     const baseUrl = typeof req.baseUrl === 'string' ? req.baseUrl.trim() : ''
@@ -209,7 +204,6 @@ function createConfig(options) {
     if (!isBuiltin) {
       if (!/^https?:\/\//i.test(baseUrl)) return { ok: false, error: '自定义端点需要 http(s) 开头的 Base URL' }
       if (!API_VALUES.includes(api)) return { ok: false, error: 'API 类型不在支持范围内' }
-      if (!provider) return { ok: false, error: '缺少 provider 名称' }
     }
 
     const modelsR = readJsonResult(modelsPath)
@@ -223,10 +217,11 @@ function createConfig(options) {
       if (apiKey) cur.apiKey = apiKey
       if (!cur.name) cur.name = preset.name
     } else {
-      cur.name = displayName || modelName || cur.name || provider
+      cur.name = displayName || (preset && preset.name) || modelName || cur.name || provider
       cur.baseUrl = baseUrl
       cur.api = api
       if (apiKey) cur.apiKey = apiKey
+      else if (preset && preset.optionalKey && keyKind(cur.apiKey) === 'none') cur.apiKey = provider
       const list = Array.isArray(cur.models) ? cur.models.slice() : []
       if (modelId && !list.some(m => m && m.id === modelId)) {
         list.push({ id: modelId, name: modelName || modelId })

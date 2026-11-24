@@ -29,12 +29,12 @@ describe('formatText XSS 防护', () => {
 })
 
 describe('formatText 渲染规则', () => {
-  it('代码块内容不被行内规则改写，保留换行并剥离围栏语言名', () => {
+  it('代码块内容不被行内规则改写，保留换行、剥离围栏语言名并带复制按钮', () => {
     const out = formatText('```\n<b> **bold** </b>\n```')
-    expect(out).toBe('<pre><code>&lt;b&gt; **bold** &lt;/b&gt;\n</code></pre>')
+    expect(out).toBe('<div class="code-block"><button type="button" class="code-copy-btn" data-copy-code="1">复制</button><pre><code>&lt;b&gt; **bold** &lt;/b&gt;\n</code></pre></div>')
 
     const withLang = formatText('```js\nconst a = 1\n```')
-    expect(withLang).toBe('<pre><code>const a = 1\n</code></pre>')
+    expect(withLang).toBe('<div class="code-block"><button type="button" class="code-copy-btn" data-copy-code="1">复制</button><pre><code>const a = 1\n</code></pre></div>')
   })
 
   it('列表紧跟标题时正常渲染标题', () => {

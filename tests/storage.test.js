@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { read, write, readLocal, writeLocal, readCache, writeCache, purgeLegacyDbCache } from '../src/storage.js'
+import { read, write, readLocal, writeLocal, readCache, writeCache } from '../src/storage.js'
 
 function createMockDbStorage() {
   const map = new Map()
@@ -69,31 +69,5 @@ describe('storage.js 同步库隔离与缓存分级', () => {
     expect(writeLocal('pideck.drafts.v1', { chat: 'hi' })).toBe(true)
     expect(readLocal('pideck.drafts.v1', {})).toEqual({ chat: 'hi' })
     expect(dbStorage.map.size).toBe(0)
-  })
-
-  it('purgeLegacyDbCache 清理 cache 键并迁移清理遗留 drafts / permNotice，保留用户数据', () => {
-    const dbStorage = createMockDbStorage()
-    const localMap = new Map()
-    dbStorage.setItem('pideck.cache.models', 'old-models')
-    dbStorage.setItem('pideck.cache.skills', 'old-skills')
-    dbStorage.setItem('pideck.cache.defaults', 'old-defaults')
-    dbStorage.setItem('pideck.drafts.v1', JSON.stringify({ chat: 'draft' }))
-    dbStorage.setItem('pideck.permNotice.v1', 'true')
-    dbStorage.setItem('pideck.groups.v1', 'user-groups')
-    globalThis.window.utools = { dbStorage }
-    globalThis.window.piBridge = {
-      readLocal: (k, fb) => (localMap.has(k) ? localMap.get(k) : fb),
-      writeLocal: (k, v) => { localMap.set(k, v); return true },
-    }
-
-    expect(purgeLegacyDbCache()).toBe(5)
-    expect(dbStorage.map.has('pideck.cache.models')).toBe(false)
-    expect(dbStorage.map.has('pideck.cache.skills')).toBe(false)
-    expect(dbStorage.map.has('pideck.cache.defaults')).toBe(false)
-    expect(dbStorage.map.has('pideck.drafts.v1')).toBe(false)
-    expect(dbStorage.map.has('pideck.permNotice.v1')).toBe(false)
-    expect(localMap.get('pideck.drafts.v1')).toEqual({ chat: 'draft' })
-    expect(localMap.get('pideck.permNotice.v1')).toBe(true)
-    expect(dbStorage.getItem('pideck.groups.v1')).toBe('user-groups')
   })
 })

@@ -1,9 +1,9 @@
 // dev-only vite 插件：本地 API 代理，让浏览器预览能真实调用 pi CLI
-// 核心逻辑复用 shared/pi-core.cjs
+// 核心逻辑复用 shared/pi-core.cjs 与 shared/runner.cjs
 import { createRequire } from 'node:module'
-import { spawn } from 'node:child_process'
 const require = createRequire(import.meta.url)
 const core = require('./shared/pi-core.cjs')
+const runnerMod = require('./shared/runner.cjs')
 
 function readJson(req) {
   return new Promise(resolve => {
@@ -95,6 +95,13 @@ export function piDevApi() {
           catch (e) { res.end(JSON.stringify({ error: String(e.message || e) })) }
           return
         }
+        if (p === 'reset-cache') {
+          if (req.method !== 'POST') { res.statusCode = 405; res.end('method not allowed'); return }
+          core.resetPiCache()
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ ok: true }))
+          return
+        }
         if (p === 'run') {
           if (req.method !== 'POST') { res.statusCode = 405; res.end('method not allowed'); return }
           let body = await readJson(req)
@@ -103,73 +110,35 @@ export function piDevApi() {
           res.setHeader('Cache-Control', 'no-cache')
           res.setHeader('Connection', 'keep-alive')
           const send = (type, data) => { try { res.write(`data: ${JSON.stringify({ type, data })}\n\n`) } catch (_) {} }
-
-          let node, args
+          const devRunner = runnerMod.createRunner({ core, loadConfig: () => ({ engine: 'json' }) })
+          let ended = false
+          const endStream = () => { if (!ended) { ended = true; res.end() } }
+          let handle
           try {
-            // 禁工具且无 MCP/扩展的纯文本分组：替换 system prompt，避免模型输出原始工具调用标记
-            body = core.applyLeanSystemPrompt(body)
-            node = core.resolvePi().node; args = core.buildArgs(body)
-          }
-          catch (e) { send('error', e.message); res.end(); return }
-
-          const child = spawn(node, args, {
-            cwd: core.effectiveCwd(body.cwd), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-          })
-          const buf = core.makeLineBuffer()
-          const errStream = core.makeTextStream()
-          let stderrBuf = ''
-          let doneFired = false
-          const finish = data => { if (!doneFired) { doneFired = true; send('done', data) } }
-          child.stdout.on('data', chunk => {
-            core.pushChunk(buf, chunk, rec => {
-              const settled = core.mapPiEvent(rec, {
-                onText: d => send('text', d),
-                onThinking: d => send('thinking', d),
-                onUsage: u => send('usage', u),
-                onTool: (phase, name, payload, id) => send(phase === 'start' ? 'tool_start' : 'tool_end',
-                  phase === 'start' ? { name, args: payload, id } : { name, result: payload, id }),
-                onEvent: r => send('event', r),
-              })
-              if (settled) finish({ aborted: false })
+            handle = devRunner.run(body, {
+              onEvent: r => send('event', r),
+              onText: d => send('text', d),
+              onThinking: d => send('thinking', d),
+              onUsage: u => send('usage', u),
+              onTool: (phase, name, payload, id) => send(
+                phase === 'start' ? 'tool_start' : 'tool_end',
+                phase === 'start' ? { name, args: payload, id } : { name, result: payload, id },
+              ),
+              onDone: payload => { send('done', payload); send('close', { code: 0 }); endStream() },
+              onError: msg => { send('error', msg); send('close', { code: 1 }); endStream() },
+              onClose: code => { send('close', { code }); endStream() },
             })
-          })
-          child.stderr.on('data', c => {
-            const s = errStream.push(c)
-            if (s) {
-              stderrBuf = (stderrBuf + s).slice(-1200)
-              send('stderr', s.slice(0, 500))
+          } catch (e) {
+            send('error', String(e.message || e))
+            endStream()
+            return
+          }
+          req.on('close', () => {
+            if (!ended && handle && handle.cancel) {
+              try { handle.cancel() } catch (_) {}
             }
+            ended = true
           })
-          const timer = setTimeout(() => {
-            if (!doneFired) {
-              doneFired = true
-              send('error', 'pi 运行超时（15 分钟）')
-            }
-            try { child.kill() } catch (_) {}
-          }, 15 * 60 * 1000)
-          child.on('error', err => {
-            clearTimeout(timer)
-            if (!doneFired) {
-              doneFired = true
-              send('error', String((err && err.message) || err))
-            }
-            res.end()
-          })
-          child.on('close', code => {
-            clearTimeout(timer)
-            stderrBuf = (stderrBuf + errStream.end()).slice(-1200)
-            if (!doneFired) {
-              if (code === 0) finish({ aborted: false, code })
-              else {
-                doneFired = true
-                const msg = stderrBuf.trim()
-                send('error', msg ? `pi 退出（code ${code}）：${msg}` : `pi 退出（code ${code}）`)
-              }
-            }
-            send('close', { code })
-            res.end()
-          })
-          req.on('close', () => { try { child.kill() } catch (_) {} })
           return
         }
         res.statusCode = 404; res.end('not found')

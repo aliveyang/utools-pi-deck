@@ -1,27 +1,20 @@
 // PiDeck preload：渲染进程 ↔ Node/uTools 薄桥接层
 // 核心逻辑在 shared/*.cjs（dev 用 ../shared，构建后 dist 用 ./shared）
-let core = null
 let coreErr = ''
-try { core = require('./shared/pi-core.cjs') }
-catch (e1) {
-  try { core = require('../shared/pi-core.cjs') }
-  catch (e2) { coreErr = `${e1.message} / ${e2.message}` }
+function loadShared(name, recordErr) {
+  for (const rel of [`./shared/${name}`, `../shared/${name}`]) {
+    try { return require(rel) }
+    catch (e) { if (recordErr) coreErr = (coreErr ? coreErr + ' / ' : '') + e.message }
+  }
+  return null
 }
-let rpcEngine = null
-try { rpcEngine = require('./shared/rpc-engine.cjs') }
-catch (_) { try { rpcEngine = require('../shared/rpc-engine.cjs') } catch (_) {} }
-let auditCore = null
-try { auditCore = require('./shared/audit.cjs') }
-catch (_) { try { auditCore = require('../shared/audit.cjs') } catch (_) {} }
-let configCore = null
-try { configCore = require('./shared/config.cjs') }
-catch (_) { try { configCore = require('../shared/config.cjs') } catch (_) {} }
-let localStoreMod = null
-try { localStoreMod = require('./shared/local-store.cjs') }
-catch (_) { try { localStoreMod = require('../shared/local-store.cjs') } catch (_) {} }
-let runnerMod = null
-try { runnerMod = require('./shared/runner.cjs') }
-catch (_) { try { runnerMod = require('../shared/runner.cjs') } catch (_) {} }
+
+const core = loadShared('pi-core.cjs', true)
+const rpcEngine = loadShared('rpc-engine.cjs')
+const auditCore = loadShared('audit.cjs')
+const configCore = loadShared('config.cjs')
+const localStoreMod = loadShared('local-store.cjs')
+const runnerMod = loadShared('runner.cjs')
 
 const fs = require('node:fs')
 const path = require('node:path')
@@ -32,6 +25,8 @@ if (!core || !localStoreMod || !runnerMod) {
   // 降级桥：字段需与正常分支保持一致，避免前端取到 undefined
   window.piBridge = {
     resolvePi: () => ({ ok: false, error: 'pi-core 加载失败：' + errMsg }),
+    resetPiCache: () => {},
+    installPiInTerminal: () => false,
     getConfig: () => ({}), setConfig: () => ({}),
     readCache: () => null, writeCache: () => false,
     readLocal: (_k, fb) => fb, writeLocal: () => false,
@@ -45,7 +40,8 @@ if (!core || !localStoreMod || !runnerMod) {
     openExternal: () => false, openPath: () => false,
     run: () => { throw new Error('pi-core 加载失败：' + errMsg) },
     cancel: () => {}, saveImage: () => { throw new Error('pi-core 加载失败') },
-    pickFolder: () => null, validateCwd: () => false, effectiveCwd: p => p || os.homedir(), resolveCwd: p => p || os.homedir(),
+    pickFolder: () => null, pickFiles: () => null, pickExecutable: () => null,
+    validateCwd: () => false, effectiveCwd: p => p || os.homedir(), resolveCwd: p => p || os.homedir(),
     homedir: () => os.homedir(),
     auditTail: () => [], auditExport: () => '', auditDir: () => '', auditClear: () => ({ removed: 0, failed: 0 }), auditRecord: () => false,
     configState: () => ({ ok: false, error: 'pi-core 加载失败' }),
@@ -89,6 +85,12 @@ function boot() {
     legacyConfigFile: path.join(os.homedir(), '.pideck', 'config.json'),
   })
 
+  // 启动时注入本机手动指定的 Node / pi CLI 路径覆盖
+  const initCfg = store.loadConfig()
+  if (initCfg && (initCfg.nodePath || initCfg.piCliPath)) {
+    core.setPathOverrides({ nodePath: initCfg.nodePath || '', piCliPath: initCfg.piCliPath || '' })
+  }
+
   const audit = auditCore
     ? (pluginLocalRoot ? auditCore.createAudit({ root: path.join(pluginLocalRoot, 'audit') }) : auditCore)
     : null
@@ -127,6 +129,30 @@ function boot() {
     const picked = r && r[0] ? r[0] : null
     if (picked && core.validateCwd(picked)) workspaceRoots.add(picked)
     return picked
+  }
+
+  function pickFiles() {
+    if (!window.utools || !window.utools.showOpenDialog) return null
+    const r = window.utools.showOpenDialog({
+      title: '选择图片或文件',
+      defaultPath: os.homedir(),
+      properties: ['openFile', 'multiSelections'],
+      filters: [
+        { name: '支持的文件', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'txt', 'md', 'pdf', 'json', 'csv', 'js', 'ts', 'py', 'html', 'css'] },
+        { name: '所有文件', extensions: ['*'] },
+      ],
+    })
+    return Array.isArray(r) ? r.filter(Boolean) : []
+  }
+
+  function pickExecutable(kind) {
+    if (!window.utools || !window.utools.showOpenDialog) return null
+    const r = window.utools.showOpenDialog({
+      title: kind === 'node' ? '选择 Node 可执行文件' : '选择 pi cli.js',
+      defaultPath: os.homedir(),
+      properties: ['openFile'],
+    })
+    return r && r[0] ? r[0] : null
   }
 
   // 保存文本文件：优先 uTools 下载目录与保存对话框
@@ -190,6 +216,8 @@ function boot() {
     cancel: () => runner.cancel(),
     saveImage: dataUrl => store.saveImage(dataUrl),
     pickFolder,
+    pickFiles,
+    pickExecutable,
     validateCwd: core.validateCwd,
     effectiveCwd: core.effectiveCwd,
     resolveCwd: core.resolveCwd,
@@ -212,7 +240,13 @@ function boot() {
     writeLocal: (key, value) => store.writeLocal(key, value),
     // RPC 引擎与配置
     getConfig: () => store.loadConfig(),
-    setConfig: patch => store.saveConfig(patch),
+    setConfig: patch => {
+      const next = store.saveConfig(patch)
+      if (patch && ('nodePath' in patch || 'piCliPath' in patch)) {
+        core.setPathOverrides({ nodePath: next.nodePath || '', piCliPath: next.piCliPath || '' })
+      }
+      return next
+    },
     prewarmRpc: (cwd, flags) => {
       if (!rpcEngine) return Promise.resolve(false)
       return rpcEngine.prewarm(cwd, core.applyLeanSystemPrompt(flags || {}))
@@ -231,6 +265,8 @@ function boot() {
     configAuthCheck: provider => (configCore ? configCore.authCheck(provider) : Promise.resolve({ status: 'unavailable' })),
     configLoginCommand: provider => (configCore ? configCore.loginCommand(provider) : ''),
     openTerminalForProvider: provider => (configCore ? runner.openTerminal(configCore.loginCommand(provider)) : false),
+    installPiInTerminal: () => runner.openTerminal(core.PI_INSTALL_CMD),
+    resetPiCache: () => core.resetPiCache(),
     resolvePi: () => {
       try { const r = core.resolvePi(); return { ok: true, ...r } }
       catch (e) { return { ok: false, error: String(e.message || e) } }

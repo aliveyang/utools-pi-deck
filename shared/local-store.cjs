@@ -77,17 +77,24 @@ function readJsonObject(file) {
   }
 }
 
-function writeJsonAtomic(file, data, pretty) {
+function writeJsonAtomic(file, data, opts) {
+  const options = typeof opts === 'boolean' ? { pretty: opts } : (opts || {})
+  const pretty = !!options.pretty
+  const mode = options.mode
   const dir = path.dirname(file)
   const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 7)}`
   try {
-    fs.mkdirSync(dir, { recursive: true })
-    const text = pretty ? JSON.stringify(data, null, 2) : JSON.stringify(data)
-    fs.writeFileSync(tmp, text, 'utf8')
+    fs.mkdirSync(dir, { recursive: true, ...(mode ? { mode: 0o700 } : {}) })
+    const text = (pretty ? JSON.stringify(data, null, 2) + '\n' : JSON.stringify(data))
+    const writeOpts = mode ? { encoding: 'utf8', mode } : 'utf8'
+    fs.writeFileSync(tmp, text, writeOpts)
     try {
       fs.renameSync(tmp, file)
     } catch (_) {
-      fs.writeFileSync(file, text, 'utf8')
+      fs.writeFileSync(file, text, writeOpts)
+    }
+    if (mode) {
+      try { fs.chmodSync(file, mode) } catch (_) {}
     }
     return true
   } catch (_) {
@@ -261,6 +268,8 @@ module.exports = {
   isAllowedExternalUrl,
   isPathWithinRoot,
   resolveSafeOpenTarget,
+  readJsonObject,
+  writeJsonAtomic,
   DEFAULT_CACHE_TTL,
   DEFAULT_MAX_IMAGE_BYTES,
   IMAGE_MAX_AGE_MS,

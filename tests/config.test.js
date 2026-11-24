@@ -149,9 +149,41 @@ describe('config', () => {
     expect(JSON.stringify(state)).not.toContain('$DEEPSEEK_API_KEY')
   })
 
-  it('非法 provider 名称被拒绝', () => {
+  it('非法 provider 名称与保留模板 custom 被拒绝', () => {
     const cfg = createConfig({ agentDir: dir })
     expect(cfg.save({ provider: '../evil', apiKey: 'x', modelId: 'm' }).ok).toBe(false)
+    expect(cfg.save({ provider: 'custom', baseUrl: 'https://x.test/v1', api: 'openai-completions', modelId: 'm' }).ok).toBe(false)
     expect(cfg.removeKey('a b').ok).toBe(false)
+  })
+
+  it('包含国内预设与 Ollama；多自定义端点互不覆盖且 Ollama 可免填 apiKey', () => {
+    const cfg = createConfig({ agentDir: dir })
+    const st = cfg.getState()
+    expect(st.providers.some(p => p.id === 'dashscope')).toBe(true)
+    expect(st.providers.some(p => p.id === 'siliconflow')).toBe(true)
+    expect(st.providers.some(p => p.id === 'zhipu')).toBe(true)
+    expect(st.providers.some(p => p.id === 'moonshot')).toBe(true)
+    const ollama = st.providers.find(p => p.id === 'ollama')
+    expect(ollama.optionalKey).toBe(true)
+
+    const rOllama = cfg.save({
+      provider: 'ollama', baseUrl: 'http://127.0.0.1:11434/v1', api: 'openai-completions',
+      apiKey: '', modelId: 'qwen2.5:7b', setDefault: true,
+    })
+    expect(rOllama.ok).toBe(true)
+    expect(readJson(modelsPath).providers.ollama.apiKey).toBe('ollama')
+
+    const r1 = cfg.save({
+      provider: 'relay-a', name: '中转A', baseUrl: 'https://a.test/v1', api: 'openai-completions',
+      apiKey: 'ka-test', modelId: 'm1', setDefault: true,
+    })
+    const r2 = cfg.save({
+      provider: 'relay-b', name: '中转B', baseUrl: 'https://b.test/v1', api: 'openai-completions',
+      apiKey: 'kb-test', modelId: 'm2', setDefault: true,
+    })
+    expect(r1.ok && r2.ok).toBe(true)
+    const savedProviders = readJson(modelsPath).providers
+    expect(savedProviders['relay-a'].baseUrl).toBe('https://a.test/v1')
+    expect(savedProviders['relay-b'].baseUrl).toBe('https://b.test/v1')
   })
 })
