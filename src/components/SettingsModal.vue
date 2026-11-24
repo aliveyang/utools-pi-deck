@@ -49,8 +49,21 @@ const TOOL_META = [
 
 const settingsTab = ref('general')
 const editing = ref(null)
+const editOrigRiskKeys = ref(new Set())
+const confirmRiskSave = ref(false)
+let confirmRiskTimer = null
 const editContextFiles = ref([])
 const editSkills = ref([])
+
+function riskKeysOf(tool) {
+  const t = tool || {}
+  const keys = new Set()
+  for (const n of (t.list || [])) {
+    if (n === 'edit' || n === 'write' || n === 'bash' || n === 'powershell') keys.add(n)
+  }
+  if (t.trust) keys.add('trust')
+  return keys
+}
 
 watch(() => props.show, val => {
   if (val) {
@@ -62,8 +75,10 @@ watch(() => props.show, val => {
     cfgKey.value = ''
     confirmClearAll.value = false
     auditConfirmClear.value = false
+    confirmRiskSave.value = false
     clearTimeout(confirmClearTimer)
     clearTimeout(auditClearTimer)
+    clearTimeout(confirmRiskTimer)
   }
 })
 
@@ -108,6 +123,7 @@ function ctxLabel(c) { return c.global ? '全局' : '项目' }
 
 function editGroup(g) {
   const base = g.tool || TOOL_PRESETS.read
+  editOrigRiskKeys.value = riskKeysOf(base)
   editing.value = {
     ...g,
     lean: { noContextFiles: false, noSkills: false, noMcp: false, noTools: false, ...(g.lean || {}) },
@@ -121,6 +137,7 @@ function editGroup(g) {
   refreshEditEnv()
 }
 function addGroup() {
+  editOrigRiskKeys.value = new Set()
   editing.value = newGroup()
   refreshEditEnv()
 }
@@ -132,6 +149,19 @@ function saveGroup() {
     list: ((e.tool && e.tool.list) || []).slice(),
     skillNames: ((e.tool && e.tool.skillNames) || []).slice(),
   }
+  const nextKeys = riskKeysOf(tool)
+  let addedRisk = false
+  for (const k of nextKeys) {
+    if (!editOrigRiskKeys.value.has(k)) { addedRisk = true; break }
+  }
+  if (addedRisk && !confirmRiskSave.value) {
+    confirmRiskSave.value = true
+    clearTimeout(confirmRiskTimer)
+    confirmRiskTimer = setTimeout(() => { confirmRiskSave.value = false }, 4000)
+    return
+  }
+  confirmRiskSave.value = false
+  clearTimeout(confirmRiskTimer)
   const next = {
     ...e, tool,
     lean: {
@@ -151,7 +181,9 @@ const confirmDeleteGroup = ref(false)
 let confirmDeleteTimer = null
 watch(editing, () => {
   confirmDeleteGroup.value = false
+  confirmRiskSave.value = false
   clearTimeout(confirmDeleteTimer)
+  clearTimeout(confirmRiskTimer)
 })
 function requestDeleteGroup() {
   if (!editing.value) return
@@ -214,13 +246,14 @@ const editRisk = computed(() => {
     out.push(String(t.mcpServers || '').trim() ? 'MCP 指定（不受白名单约束）' : 'MCP 未填 server，按关闭处理')
   }
   if (t.ext) out.push('扩展可能自带工具')
+  if (t.trust) out.push('信任项目级 .pi 配置（将加载项目扩展/MCP）')
   if (!out.length) return ['不暴露任何工具']
   return out
 })
 const editHasExec = computed(() => {
   const t = editing.value && editing.value.tool
   if (!t) return false
-  return (t.list || []).some(n => n === 'bash' || n === 'powershell')
+  return (t.list || []).some(n => n === 'bash' || n === 'powershell') || !!t.trust
 })
 
 function groupSummary(g) {
@@ -604,7 +637,8 @@ defineExpose({ handleEsc, openTab })
             <span class="switch-label">项目级 .pi 配置<small>项目扩展 / 项目 MCP / 项目技能</small></span>
             <input class="switch" type="checkbox" :checked="editTool.trust" @change="editTool.trust = $event.target.checked" />
           </label>
-          <span class="hint">全局 ~/.pi 配置始终生效；项目级配置需要信任，非交互模式不会弹窗</span>
+          <span v-if="editTool.trust" class="hint warn">已启用 --approve，将自动加载工作区内的项目扩展与 MCP，请仅对可信项目开启</span>
+          <span v-else class="hint">全局 ~/.pi 配置始终生效；项目级配置需要信任，非交互模式不会弹窗</span>
           <div v-if="editContextFiles.length" class="ctx-info">
             检测到规范文件：
             <div v-for="c in editContextFiles" :key="c.path" class="ctx-row">
@@ -619,7 +653,9 @@ defineExpose({ handleEsc, openTab })
           </button>
           <span class="spacer"></span>
           <button class="mini-btn" @click="editing = null">取消</button>
-          <button class="primary-btn" @click="saveGroup">保存</button>
+          <button class="primary-btn" :class="{ danger: confirmRiskSave }" @click="saveGroup">
+            {{ confirmRiskSave ? '再点一次确认启用高风险权限' : '保存' }}
+          </button>
         </div>
       </div>
 

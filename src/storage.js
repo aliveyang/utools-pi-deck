@@ -1,17 +1,23 @@
 // 统一存储层：uTools dbStorage 优先，localStorage 降级
-// 契约：存 JSON 字符串（避开 Electron IPC 无法克隆 Proxy），读兼容对象/字符串/旧数据
+// 契约：
+// - 用户数据（分组、会话、偏好）使用 read/write/remove 存入 dbStorage（随账号同步）
+// - 本机状态（草稿、一次性提示标记）使用 readLocal/writeLocal 存入本地数据目录/localStorage（不同步）
+// - 可重建缓存（模型列表、技能列表、默认配置）使用 readCache/writeCache 存入临时目录/localStorage（不同步）
 function backend() {
   return (window.utools && window.utools.dbStorage) ? window.utools.dbStorage : localStorage
 }
 
+function parseRaw(raw, fallback) {
+  if (raw == null) return fallback
+  if (Array.isArray(raw)) return raw          // 旧数据：dbStorage 存的对象
+  if (typeof raw === 'object') return raw     // 旧数据：dbStorage 返回对象
+  if (typeof raw === 'string') return JSON.parse(raw)
+  return fallback
+}
+
 export function read(key, fallback) {
   try {
-    const raw = backend().getItem(key)
-    if (raw == null) return fallback
-    if (Array.isArray(raw)) return raw          // 旧数据：dbStorage 存的对象
-    if (typeof raw === 'object') return raw     // 旧数据：dbStorage 返回对象
-    if (typeof raw === 'string') return JSON.parse(raw)
-    return fallback
+    return parseRaw(backend().getItem(key), fallback)
   } catch (_) { return fallback }
 }
 
@@ -36,13 +42,96 @@ export function remove(key) {
   }
 }
 
-const CACHE_TTL = 5 * 60 * 1000
-// 带 TTL 的缓存：命中返回 data，未命中/过期返回 null
-export function readCache(key) {
-  const entry = read('pideck.cache.' + key, null)
-  if (!entry || !entry.t || Date.now() - entry.t > CACHE_TTL) return null
-  return entry.data
+// 本机持久状态（高频草稿、本地标记）：不写入 utools.dbStorage
+export function readLocal(key, fallback) {
+  try {
+    if (window.piBridge && typeof window.piBridge.readLocal === 'function') {
+      return window.piBridge.readLocal(key, fallback)
+    }
+  } catch (_) {}
+  try {
+    if (typeof localStorage === 'undefined') return fallback
+    const raw = localStorage.getItem(key)
+    return raw == null ? fallback : parseRaw(raw, fallback)
+  } catch (_) { return fallback }
 }
+
+export function writeLocal(key, value) {
+  try {
+    if (window.piBridge && typeof window.piBridge.writeLocal === 'function') {
+      return !!window.piBridge.writeLocal(key, value)
+    }
+  } catch (_) {}
+  try {
+    if (typeof localStorage === 'undefined') return false
+    localStorage.setItem(key, JSON.stringify(value))
+    return true
+  } catch (_) { return false }
+}
+
+const CACHE_TTL = 5 * 60 * 1000
+const LOCAL_CACHE_PREFIX = 'pideck.localcache.'
+const LEGACY_CACHE_KEYS = ['models', 'skills', 'defaults']
+const LEGACY_LOCAL_KEYS = ['pideck.drafts.v1', 'pideck.permNotice.v1']
+
+// 本地缓存：优先走 preload 写入插件临时目录；浏览器 dev 降级到 localStorage
+export function readCache(key) {
+  try {
+    if (window.piBridge && typeof window.piBridge.readCache === 'function') {
+      return window.piBridge.readCache(key)
+    }
+  } catch (_) {}
+  try {
+    if (typeof localStorage === 'undefined') return null
+    const raw = localStorage.getItem(LOCAL_CACHE_PREFIX + key)
+    if (!raw) return null
+    const entry = JSON.parse(raw)
+    if (!entry || typeof entry.t !== 'number' || Date.now() - entry.t > CACHE_TTL) return null
+    return entry.data === undefined ? null : entry.data
+  } catch (_) { return null }
+}
+
 export function writeCache(key, data) {
-  write('pideck.cache.' + key, { t: Date.now(), data })
+  try {
+    if (window.piBridge && typeof window.piBridge.writeCache === 'function') {
+      return !!window.piBridge.writeCache(key, data)
+    }
+  } catch (_) {}
+  try {
+    if (typeof localStorage === 'undefined') return false
+    localStorage.setItem(LOCAL_CACHE_PREFIX + key, JSON.stringify({ t: Date.now(), data }))
+    return true
+  } catch (_) { return false }
+}
+
+// 清理并迁移历史版本误写入 utools.dbStorage 的缓存与高频本地状态
+export function purgeLegacyDbCache() {
+  try {
+    const dbStorage = window.utools && window.utools.dbStorage
+    if (!dbStorage || typeof dbStorage.getItem !== 'function' || typeof dbStorage.removeItem !== 'function') return 0
+    let removed = 0
+    for (const k of LEGACY_CACHE_KEYS) {
+      const fullKey = 'pideck.cache.' + k
+      try {
+        if (dbStorage.getItem(fullKey) != null) {
+          dbStorage.removeItem(fullKey)
+          removed++
+        }
+      } catch (_) {}
+    }
+    const SENTINEL = {}
+    for (const k of LEGACY_LOCAL_KEYS) {
+      try {
+        const raw = dbStorage.getItem(k)
+        if (raw == null) continue
+        if (readLocal(k, SENTINEL) === SENTINEL) {
+          const val = parseRaw(raw, SENTINEL)
+          if (val !== SENTINEL) writeLocal(k, val)
+        }
+        dbStorage.removeItem(k)
+        removed++
+      } catch (_) {}
+    }
+    return removed
+  } catch (_) { return 0 }
 }

@@ -51,11 +51,13 @@ RPC 的会话隔离：同一长驻进程在多个 PiDeck 会话间切换时会�
 
 ## 工具权限
 
-每个分组独立配置四档预设（纯文本 / 只读 / 可编辑 / 完整）+ 细粒度勾选（内置工具白名单、MCP 三态、扩展、技能、AGENTS.md 规范、项目级 `.pi` 信任）。写入与执行类工具（`edit`/`write`/`bash`/`powershell`）在 UI 中有显著风险标识。MCP 与扩展不受内置白名单约束，组合后的真实后果会显示在"工具影响"一行。
+每个分组独立配置四档预设（纯文本 / 只读 / 可编辑 / 完整）+ 细粒度勾选（内置工具白名单、MCP 三态、扩展、技能、AGENTS.md 规范、项目级 `.pi` 信任）。写入与执行类工具（`edit`/`write`/`bash`/`powershell`）及项目级 `.pi` 信任（`--approve`）在 UI 中有显著风险标识：分组新增开启高风险权限需两步确认，且每个会话首次执行含高风险权限的发送前会在输入区上方弹出确认条。MCP 与扩展不受内置白名单约束，组合后的真实后果会显示在"工具影响"一行。
 
-## 操作记录
+## 操作记录与数据存储
 
-「设置 → 操作记录」记录工具调用与权限变更：时间、分组、工具名、参数/结果摘要（截断并脱敏）、耗时、token 用量。记录只保存在本机 `~/.pideck/audit/`（按天 JSONL，保留 30 天，单片 20MB 自动分片），不记录对话全文、完整文件内容与密钥；支持「只看风险」、导出 Markdown、清空记录。
+「设置 → 操作记录」记录工具调用与权限变更：时间、分组、工具名、参数/结果摘要（截断并脱敏）、耗时、token 用量。记录只保存在本机应用数据目录（`utools.getPluginLocalDataPath()/audit`，无 uTools 环境时回退 `~/.pideck/audit/`，按天 JSONL，保留 30 天，单片 20MB 自动分片），不记录对话全文、完整文件内容与密钥；支持「只看风险」、导出 Markdown、清空记录。
+
+存储分级：分组配置、会话历史与用户偏好存入 `utools.dbStorage`（支持云同步）；输入草稿、本地引擎配置与审计日志保存在插件本地数据目录；模型/技能/默认配置缓存与粘贴临时图片保存在插件临时目录（`utools.getPluginTempPath()`），不占用云同步空间。
 
 「设置 → 对话默认」底部提供「清空所有对话」，会同时删除 pi 侧会话文件，需要两步确认。删除单条会话与删除分组也都改成了两步确认。
 
@@ -74,17 +76,22 @@ npm test          # vitest 单测（纯函数：权限拼参 / Markdown 转义 /
 
 ```
 ├─ public/plugin.json     uTools 插件描述（入口/关键字/图片/文件指令）
-├─ public/preload.js      渲染层 ↔ Node 桥（piBridge），核心逻辑在 shared
+├─ public/preload.js      渲染层 ↔ Node/uTools 薄桥接层（piBridge）
+├─ public/logo.png        原创插件图标（256×256 RGBA PNG）
 ├─ shared/pi-core.cjs     pi 定位、JSONL 解析、权限拼参、扫描、诊断（三调用方共用）
 ├─ shared/rpc-engine.cjs  RPC 长驻引擎（按 cwd+配置 维护进程，new_session 会话隔离）
+├─ shared/runner.cjs      进程调度、审计包装、异步模型列表与终端登录逻辑
+├─ shared/local-store.cjs 本地缓存、本机配置/状态、临时图片落盘/清理、外链与路径安全校验
 ├─ shared/audit.cjs       操作记录（本地 JSONL、脱敏、按天分片、30 天保留）
 ├─ shared/config.cjs      pi 配置读写（settings/models、备份、apiKey 不落渲染层）
 ├─ dev-server-plugin.mjs  dev-only vite 中间件：/__pideck/api/*（SSE 流式）
-├─ src/App.vue            主界面（双布局、设置、发送/取消/收口）
+├─ AGENTS.md              项目级 uTools 插件开发规范与提审自检标准
+├─ .agents/skills/        官方 uTools 开发规范与提交前自检 Skills
+├─ src/App.vue            主界面（双布局、设置、发送/取消/收口、高风险确认）
 ├─ src/components/        TurnList（消息流）、SettingsModal（分组 / 环境与模型 / 操作记录）、Icon（图标系统）
 ├─ src/composables/       usePiEnv（环境/模型/技能）、usePrefs（偏好）、useToast
-├─ src/sessions.js        会话持久化（单会话分 key + 索引，旧数据自动迁移/重建）
+├─ src/sessions.js        会话持久化（单会话分 key + 索引、体积预算裁剪、旧数据自动迁移/重建）
 ├─ src/groups.js          分组与工具权限数据模型
 ├─ src/format.js          轻量 Markdown → HTML（先转义再生成标签，防 XSS）
-└─ src/storage.js         dbStorage/localStorage 统一存储契约（存字符串避 IPC clone）
+└─ src/storage.js         存储分级契约（dbStorage 仅存用户数据；本地状态/缓存分离）
 ```

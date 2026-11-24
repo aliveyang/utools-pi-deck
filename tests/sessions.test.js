@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { read, write, remove } from '../src/storage.js'
 import {
   listSessions, getSession, createSession, updateSession, deleteSession,
-  titleFromText, exportMarkdown,
+  titleFromText, exportMarkdown, fitSessionBudget,
 } from '../src/sessions.js'
 
 const IDX_KEY = 'pideck.sessions.idx'
@@ -106,5 +106,20 @@ describe('辅助函数', () => {
     expect(md).toContain('## Pi')
     expect(md).toContain('回答')
     expect(md).toContain('> 错误：超时')
+  })
+
+  it('fitSessionBudget：超大工具结果与思考文本优先被裁剪，超限时丢弃最旧消息以守住 1MB 上限', () => {
+    const bigSession = {
+      id: 's-big',
+      messages: [
+        { role: 'user', text: 'first' },
+        { role: 'assistant', text: 'ok1', thinking: 't'.repeat(2000), tools: [{ name: 'read', result: 'r'.repeat(4000) }] },
+        { role: 'user', text: 'latest' },
+        { role: 'assistant', text: 'x'.repeat(2000) },
+      ],
+    }
+    const fitted = fitSessionBudget(bigSession, 3000)
+    expect(Buffer.byteLength(JSON.stringify(fitted), 'utf8')).toBeLessThanOrEqual(3000)
+    expect(fitted.messages.at(-1).text).toBe('x'.repeat(2000))
   })
 })

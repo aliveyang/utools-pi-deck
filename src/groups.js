@@ -1,5 +1,5 @@
 // 分组配置持久化
-import { read, write } from './storage.js'
+import { read, write, readLocal, writeLocal } from './storage.js'
 
 const KEY = 'pideck.groups.v1'
 const ACTIVE_KEY = 'pideck.active.v1'
@@ -132,11 +132,11 @@ export function saveActiveId(id) {
 }
 
 export function loadDrafts() {
-  const d = read(DRAFT_KEY, {})
+  const d = readLocal(DRAFT_KEY, {})
   return (d && typeof d === 'object') ? d : {}
 }
 export function saveDrafts(drafts) {
-  write(DRAFT_KEY, drafts)
+  writeLocal(DRAFT_KEY, drafts)
 }
 
 export function newGroup() {

@@ -12,10 +12,17 @@ export function useToast() {
   }
 
   function copyText(text) {
+    const str = String(text ?? '')
     const done = () => showToast('已复制')
+    try {
+      if (window.utools && typeof window.utools.copyText === 'function' && window.utools.copyText(str)) {
+        done()
+        return
+      }
+    } catch (_) {}
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done))
-    } else fallbackCopy(text, done)
+      navigator.clipboard.writeText(str).then(done).catch(() => fallbackCopy(str, done))
+    } else fallbackCopy(str, done)
   }
 
   function fallbackCopy(text, done) {

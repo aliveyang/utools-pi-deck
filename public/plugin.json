@@ -8,12 +8,11 @@
       "description": "PiDeck - 快速对话",
       "cmds": [
         "pi",
-        "pideck",
         "PiDeck",
         {
           "type": "over",
           "label": "PiDeck 对话",
-          "maxLength": 20000
+          "maxLength": 10000
         },
         {
           "type": "img",
@@ -37,20 +36,20 @@
         {
           "type": "over",
           "label": "PiDeck 翻译",
-          "maxLength": 20000
+          "maxLength": 10000
         }
       ]
     },
     {
       "code": "agent",
-      "description": "PiDeck - 智能体（完整工具能力）",
+      "description": "PiDeck - 智能体（默认只读工具，可按需开启编辑与命令）",
       "cmds": [
         "智能体",
         "agent",
         {
           "type": "over",
           "label": "PiDeck 智能体",
-          "maxLength": 20000
+          "maxLength": 10000
         }
       ]
     }

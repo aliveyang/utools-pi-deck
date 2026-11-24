@@ -15,7 +15,7 @@ function copyCore() {
     closeBundle() {
       const outDir = resolve(ROOT, 'dist', 'shared')
       mkdirSync(outDir, { recursive: true })
-      for (const name of ['pi-core.cjs', 'rpc-engine.cjs', 'audit.cjs', 'config.cjs']) {
+      for (const name of ['pi-core.cjs', 'rpc-engine.cjs', 'audit.cjs', 'config.cjs', 'local-store.cjs', 'runner.cjs']) {
         copyFileSync(resolve(ROOT, 'shared', name), resolve(outDir, name))
       }
       // 生产包去掉开发态入口

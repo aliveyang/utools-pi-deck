@@ -114,7 +114,14 @@ window.piBridge = {
   },
   openPath: () => false,   // 浏览器预览无法打开系统文件管理器
   saveTextFile: () => ({ ok: false, unsupported: true }),   // 走前端 Blob 降级
-  openExternal: url => { try { window.open(url, '_blank'); return true } catch (_) { return false } },
+  openExternal: url => {
+    try {
+      const parsed = new URL(String(url || '').trim())
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+      window.open(parsed.href, '_blank', 'noopener,noreferrer')
+      return true
+    } catch (_) { return false }
+  },
   // dev 模式不启用 RPC（走 dev-server JSON），保留接口形状一致
   getConfig: () => ({ engine: 'json' }),
   setConfig: () => ({}),

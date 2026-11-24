@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { loadGroups, saveGroups, loadActiveId, saveActiveId, loadDrafts, saveDrafts, PRESET_LABEL, TOOL_PRESETS, presetOf } from './groups.js'
-import { readCache, read, write } from './storage.js'
+import { readCache, readLocal, writeLocal, purgeLegacyDbCache } from './storage.js'
 import Icon from './components/Icon.vue'
 import TurnList from './components/TurnList.vue'
 import EnvBanner from './components/EnvBanner.vue'
@@ -312,11 +312,18 @@ onMounted(async () => {
   // 早于本组件挂载的进入事件由 preload 缓存在这里，补放一次
   const queued = window.__pideckEnterQueue || []
   while (queued.length) onEnterEvent({ detail: queued[0] })
-  // 随用即走：关窗时立即强制存草稿，不依赖 500ms 防抖
-  window.utools && window.utools.onPluginOut && window.utools.onPluginOut(() => {
+  // 随用即走：关窗/退出时立即强制存草稿；进程终止时同步停止运行中任务与常驻进程
+  window.utools && window.utools.onPluginOut && window.utools.onPluginOut(isKill => {
     clearTimeout(draftTimer)
     saveCurrentDraft()
-    // 关窗时停掉长驻 RPC 进程，避免后台滞留（运行中不停，防止打断生成）
+    if (isKill) {
+      if (running.value) cancel()
+      if (window.piBridge && window.piBridge.stopRpc) {
+        try { window.piBridge.stopRpc() } catch (_) {}
+      }
+      return
+    }
+    // 关窗隐藏到后台时：运行中不停，防止打断生成
     if (!running.value && window.piBridge && window.piBridge.stopRpc) {
       try { window.piBridge.stopRpc() } catch (_) {}
     }
@@ -329,6 +336,7 @@ onMounted(async () => {
   window.addEventListener('keydown', onGlobalKey)
   // T1/T2 后台：延迟到输入就绪后异步刷新，不阻塞首屏
   setTimeout(() => {
+    purgeLegacyDbCache()
     loadModelsAsync()
     loadSkillsAsync()
     if (window.piBridge && window.piBridge.resolvePi) piStatus.value = window.piBridge.resolvePi()
@@ -408,6 +416,8 @@ function handleEnter(action) {
   }
 
   // uTools 窗口复用，重新进入不会重新 mount：显式回到新对话态
+  sessionRiskConfirmed.value = false
+  pendingRiskConfirm.value = false
   refreshSessions()
   resetPaging()
   closeHistory()
@@ -440,6 +450,8 @@ function selectGroup(id) {
   }
   saveCurrentDraft()          // 先用【旧 id】保存当前草稿
   activeId.value = id         // 再切换
+  sessionRiskConfirmed.value = false
+  pendingRiskConfirm.value = false
   loadSkillsAsync()           // 异步，不阻塞切换
   detectContext()
   historyFallbackNotified = false
@@ -474,6 +486,8 @@ function loadSession(id) {
   if (!s) return
   currentSession.value = s
   errorMsg.value = ''
+  sessionRiskConfirmed.value = false
+  pendingRiskConfirm.value = false
   historyFallbackNotified = false
   resetPaging()
   closeHistory()
@@ -494,6 +508,8 @@ function newChat() {
   currentSession.value = null
   resetPaging()
   errorMsg.value = ''
+  sessionRiskConfirmed.value = false
+  pendingRiskConfirm.value = false
   historyFallbackNotified = false
   closeHistory()
   if (kept) showToast('已开始新对话，输入内容已保留')
@@ -624,6 +640,32 @@ function truncateToolResult(val) {
 }
 
 // 调用 pi
+const sessionRiskConfirmed = ref(false)
+const pendingRiskConfirm = ref(false)
+
+function isRiskyTool(tool) {
+  const t = tool || {}
+  const list = Array.isArray(t.list) ? t.list : []
+  return list.some(n => n === 'edit' || n === 'write' || n === 'bash' || n === 'powershell') || !!t.trust
+}
+const activeRiskSummary = computed(() => {
+  const t = (activeGroup.value && activeGroup.value.tool) || {}
+  const list = Array.isArray(t.list) ? t.list : []
+  const items = []
+  if (list.some(n => n === 'edit' || n === 'write')) items.push('修改文件（edit/write）')
+  if (list.some(n => n === 'bash' || n === 'powershell')) items.push('执行命令（bash/powershell）')
+  if (t.trust) items.push('信任项目级 .pi 配置（--approve）')
+  return items.join('、')
+})
+function confirmRiskSend() {
+  sessionRiskConfirmed.value = true
+  pendingRiskConfirm.value = false
+  send()
+}
+function cancelRiskSend() {
+  pendingRiskConfirm.value = false
+}
+
 let sending = false
 async function send() {
   if (running.value || sending) return
@@ -637,6 +679,11 @@ async function send() {
     errorMsg.value = 'preload 桥未加载，需在 uTools 中运行'
     return
   }
+  if (isRiskyTool(activeGroup.value && activeGroup.value.tool) && !sessionRiskConfirmed.value) {
+    pendingRiskConfirm.value = true
+    return
+  }
+  pendingRiskConfirm.value = false
   const userText = inputText.value.trim()
   const outImages = [...images.value]
   const outFiles = [...attachedFiles.value]
@@ -837,15 +884,16 @@ function toolForSend(g) {
   return t
 }
 const activePermLabel = computed(() => PRESET_LABEL[presetOf(activeGroup.value && activeGroup.value.tool)] || '自定义')
-const activeHasExec = computed(() =>
-  ((activeGroup.value && activeGroup.value.tool && activeGroup.value.tool.list) || [])
-    .some(n => n === 'bash' || n === 'powershell'))
+const activeHasExec = computed(() => {
+  const t = (activeGroup.value && activeGroup.value.tool) || {}
+  return ((t.list) || []).some(n => n === 'bash' || n === 'powershell') || !!t.trust
+})
 
 // 升级后一次性提示：工具权限默认收紧了
 function noticePermOnce() {
   try {
-    if (read('pideck.permNotice.v1', false)) return
-    write('pideck.permNotice.v1', true)
+    if (readLocal('pideck.permNotice.v1', false)) return
+    writeLocal('pideck.permNotice.v1', true)
     setTimeout(() => showToast('工具权限已默认设为「只读」，可在分组设置里放开'), 900)
   } catch (_) {}
 }
@@ -864,7 +912,11 @@ function onSaveGroup(next) {
   loadSkillsAsync()
   detectContext()
   files.value = []
-  if (next.id === activeId.value && engine.value === 'rpc') maybePrewarmRpc()
+  if (next.id === activeId.value) {
+    sessionRiskConfirmed.value = false
+    pendingRiskConfirm.value = false
+    if (engine.value === 'rpc') maybePrewarmRpc()
+  }
 }
 
 function onDeleteGroup(g) {
@@ -1041,6 +1093,15 @@ function onConfigSaved() {
 
         <!-- 输入区：命令行形态，读数与发送键同一行 -->
         <div class="composer">
+          <div v-if="pendingRiskConfirm" class="risk-confirm-bar">
+            <div class="risk-confirm-text">
+              <strong>当前分组启用了高风险权限</strong>：{{ activeRiskSummary }}；工作区：<code>{{ displayCwd(activeGroup && activeGroup.cwd) }}</code>
+            </div>
+            <div class="risk-confirm-actions">
+              <button class="mini-btn" @click="cancelRiskSend">取消</button>
+              <button class="mini-btn danger" @click="confirmRiskSend">确认执行</button>
+            </div>
+          </div>
           <div class="composer-inner">
             <div v-if="images.length || attachedFiles.length" class="attachments">
               <div v-for="(img, i) in images" :key="'i'+i" class="thumb">

@@ -107,8 +107,19 @@ export function usePiEnv({ getCwd, showToast, getLean }) {
   }
 
   function openExternal(url) {
-    if (window.piBridge && window.piBridge.openExternal && window.piBridge.openExternal(url)) return
-    window.open(url, '_blank')
+    const raw = String(url || '').trim()
+    if (!raw) return
+    let href = ''
+    try {
+      const parsed = new URL(raw)
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') href = parsed.href
+    } catch (_) {}
+    if (!href) return
+    if (window.piBridge && window.piBridge.openExternal) {
+      window.piBridge.openExternal(href)
+      return
+    }
+    window.open(href, '_blank', 'noopener,noreferrer')
   }
 
   function ctxLabel(c) { return c.global ? '全局' : '项目' }

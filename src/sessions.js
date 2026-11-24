@@ -7,6 +7,46 @@ import { read, write, remove } from './storage.js'
 const IDX_KEY = 'pideck.sessions.idx'
 const ITEM_PREFIX = 'pideck.session.'
 const LEGACY_KEY = 'pideck.sessions.v1'
+const MAX_SESSION_BYTES = 850 * 1024   // 留足余量，避免触发 utools.db 单文档 1 MB 上限
+
+function jsonByteLength(obj) {
+  const s = JSON.stringify(obj)
+  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(s).length
+  return s.length * 2
+}
+
+// 超过体积预算时逐级裁剪旧工具结果/思考文本/最早消息，防止单文档超过 1 MB 写入失败
+export function fitSessionBudget(session, maxBytes = MAX_SESSION_BYTES) {
+  if (!session || typeof session !== 'object') return session
+  if (jsonByteLength(session) <= maxBytes) return session
+  const out = {
+    ...session,
+    messages: (session.messages || []).map(m => ({
+      ...m,
+      tools: Array.isArray(m.tools) ? m.tools.map(t => ({ ...t })) : m.tools,
+    })),
+  }
+  const TRIM_MARK = '…（超出同步存储上限已裁剪）'
+  for (const m of out.messages) {
+    if (jsonByteLength(out) <= maxBytes) return out
+    if (Array.isArray(m.tools)) {
+      for (const t of m.tools) {
+        if (t && t.result != null && t.result !== TRIM_MARK) {
+          t.result = TRIM_MARK
+          if (jsonByteLength(out) <= maxBytes) return out
+        }
+      }
+    }
+    if (typeof m.thinking === 'string' && m.thinking.length > 200) {
+      m.thinking = TRIM_MARK
+      if (jsonByteLength(out) <= maxBytes) return out
+    }
+  }
+  while (out.messages.length > 1 && jsonByteLength(out) > maxBytes) {
+    out.messages.shift()
+  }
+  return out
+}
 
 // 清理已废弃的 lastSession 记录（旧版本只写不读，升级后一次性移除）
 try { remove('pideck.lastSession.v1') } catch (_) {}
@@ -116,7 +156,7 @@ export function createSession(groupId, config) {
     createdAt: Date.now(),
     updatedAt: Date.now(),
   }
-  write(itemKey(id), session)
+  write(itemKey(id), fitSessionBudget(session))
   upsertIndex(stripMessages(session))
   return session
 }
@@ -124,7 +164,7 @@ export function createSession(groupId, config) {
 export function updateSession(id, patch) {
   const cur = getSession(id)
   if (!cur) return null
-  const next = { ...cur, ...patch, updatedAt: Date.now() }
+  const next = fitSessionBudget({ ...cur, ...patch, updatedAt: Date.now() })
   write(itemKey(id), next)
   // 索引只同步影响列表展示的字段，不搬运 messages
   upsertIndex({

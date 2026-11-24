@@ -365,6 +365,7 @@ function buildPermArgs(tool, opts) {
   }
   if (!t.context) args.push('-nc')
   if (!t.templates) args.push('-np')
+  // --approve / --no-approve 仅控制项目级 .pi 配置信任；默认传 --no-approve（不自动信任）
   if (t.trust === true) args.push('--approve')
   else if (t.trust === false) args.push('--no-approve')
   return args
