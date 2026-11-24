@@ -27,12 +27,14 @@ const emit = defineEmits(['earlier', 'chip', 'copy', 'link', 'preview', 'regener
 const thinkOpenMap = ref({})
 const toolsOpenMap = ref({})
 const toolExpandedMap = ref({})
+const brokenImageMap = ref({})
 
 watch([() => props.sessionId, () => props.total === 0], ([id, isEmpty], [oldId]) => {
   if (isEmpty || id !== oldId) {
     thinkOpenMap.value = {}
     toolsOpenMap.value = {}
     toolExpandedMap.value = {}
+    brokenImageMap.value = {}
   }
 })
 
@@ -53,7 +55,9 @@ function imageSrc(p) {
   const clean = String(p).replace(/\\/g, '/').replace(/^\/+/, '')
   return 'file:///' + encodeURI(clean).replace(/#/g, '%23').replace(/\?/g, '%3F')
 }
-function hideBroken(e) { e.target.style.display = 'none' }
+function imageKey(i, pi) { return `${msgKey(i)}:${pi}` }
+function isImageBroken(i, pi) { return !!brokenImageMap.value[imageKey(i, pi)] }
+function markImageBroken(i, pi) { brokenImageMap.value[imageKey(i, pi)] = true }
 
 function msgKey(i) { return props.hiddenCount + i }
 function isLast(i) { return props.hiddenCount + i === props.total - 1 }
@@ -174,7 +178,12 @@ const typingText = () => props.runPhase === 'spawning' ? '正在启动引擎…'
         <div class="turn-body">
           <div v-if="m.imageCount" class="image-tag">{{ m.imageCount }} 张图片</div>
           <div v-if="m.imagePaths && m.imagePaths.length" class="msg-images">
-            <img v-for="(p, pi) in m.imagePaths" :key="pi" :src="imageSrc(p)" alt="图片" title="点击放大" @click="emit('preview', imageSrc(p))" @error="hideBroken" />
+            <template v-for="(p, pi) in m.imagePaths" :key="pi">
+              <div v-if="isImageBroken(i, pi)" class="img-missing" title="原图已清理或仅保存在发送设备">
+                <span>图片不可用</span>
+              </div>
+              <img v-else :src="imageSrc(p)" alt="图片" title="点击放大" @click="emit('preview', imageSrc(p))" @error="markImageBroken(i, pi)" />
+            </template>
           </div>
           <div v-if="m.fileNames && m.fileNames.length" class="msg-files">
             <span v-for="(fn, fi) in m.fileNames" :key="fi" class="file-chip">{{ fn }}</span>
@@ -326,6 +335,12 @@ const typingText = () => props.runPhase === 'spawning' ? '正在启动引擎…'
 .msg-images img {
   width: 72px; height: 72px; object-fit: cover; cursor: zoom-in;
   border: 1px solid var(--line-2); border-radius: 6px;
+}
+.img-missing {
+  width: 72px; height: 72px; border: 1px dashed var(--line-2); border-radius: 6px;
+  background: var(--surface); color: var(--ink-3); font-size: 10.5px; line-height: 1.3;
+  display: flex; align-items: center; justify-content: center; text-align: center; padding: 6px;
+  user-select: none;
 }
 .msg-files { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
 .file-chip {

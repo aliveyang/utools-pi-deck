@@ -126,7 +126,7 @@ describe('local-store 配置读写与本地状态', () => {
   })
 })
 
-describe('local-store 图片落盘与 24h 清理', () => {
+describe('local-store 图片落盘、过期与容量淘汰、安全清理', () => {
   it('合法 dataUrl 落盘，非法格式/扩展名/超限拒绝', () => {
     const pngB64 = Buffer.from('fake-png-data').toString('base64')
     const out = store.saveImage(`data:image/png;base64,${pngB64}`)
@@ -139,7 +139,7 @@ describe('local-store 图片落盘与 24h 清理', () => {
     expect(() => store.saveImage(`data:image/png;base64,${Buffer.alloc(2048).toString('base64')}`)).toThrow()
   })
 
-  it('cleanupImages 删除超过 24h 的旧文件，保留新文件', () => {
+  it('cleanupImages 默认 30 天（可配 imageMaxAgeMs）删除过期文件并保留新文件', () => {
     const imgDir = join(tmpRoot, 'images')
     mkdirSync(imgDir, { recursive: true })
     const oldFile = join(imgDir, 'old.png')
@@ -147,8 +147,8 @@ describe('local-store 图片落盘与 24h 清理', () => {
     writeFileSync(oldFile, 'old')
     writeFileSync(freshFile, 'fresh')
 
-    const oldTime = new Date(clock - 25 * 3600 * 1000)
-    const freshTime = new Date(clock - 1 * 3600 * 1000)
+    const oldTime = new Date(clock - 31 * 24 * 3600 * 1000)
+    const freshTime = new Date(clock - 5 * 24 * 3600 * 1000)
     utimesSync(oldFile, oldTime, oldTime)
     utimesSync(freshFile, freshTime, freshTime)
 
@@ -156,6 +156,116 @@ describe('local-store 图片落盘与 24h 清理', () => {
     expect(removed).toBe(1)
     expect(existsSync(oldFile)).toBe(false)
     expect(existsSync(freshFile)).toBe(true)
+
+    const customStore = createLocalStore({
+      imageDir: imgDir,
+      imageMaxAgeMs: 2 * 24 * 3600 * 1000,
+      now: () => clock,
+    })
+    expect(customStore.cleanupImages()).toBe(1)
+    expect(existsSync(freshFile)).toBe(false)
+  })
+
+  it('总容量超出 maxImageTotalBytes 时按 mtime 淘汰最旧图片，且 saveImage 保护刚写入的新图', () => {
+    const imgDir = join(tmpRoot, 'lru-images')
+    const lruStore = createLocalStore({
+      imageDir: imgDir,
+      maxImageBytes: 250,
+      maxImageTotalBytes: 220,
+      now: () => clock,
+    })
+    const first = lruStore.saveImage(`data:image/png;base64,${Buffer.alloc(50, 1).toString('base64')}`)
+    clock += 1000
+    const second = lruStore.saveImage(`data:image/png;base64,${Buffer.alloc(50, 2).toString('base64')}`)
+    // 将后写入的 second 设为更早 mtime，验证淘汰依据是 mtimeMs 而非文件名顺序
+    utimesSync(first, new Date(clock - 1000), new Date(clock - 1000))
+    utimesSync(second, new Date(clock - 5000), new Date(clock - 5000))
+    const firstSize = statSync(first).size
+    const secondSize = statSync(second).size
+    expect(existsSync(first)).toBe(true)
+    expect(existsSync(second)).toBe(true)
+
+    clock += 1000
+    // third 占 70B，三张总计 170B > 140B，但淘汰 1 张 50B 后剩余 120B <= 140B：应仅淘汰 mtime 最旧的 second
+    const thirdSizeCapStore = createLocalStore({
+      imageDir: imgDir,
+      maxImageBytes: 250,
+      maxImageTotalBytes: 140,
+      now: () => clock,
+    })
+    const third = thirdSizeCapStore.saveImage(`data:image/png;base64,${Buffer.alloc(70, 3).toString('base64')}`)
+    expect(statSync(third).size).toBe(70)
+    expect(firstSize + secondSize + statSync(third).size).toBe(170)
+    expect(existsSync(second)).toBe(false)
+    expect(existsSync(first)).toBe(true)
+    expect(existsSync(third)).toBe(true)
+
+    // 单图自身已超过总上限时也不应误删刚写入的新图
+    clock += 1000
+    const giant = thirdSizeCapStore.saveImage(`data:image/png;base64,${Buffer.alloc(240, 4).toString('base64')}`)
+    expect(existsSync(first)).toBe(false)
+    expect(existsSync(third)).toBe(false)
+    expect(existsSync(giant)).toBe(true)
+  })
+
+  it('deleteImages 仅删除 imageDir 内的普通文件，严格拒绝目录外、兄弟前缀、穿越与 symlink', () => {
+    const imgDir = join(tmpRoot, 'images')
+    const siblingDir = join(tmpRoot, 'images-other')
+    const outsideDir = join(tmpRoot, 'outside-del')
+    mkdirSync(imgDir, { recursive: true })
+    mkdirSync(siblingDir, { recursive: true })
+    mkdirSync(outsideDir, { recursive: true })
+
+    const img1 = store.saveImage(`data:image/png;base64,${Buffer.from('a').toString('base64')}`)
+    const img2 = store.saveImage(`data:image/png;base64,${Buffer.from('b').toString('base64')}`)
+    const siblingFile = join(siblingDir, 'keep.png')
+    const outsideFile = join(outsideDir, 'secret.png')
+    writeFileSync(siblingFile, 'keep')
+    writeFileSync(outsideFile, 'secret')
+
+    const linkFile = join(imgDir, 'escape-link.png')
+    let linked = false
+    try { symlinkSync(outsideFile, linkFile); linked = true } catch (_) {}
+
+    const targets = [
+      img1,
+      img1,
+      siblingFile,
+      outsideFile,
+      join(imgDir, '..', 'outside-del', 'secret.png'),
+      imgDir,
+      join(imgDir, 'missing.png'),
+      ...(linked ? [linkFile] : []),
+    ]
+    expect(store.deleteImages(targets)).toBe(1)
+    expect(existsSync(img1)).toBe(false)
+    expect(existsSync(img2)).toBe(true)
+    expect(existsSync(siblingFile)).toBe(true)
+    expect(existsSync(outsideFile)).toBe(true)
+    if (linked) expect(existsSync(linkFile)).toBe(true)
+  })
+
+  it('clearImages 清空 imageDir 下普通文件，保留子目录与外部 symlink 目标', () => {
+    const imgDir = join(tmpRoot, 'images')
+    const subDir = join(imgDir, 'nested')
+    const outsideDir = join(tmpRoot, 'outside-clear')
+    mkdirSync(subDir, { recursive: true })
+    mkdirSync(outsideDir, { recursive: true })
+
+    const img1 = store.saveImage(`data:image/png;base64,${Buffer.from('1').toString('base64')}`)
+    const img2 = store.saveImage(`data:image/png;base64,${Buffer.from('2').toString('base64')}`)
+    const outsideFile = join(outsideDir, 'keep.png')
+    writeFileSync(outsideFile, 'keep')
+    const linkFile = join(imgDir, 'link.png')
+    let linked = false
+    try { symlinkSync(outsideFile, linkFile); linked = true } catch (_) {}
+
+    expect(store.clearImages()).toBe(2)
+    expect(existsSync(img1)).toBe(false)
+    expect(existsSync(img2)).toBe(false)
+    expect(existsSync(subDir)).toBe(true)
+    expect(existsSync(outsideFile)).toBe(true)
+    if (linked) expect(existsSync(linkFile)).toBe(true)
   })
 })
 

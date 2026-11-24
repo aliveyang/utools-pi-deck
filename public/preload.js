@@ -77,6 +77,7 @@ if (!core || !localStoreMod) {
     openExternal: () => false, openPath: () => false,
     run: () => { throw new Error('pi-core 加载失败：' + errMsg) },
     cancel: () => {}, saveImage: () => { throw new Error('pi-core 加载失败') },
+    deleteImages: () => 0, clearImages: () => 0,
     pickFolder: () => null, pickFiles: () => null, pickExecutable: () => null,
     validateCwd: () => false,
     homedir: () => os.homedir(),
@@ -134,8 +135,8 @@ function boot() {
     if (_storeInstance) return _storeInstance
     const { tempRoot, localRoot } = getPluginRoots()
     _storeInstance = localStoreMod.createLocalStore({
-      ...(tempRoot ? { cacheDir: path.join(tempRoot, 'cache'), imageDir: path.join(tempRoot, 'images') } : {}),
-      ...(localRoot ? { configFile: path.join(localRoot, 'config.json'), localStateFile: path.join(localRoot, 'state.json') } : {}),
+      ...(tempRoot ? { cacheDir: path.join(tempRoot, 'cache') } : {}),
+      ...(localRoot ? { configFile: path.join(localRoot, 'config.json'), localStateFile: path.join(localRoot, 'state.json'), imageDir: path.join(localRoot, 'images') } : {}),
       legacyConfigFile: path.join(os.homedir(), '.pideck', 'config.json'),
     })
     return _storeInstance
@@ -319,6 +320,8 @@ function boot() {
     run: (opts, handlers) => getRunner().run(opts, handlers),
     cancel: () => (_runnerInstance ? _runnerInstance.cancel() : false),
     saveImage: dataUrl => getStore().saveImage(dataUrl),
+    deleteImages: paths => getStore().deleteImages(paths),
+    clearImages: () => getStore().clearImages(),
     pickFolder,
     pickFiles,
     pickExecutable,

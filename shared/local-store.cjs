@@ -1,4 +1,4 @@
-// 本地存储与安全校验：缓存、配置、本机状态、临时图片落盘/清理、外链与路径白名单校验
+// 本地存储与安全校验：缓存、配置、本机状态、本地图片落盘/清理、外链与路径白名单校验
 // 职责：把业务逻辑与本机临时/持久化存储从 preload.js 剥离，避免非用户数据写入同步数据库
 const fs = require('node:fs')
 const fsp = fs.promises
@@ -8,7 +8,8 @@ const os = require('node:os')
 const DEFAULT_CACHE_TTL = 5 * 60 * 1000
 const DEFAULT_STALE_TTL = 24 * 60 * 60 * 1000
 const DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
-const IMAGE_MAX_AGE_MS = 24 * 3600 * 1000
+const DEFAULT_IMAGE_MAX_AGE_MS = 30 * 24 * 3600 * 1000
+const DEFAULT_MAX_IMAGE_TOTAL_BYTES = 200 * 1024 * 1024
 const CACHE_KEY_RE = /^[a-z0-9_-]{1,40}$/i
 const ALLOWED_IMAGE_EXTS = new Set(['png', 'jpg', 'webp', 'gif', 'bmp', 'svg', 'avif'])
 
@@ -122,10 +123,11 @@ function createLocalStore(options = {}) {
   const configFile = options.configFile || path.join(os.homedir(), '.pideck', 'config.json')
   const legacyConfigFile = options.legacyConfigFile || ''
   const localStateFile = options.localStateFile || path.join(os.homedir(), '.pideck', 'state.json')
-  const imageDir = options.imageDir || path.join(os.tmpdir(), 'pideck-images')
+  const imageDir = options.imageDir || path.join(os.homedir(), '.pideck', 'images')
   const maxImageBytes = options.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES
+  const imageMaxAgeMs = options.imageMaxAgeMs ?? DEFAULT_IMAGE_MAX_AGE_MS
+  const maxImageTotalBytes = options.maxImageTotalBytes ?? DEFAULT_MAX_IMAGE_TOTAL_BYTES
   let now = options.now || Date.now
-  let imgCleaned = false
   let _cfgCache = null
   let _cfgCacheMtime = -1
   let _localDictCache = null
@@ -302,32 +304,95 @@ function createLocalStore(options = {}) {
     return true
   }
 
-  function cleanupImages() {
+  function cleanupImages(opts = {}) {
     try {
       if (!fs.existsSync(imageDir)) return 0
+      const protect = opts && opts.protect ? normalizeForCompare(opts.protect) : ''
       const ts = now()
-      let n = 0
+      let removed = 0
+      const kept = []
       for (const f of fs.readdirSync(imageDir)) {
         const p = path.join(imageDir, f)
         try {
-          const st = fs.statSync(p)
-          if (!st.isFile()) continue
-          if (ts - st.mtimeMs > IMAGE_MAX_AGE_MS) {
+          const st = fs.lstatSync(p)
+          if (st.isSymbolicLink() || !st.isFile()) continue
+          const isProtected = protect && normalizeForCompare(p) === protect
+          if (!isProtected && imageMaxAgeMs > 0 && ts - st.mtimeMs > imageMaxAgeMs) {
             fs.unlinkSync(p)
-            n++
+            removed++
+            continue
           }
+          kept.push({ path: p, size: st.size, mtimeMs: st.mtimeMs, isProtected })
         } catch (_) {}
       }
-      return n
+      if (maxImageTotalBytes > 0) {
+        let totalBytes = kept.reduce((sum, item) => sum + item.size, 0)
+        if (totalBytes > maxImageTotalBytes) {
+          kept.sort((a, b) => (a.mtimeMs - b.mtimeMs) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+          for (const item of kept) {
+            if (totalBytes <= maxImageTotalBytes) break
+            if (item.isProtected) continue
+            try {
+              fs.unlinkSync(item.path)
+              totalBytes -= item.size
+              removed++
+            } catch (_) {}
+          }
+        }
+      }
+      return removed
     } catch (_) {
       return 0
     }
   }
 
-  function maybeCleanupImages() {
-    if (imgCleaned) return
-    imgCleaned = true
-    try { cleanupImages() } catch (_) {}
+  function deleteImages(paths) {
+    if (!Array.isArray(paths) || !paths.length || !fs.existsSync(imageDir)) return 0
+    let realImgDir
+    try {
+      realImgDir = fs.realpathSync(imageDir)
+    } catch (_) {
+      return 0
+    }
+    let removed = 0
+    const seen = new Set()
+    for (const raw of paths) {
+      if (typeof raw !== 'string' || !raw.trim()) continue
+      const candidate = path.resolve(raw.trim())
+      const normKey = normalizeForCompare(candidate)
+      if (seen.has(normKey)) continue
+      seen.add(normKey)
+      if (!isPathWithinRoot(candidate, imageDir) && !isPathWithinRoot(candidate, realImgDir)) continue
+      try {
+        const st = fs.lstatSync(candidate)
+        if (st.isSymbolicLink() || !st.isFile()) continue
+        const realTarget = fs.realpathSync(candidate)
+        if (normalizeForCompare(realTarget) === normalizeForCompare(realImgDir)) continue
+        if (!isPathWithinRoot(realTarget, realImgDir)) continue
+        fs.unlinkSync(realTarget)
+        removed++
+      } catch (_) {}
+    }
+    return removed
+  }
+
+  function clearImages() {
+    try {
+      if (!fs.existsSync(imageDir)) return 0
+      let removed = 0
+      for (const f of fs.readdirSync(imageDir)) {
+        const p = path.join(imageDir, f)
+        try {
+          const st = fs.lstatSync(p)
+          if (st.isSymbolicLink() || !st.isFile()) continue
+          fs.unlinkSync(p)
+          removed++
+        } catch (_) {}
+      }
+      return removed
+    } catch (_) {
+      return 0
+    }
   }
 
   function saveImage(dataUrl) {
@@ -344,9 +409,9 @@ function createLocalStore(options = {}) {
       throw new Error(`图片过大（${(buf.length / 1048576).toFixed(1)}MB），单张上限 ${maxImageBytes / 1048576}MB`)
     }
     fs.mkdirSync(imageDir, { recursive: true })
-    maybeCleanupImages()
     const file = path.join(imageDir, `img-${now()}-${Math.random().toString(36).slice(2, 7)}.${ext}`)
     fs.writeFileSync(file, buf)
+    try { cleanupImages({ protect: file }) } catch (_) {}
     return file
   }
 
@@ -369,6 +434,8 @@ function createLocalStore(options = {}) {
     writeLocal,
     removeLocal,
     cleanupImages,
+    deleteImages,
+    clearImages,
     saveImage,
     isAllowedExternalUrl,
     isPathWithinRoot,

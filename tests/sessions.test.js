@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import { write, remove } from '../src/storage.js'
 import {
   listSessions, getSession, createSession, updateSession, deleteSession,
-  titleFromText, exportMarkdown, fitSessionBudget,
+  collectSessionImagePaths, titleFromText, exportMarkdown, fitSessionBudget,
 } from '../src/sessions.js'
 
 const IDX_KEY = 'pideck.sessions.idx'
@@ -131,5 +131,18 @@ describe('辅助函数', () => {
     const fitted = fitSessionBudget(bigSession, 3000)
     expect(Buffer.byteLength(JSON.stringify(fitted), 'utf8')).toBeLessThanOrEqual(3000)
     expect(fitted.messages.at(-1).text).toBe('x'.repeat(2000))
+  })
+
+  it('collectSessionImagePaths：提取多轮消息中的有效图片路径并忽略空值', () => {
+    expect(collectSessionImagePaths(null)).toEqual([])
+    expect(collectSessionImagePaths({})).toEqual([])
+    expect(collectSessionImagePaths({
+      messages: [
+        { role: 'user', text: '无图' },
+        { role: 'user', text: '图1', imagePaths: ['/a/1.png', '', null, '  '] },
+        { role: 'assistant', text: '收到' },
+        { role: 'user', text: '图2', imagePaths: ['C:\\img\\2.jpg', 123] },
+      ],
+    })).toEqual(['/a/1.png', 'C:\\img\\2.jpg'])
   })
 })

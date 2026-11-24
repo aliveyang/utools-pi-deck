@@ -80,6 +80,8 @@ window.piBridge = {
   run,
   cancel: () => { if (activeCtrl) activeCtrl.abort() },
   saveImage,
+  deleteImages: () => 0,
+  clearImages: () => 0,
   pickFolder: () => null,
   pickFiles: () => null,
   pickExecutable: () => null,

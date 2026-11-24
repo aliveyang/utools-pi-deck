@@ -122,8 +122,8 @@ PiDeck/
 | 数据类别 | 存储机制 / API | 生命周期 | 账号云同步 | PiDeck 示例 |
 | --- | --- | --- | --- | --- |
 | **用户数据** | `utools.db` / `utools.dbStorage` | 长期 | **是** | 分组配置（`pideck.groups.v1`）、激活分组、用户偏好、会话索引与消息（`pideck.session.<id>`） |
-| **应用本地数据** | `utools.getPluginLocalDataPath()`（降级 `~/.pideck/`） | 长期（本机） | **否** | 操作审计 JSONL（`audit/`）、本地引擎与路径覆盖配置（`config.json`）、高频草稿（`state.json`：`pideck.drafts.v1`） |
-| **临时 / 可重建缓存** | `utools.getPluginTempPath()`（降级 `os.tmpdir()` / 浏览器 `localStorage`） | 运行期 / 短期 | **否** | 模型列表缓存（`models`）、技能列表缓存（`skills`）、默认配置缓存（`defaults`）、剪贴板粘贴临时图片（24h 清理）、终端登录/安装临时脚本 |
+| **应用本地数据** | `utools.getPluginLocalDataPath()`（降级 `~/.pideck/`） | 长期（本机） | **否** | 操作审计 JSONL（`audit/`）、本地引擎与路径覆盖配置（`config.json`）、高频草稿（`state.json`：`pideck.drafts.v1`）、粘贴/发送的本地图片（`images/`，30 天 / 200 MB 上限且随会话清理） |
+| **临时 / 可重建缓存** | `utools.getPluginTempPath()`（降级 `os.tmpdir()` / 浏览器 `localStorage`） | 运行期 / 短期 | **否** | 模型列表缓存（`models`）、技能列表缓存（`skills`）、默认配置缓存（`defaults`）、终端登录/安装临时脚本 |
 | **用户导出文件** | `utools.showSaveDialog()` / `utools.getPath('downloads')` | 用户管理 | **否** | 会话 Markdown 导出、操作记录导出 |
 
 ### 强制规则

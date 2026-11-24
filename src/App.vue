@@ -14,7 +14,7 @@ import HistoryDrawer from './components/HistoryDrawer.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import {
   listSessions, getSession, createSession, updateSession, deleteSession,
-  clearAllSessions, titleFromText, exportMarkdown,
+  clearAllSessions, collectSessionImagePaths, titleFromText, exportMarkdown,
 } from './sessions.js'
 import { useToast } from './composables/useToast.js'
 import { usePrefs } from './composables/usePrefs.js'
@@ -572,6 +572,10 @@ function removeSession(id) {
   const s = getSession(id)
   if (!s) return
   deleteSession(id)
+  const imgPaths = collectSessionImagePaths(s)
+  if (imgPaths.length && window.piBridge && window.piBridge.deleteImages) {
+    try { window.piBridge.deleteImages(imgPaths) } catch (_) {}
+  }
   if (s.piSessionId && window.piBridge && window.piBridge.deletePiSession) {
     try { window.piBridge.deletePiSession(s.piSessionId) } catch (_) {}
   }
@@ -759,7 +763,13 @@ async function send() {
   const imagePaths = []
   for (const img of outImages) {
     try { const p = window.piBridge.saveImage(img.dataUrl); imagePaths.push(p); sendFiles.push(p) }
-    catch (e) { errorMsg.value = String(e.message || e); return }
+    catch (e) {
+      if (imagePaths.length && window.piBridge && window.piBridge.deleteImages) {
+        try { window.piBridge.deleteImages(imagePaths) } catch (_) {}
+      }
+      errorMsg.value = String(e.message || e)
+      return
+    }
   }
 
   if (!currentSession.value || currentSession.value.groupId !== activeId.value) {
@@ -937,11 +947,16 @@ function pickGroupCwd() {
 function onDeleteGroup(g) {
   if (groups.value.length <= 1) return
   const list = listSessions(g.id)
+  const imgPaths = []
   for (const s of list) {
-    deleteSession(s.id)
+    const removed = deleteSession(s.id)
+    if (removed) imgPaths.push(...collectSessionImagePaths(removed))
     if (s.piSessionId && window.piBridge && window.piBridge.deletePiSession) {
       try { window.piBridge.deletePiSession(s.piSessionId) } catch (_) {}
     }
+  }
+  if (imgPaths.length && window.piBridge && window.piBridge.deleteImages) {
+    try { window.piBridge.deleteImages(imgPaths) } catch (_) {}
   }
   groups.value = groups.value.filter(x => x.id !== g.id)
   saveGroups(groups.value)
@@ -953,6 +968,9 @@ function onDeleteGroup(g) {
 function clearAllConversations() {
   if (running.value) { showToast('请先停止当前回答'); return }
   const list = clearAllSessions()
+  if (window.piBridge && window.piBridge.clearImages) {
+    try { window.piBridge.clearImages() } catch (_) {}
+  }
   for (const s of list) {
     if (s.piSessionId && window.piBridge && window.piBridge.deletePiSession) {
       try { window.piBridge.deletePiSession(s.piSessionId) } catch (_) {}

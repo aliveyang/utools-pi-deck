@@ -158,6 +158,18 @@ export function deleteSession(id) {
   return cur
 }
 
+export function collectSessionImagePaths(session) {
+  if (!session || !Array.isArray(session.messages)) return []
+  const paths = []
+  for (const m of session.messages) {
+    if (!m || !Array.isArray(m.imagePaths)) continue
+    for (const p of m.imagePaths) {
+      if (typeof p === 'string' && p.trim()) paths.push(p)
+    }
+  }
+  return paths
+}
+
 export function clearAllSessions() {
   const idx = readIndex()
   for (const e of idx) remove(itemKey(e.id))
