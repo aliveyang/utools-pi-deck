@@ -207,7 +207,7 @@ const typingText = () => props.runPhase === 'spawning' ? '正在启动引擎…'
             </div>
           </div>
           <div v-if="m.text" class="turn-text" v-html="renderText(m)" @click="onTextClick"></div>
-          <div v-if="running && isLast(i) && !m.text" class="typing">{{ typingText() }}</div>
+          <div v-if="running && isLast(i) && !m.text" class="typing"><span class="typing-dot"></span><span>{{ typingText() }}</span></div>
           <div v-if="m.aborted" class="aborted">已停止</div>
           <div v-if="m.error" class="turn-error">{{ m.error }}</div>
           <div v-if="!running && (m.text || m.error || m.aborted)" class="turn-actions">
@@ -306,7 +306,12 @@ const typingText = () => props.runPhase === 'spawning' ? '正在启动引擎…'
   white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow-y: auto;
 }
 
-.typing { font-size: 12px; color: var(--ink-3); padding: 2px 0; }
+.typing { font-size: 12px; color: var(--ink-3); padding: 2px 0; display: inline-flex; align-items: center; gap: 7px; }
+.typing-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none;
+  animation: typing-pulse 1.2s ease-in-out infinite;
+}
+@keyframes typing-pulse { 0%, 100% { opacity: .35; transform: scale(.88) } 50% { opacity: 1; transform: scale(1) } }
 .aborted { font-size: 11.5px; color: var(--ink-3); margin-top: 6px; }
 .turn-error { font-size: 12px; color: var(--danger); margin-top: 8px; white-space: pre-wrap; }
 .turn-actions { display: flex; align-items: center; gap: 6px; height: 20px; margin-top: 6px; opacity: 0; transition: opacity .14s var(--ease); }

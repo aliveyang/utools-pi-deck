@@ -8,9 +8,15 @@ const LAYOUT_KEY = 'pideck.layout.v1'
 
 export function usePrefs({ showToast, onCwdChange }) {
   const defaultCwd = ref(read(DEFAULT_CWD_KEY, '') || '')
+  const cwdDisplayCache = new Map()
+
+  function clearCwdDisplayCache() {
+    cwdDisplayCache.clear()
+  }
 
   function setDefaultCwd(dir) {
     defaultCwd.value = dir || ''
+    clearCwdDisplayCache()
     write(DEFAULT_CWD_KEY, defaultCwd.value)
     if (onCwdChange) onCwdChange()
   }
@@ -37,9 +43,15 @@ export function usePrefs({ showToast, onCwdChange }) {
 
   function displayCwd(cwd) {
     const dir = cwd || defaultCwd.value
-    if (!window.piBridge) return dir || '~'
-    if (window.piBridge.resolveCwd) return window.piBridge.resolveCwd(dir)
-    return window.piBridge.effectiveCwd ? window.piBridge.effectiveCwd(dir) : (dir || '~')
+    const cacheKey = `${cwd || ''}|${defaultCwd.value || ''}`
+    if (cwdDisplayCache.has(cacheKey)) return cwdDisplayCache.get(cacheKey)
+    let resolved
+    if (!window.piBridge) resolved = dir || '~'
+    else if (window.piBridge.resolveCwd) resolved = window.piBridge.resolveCwd(dir)
+    else resolved = window.piBridge.effectiveCwd ? window.piBridge.effectiveCwd(dir) : (dir || '~')
+    if (cwdDisplayCache.size > 32) cwdDisplayCache.clear()
+    cwdDisplayCache.set(cacheKey, resolved)
+    return resolved
   }
 
   const layout = ref(read(LAYOUT_KEY, 'classic') === 'console' ? 'console' : 'classic')
@@ -53,7 +65,7 @@ export function usePrefs({ showToast, onCwdChange }) {
 
   return {
     defaultCwd, setDefaultCwd, commitDefaultCwd, pickDefaultCwd,
-    sendKeyMode, setSendKeyMode, displayCwd,
+    sendKeyMode, setSendKeyMode, displayCwd, clearCwdDisplayCache,
     layout, setLayout,
   }
 }

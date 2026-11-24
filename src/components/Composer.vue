@@ -13,10 +13,13 @@ const props = defineProps({
   attachedFiles: { type: Array, default: () => [] },
   skills: { type: Array, default: () => [] },
   files: { type: Array, default: () => [] },
+  filesLoading: { type: Boolean, default: false },
   activeGroup: { type: Object, required: true },
   models: { type: Array, default: () => [] },
   defaults: { type: Object, default: () => ({}) },
   cwdLabel: { type: String, default: '~' },
+  engine: { type: String, default: 'json' },
+  rpcStatus: { type: String, default: '' },
   running: { type: Boolean, default: false },
   sendKeyMode: { type: String, default: 'ctrl' },
   isMac: { type: Boolean, default: false },
@@ -53,12 +56,14 @@ const menuItems = computed(() =>
   showSkillMenu.value ? filteredSkills.value : showFileMenu.value ? filteredFiles.value : [])
 
 function focusInput(pos) {
-  nextTick(() => {
+  const apply = () => {
     const el = inputEl.value
     if (!el) return
     el.focus()
     if (typeof pos === 'number') el.selectionStart = el.selectionEnd = pos
-  })
+  }
+  apply()
+  nextTick(apply)
 }
 function closeMenus() {
   showSkillMenu.value = false
@@ -250,7 +255,7 @@ const canSend = computed(() => !!(props.modelValue.trim() || props.images.length
         >
           <span class="suggest-name">{{ f.dir ? '[目录] ' : '' }}{{ f.path }}</span>
         </button>
-        <div v-if="!filteredFiles.length" class="suggest-empty">无匹配文件</div>
+        <div v-if="!filteredFiles.length" class="suggest-empty">{{ filesLoading ? '正在扫描工作区文件…' : '无匹配文件' }}</div>
       </div>
 
       <div class="prompt-row">
@@ -274,6 +279,8 @@ const canSend = computed(() => !!(props.modelValue.trim() || props.images.length
           :models="models"
           :defaults="defaults"
           :cwd-label="cwdLabel"
+          :engine="engine"
+          :rpc-status="rpcStatus"
           :disabled="running"
           @update-group="emit('updateGroup', $event)"
           @pick-cwd="emit('pickCwd')"

@@ -69,12 +69,17 @@ export function writeLocal(key, value) {
 }
 
 const CACHE_TTL = 5 * 60 * 1000
+const STALE_TTL = 24 * 60 * 60 * 1000
 const LOCAL_CACHE_PREFIX = 'pideck.localcache.'
 
-export function readCache(key) {
+export function readCacheMeta(key) {
   try {
+    if (window.piBridge && typeof window.piBridge.readCacheMeta === 'function') {
+      return window.piBridge.readCacheMeta(key)
+    }
     if (window.piBridge && typeof window.piBridge.readCache === 'function') {
-      return window.piBridge.readCache(key)
+      const data = window.piBridge.readCache(key)
+      return data == null ? null : { data, fresh: true, ageMs: 0 }
     }
   } catch (_) {}
   try {
@@ -82,9 +87,16 @@ export function readCache(key) {
     const raw = localStorage.getItem(LOCAL_CACHE_PREFIX + key)
     if (!raw) return null
     const entry = JSON.parse(raw)
-    if (!entry || typeof entry.t !== 'number' || Date.now() - entry.t > CACHE_TTL) return null
-    return entry.data === undefined ? null : entry.data
+    if (!entry || typeof entry.t !== 'number' || entry.data === undefined) return null
+    const ageMs = Math.max(0, Date.now() - entry.t)
+    if (ageMs > STALE_TTL) return null
+    return { data: entry.data, fresh: ageMs <= CACHE_TTL, ageMs }
   } catch (_) { return null }
+}
+
+export function readCache(key) {
+  const meta = readCacheMeta(key)
+  return (meta && meta.fresh) ? meta.data : null
 }
 
 export function writeCache(key, data) {

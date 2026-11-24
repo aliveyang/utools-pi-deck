@@ -5,6 +5,7 @@ const path = require('node:path')
 const os = require('node:os')
 
 const DEFAULT_CACHE_TTL = 5 * 60 * 1000
+const DEFAULT_STALE_TTL = 24 * 60 * 60 * 1000
 const DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 const IMAGE_MAX_AGE_MS = 24 * 3600 * 1000
 const CACHE_KEY_RE = /^[a-z0-9_-]{1,40}$/i
@@ -107,6 +108,7 @@ function writeJsonAtomic(file, data, opts) {
 function createLocalStore(options = {}) {
   const cacheDir = options.cacheDir || path.join(os.tmpdir(), 'pideck-cache')
   const cacheTtl = options.cacheTtl ?? DEFAULT_CACHE_TTL
+  const staleTtl = options.staleTtl ?? DEFAULT_STALE_TTL
   const configFile = options.configFile || path.join(os.homedir(), '.pideck', 'config.json')
   const legacyConfigFile = options.legacyConfigFile || ''
   const localStateFile = options.localStateFile || path.join(os.homedir(), '.pideck', 'state.json')
@@ -114,6 +116,9 @@ function createLocalStore(options = {}) {
   const maxImageBytes = options.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES
   let now = options.now || Date.now
   let imgCleaned = false
+  let _cfgCache = null
+  let _cfgCacheMtime = -1
+  let _localDictCache = null
 
   function cacheFilePath(key) {
     const k = String(key || '')
@@ -121,19 +126,36 @@ function createLocalStore(options = {}) {
     return path.join(cacheDir, `${k}.json`)
   }
 
-  function readCache(key) {
+  function readCacheMeta(key) {
     const file = cacheFilePath(key)
     if (!file) return null
     const entry = readJsonObject(file)
-    if (!entry || typeof entry.t !== 'number') return null
-    if (now() - entry.t > cacheTtl) return null
-    return entry.data === undefined ? null : entry.data
+    if (!entry || typeof entry.t !== 'number' || entry.data === undefined) return null
+    const ageMs = Math.max(0, now() - entry.t)
+    if (ageMs > staleTtl) return null
+    return { data: entry.data, fresh: ageMs <= cacheTtl, ageMs }
+  }
+
+  function readCache(key) {
+    const meta = readCacheMeta(key)
+    return (meta && meta.fresh) ? meta.data : null
   }
 
   function writeCache(key, data) {
     const file = cacheFilePath(key)
     if (!file) return false
     return writeJsonAtomic(file, { t: now(), data }, false)
+  }
+
+  function removeCache(key) {
+    const file = cacheFilePath(key)
+    if (!file) return false
+    try {
+      if (fs.existsSync(file)) fs.unlinkSync(file)
+      return true
+    } catch (_) {
+      return false
+    }
   }
 
   function clearCache() {
@@ -149,8 +171,19 @@ function createLocalStore(options = {}) {
   }
 
   function loadConfig() {
-    const primary = readJsonObject(configFile)
-    if (primary) return primary
+    try {
+      const st = fs.statSync(configFile)
+      if (_cfgCache && _cfgCacheMtime === st.mtimeMs) return _cfgCache
+      const primary = readJsonObject(configFile)
+      if (primary) {
+        _cfgCache = primary
+        _cfgCacheMtime = st.mtimeMs
+        return primary
+      }
+    } catch (_) {
+      _cfgCache = null
+      _cfgCacheMtime = -1
+    }
     if (legacyConfigFile && legacyConfigFile !== configFile) {
       const legacy = readJsonObject(legacyConfigFile)
       if (legacy) return legacy
@@ -160,14 +193,24 @@ function createLocalStore(options = {}) {
 
   function saveConfig(patch) {
     const next = { ...loadConfig(), ...(patch && typeof patch === 'object' ? patch : {}) }
-    writeJsonAtomic(configFile, next, true)
+    if (writeJsonAtomic(configFile, next, true)) {
+      _cfgCache = next
+      try { _cfgCacheMtime = fs.statSync(configFile).mtimeMs } catch (_) { _cfgCacheMtime = -1 }
+    }
     return next
+  }
+
+  function loadLocalDict() {
+    if (_localDictCache) return _localDictCache
+    const dict = readJsonObject(localStateFile)
+    if (dict) _localDictCache = dict
+    return dict
   }
 
   function readLocal(key, fallback) {
     const k = String(key || '')
     if (!k) return fallback
-    const dict = readJsonObject(localStateFile)
+    const dict = loadLocalDict()
     if (!dict || !Object.prototype.hasOwnProperty.call(dict, k)) return fallback
     return dict[k] === undefined ? fallback : dict[k]
   }
@@ -175,19 +218,32 @@ function createLocalStore(options = {}) {
   function writeLocal(key, value) {
     const k = String(key || '')
     if (!k) return false
-    const dict = readJsonObject(localStateFile) || {}
-    if (value === undefined) delete dict[k]
-    else dict[k] = value
-    return writeJsonAtomic(localStateFile, dict, false)
+    const curDict = loadLocalDict()
+    const dict = curDict ? { ...curDict } : {}
+    if (value === undefined) {
+      if (!Object.prototype.hasOwnProperty.call(dict, k)) return true
+      delete dict[k]
+    } else {
+      const prevJson = Object.prototype.hasOwnProperty.call(dict, k) ? JSON.stringify(dict[k]) : undefined
+      const nextJson = JSON.stringify(value)
+      if (prevJson === nextJson) return true
+      dict[k] = value
+    }
+    if (!writeJsonAtomic(localStateFile, dict, false)) return false
+    _localDictCache = dict
+    return true
   }
 
   function removeLocal(key) {
     const k = String(key || '')
     if (!k) return false
-    const dict = readJsonObject(localStateFile)
-    if (!dict || !Object.prototype.hasOwnProperty.call(dict, k)) return true
+    const curDict = loadLocalDict()
+    if (!curDict || !Object.prototype.hasOwnProperty.call(curDict, k)) return true
+    const dict = { ...curDict }
     delete dict[k]
-    return writeJsonAtomic(localStateFile, dict, false)
+    if (!writeJsonAtomic(localStateFile, dict, false)) return false
+    _localDictCache = dict
+    return true
   }
 
   function cleanupImages() {
@@ -244,7 +300,9 @@ function createLocalStore(options = {}) {
     localStateFile,
     imageDir,
     readCache,
+    readCacheMeta,
     writeCache,
+    removeCache,
     clearCache,
     loadConfig,
     saveConfig,
@@ -271,6 +329,7 @@ module.exports = {
   readJsonObject,
   writeJsonAtomic,
   DEFAULT_CACHE_TTL,
+  DEFAULT_STALE_TTL,
   DEFAULT_MAX_IMAGE_BYTES,
   IMAGE_MAX_AGE_MS,
   ALLOWED_IMAGE_EXTS,

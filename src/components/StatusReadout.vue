@@ -10,10 +10,19 @@ const props = defineProps({
   models: { type: Array, default: () => [] },
   defaults: { type: Object, default: () => ({}) },
   cwdLabel: { type: String, default: '~' },
+  engine: { type: String, default: 'json' },
+  rpcStatus: { type: String, default: '' },
   disabled: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['update-group', 'pick-cwd', 'open-group-settings'])
+
+const rpcTitle = computed(() => {
+  if (props.rpcStatus === 'ready') return '极速模式已就绪'
+  if (props.rpcStatus === 'warming') return '极速模式预热中…'
+  if (props.rpcStatus === 'failed') return '极速模式预热失败，将自动使用标准模式'
+  return '极速模式待预热'
+})
 
 const permLabel = computed(() => PRESET_LABEL[presetOf(props.group && props.group.tool)] || '自定义')
 const risky = computed(() => hasExecRisk(props.group && props.group.tool))
@@ -78,6 +87,13 @@ function onSelect(field, e) {
       type="button" class="ro-btn ro-path" :disabled="disabled"
       :title="`工作目录：${cwdLabel}（点击快速切换）`" @click="emit('pick-cwd')"
     >{{ cwdLabel }}</button>
+    <span
+      v-if="engine === 'rpc'"
+      class="ro-rpc-dot"
+      :class="rpcStatus || 'idle'"
+      :title="rpcTitle"
+      :aria-label="rpcTitle"
+    ></span>
   </div>
 </template>
 
@@ -99,6 +115,14 @@ function onSelect(field, e) {
 .ro-model, .ro-path { font-family: var(--mono); }
 .ro-path { color: var(--ink-3); max-width: 185px; }
 .ro-perm.risky { color: var(--danger); }
+.ro-rpc-dot {
+  width: 6px; height: 6px; border-radius: 50%; flex: none;
+  background: var(--ink-3); opacity: .65;
+}
+.ro-rpc-dot.ready { background: var(--accent); opacity: 1; }
+.ro-rpc-dot.warming { background: var(--warn-ink); opacity: .9; animation: ro-pulse 1.1s ease-in-out infinite; }
+.ro-rpc-dot.failed { background: var(--danger); opacity: .9; }
+@keyframes ro-pulse { 0%, 100% { opacity: .35 } 50% { opacity: 1 } }
 
 @media (max-width: 720px) {
   .ro-path, .ro-path-sep { display: none; }

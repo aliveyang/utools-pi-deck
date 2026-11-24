@@ -179,10 +179,16 @@ describe('rpc-engine ensure 与 prompt 契约', () => {
     expect(errors).toBe(1)
   })
 
-  it('hasSession 只在该进程持有同一会话时为真', async () => {
-    const child = makeMockChild()
+  it('hasSession 只在该进程持有同一会话时为真，getCachedDefaults 返回默认模型与思考强度', async () => {
+    const child = makeMockChild({ stateData: { model: { id: 'm-def', name: 'M Def' }, thinkingLevel: 'low' } })
     const eng = createRpcEngine({ core, spawn: () => child })
+    expect(eng.getCachedDefaults(fixtureDir, {})).toBeNull()
     await eng.ensure(fixtureDir, {})
+    expect(eng.getCachedDefaults(fixtureDir, {})).toEqual({
+      modelId: 'm-def',
+      modelName: 'M Def',
+      thinkingLevel: 'low',
+    })
     expect(eng.hasSession(fixtureDir, {}, 'pideck-s1')).toBe(false)
     await new Promise(resolve => {
       eng.prompt(fixtureDir, { prompt: 'a', sessionId: 'pideck-s1' }, { onDone: resolve })

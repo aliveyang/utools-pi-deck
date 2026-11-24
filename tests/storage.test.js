@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { read, write, readLocal, writeLocal, readCache, writeCache } from '../src/storage.js'
+import { read, write, readLocal, writeLocal, readCache, readCacheMeta, writeCache } from '../src/storage.js'
 
 function createMockDbStorage() {
   const map = new Map()
@@ -54,6 +54,7 @@ describe('storage.js 同步库隔离与缓存分级', () => {
 
     expect(writeCache('skills', [{ name: 's1' }])).toBe(true)
     expect(readCache('skills')).toEqual([{ name: 's1' }])
+    expect(readCacheMeta('skills')).toMatchObject({ data: [{ name: 's1' }], fresh: true })
     expect(dbStorage.map.size).toBe(0)
   })
 

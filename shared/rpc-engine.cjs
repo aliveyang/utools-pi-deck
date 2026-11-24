@@ -94,7 +94,7 @@ function createRpcEngine(deps = {}) {
     const e = {
       child, key, alive: true, ready: false, lastUsed: Date.now(),
       sessionId: '',
-      defaultModel: '', defaultThinking: '',
+      defaultModel: '', defaultModelName: '', defaultThinking: '',
       curModel: '', curThinking: '',
       lineBuf: core.makeLineBuffer(),
       pending: new Map(), listeners: new Set(),
@@ -132,6 +132,7 @@ function createRpcEngine(deps = {}) {
     e.readyPromise = send(e, { type: 'get_state' }).then(d => {
       const state = d || {}
       e.defaultModel = (state.model && state.model.id) || ''
+      e.defaultModelName = (state.model && state.model.name) || ''
       e.defaultThinking = state.thinkingLevel || ''
       e.curModel = e.defaultModel
       e.curThinking = e.defaultThinking
@@ -255,6 +256,17 @@ function createRpcEngine(deps = {}) {
     return !!(e && e.alive && e.ready)
   }
 
+  function getCachedDefaults(cwd, flags) {
+    const e = getEntry(keyOf(cwd, flags))
+    if (!e || !e.alive || !e.ready) return null
+    if (!e.defaultModel && !e.defaultModelName && !e.defaultThinking) return null
+    return {
+      modelId: e.defaultModel || '',
+      modelName: e.defaultModelName || e.defaultModel || '',
+      thinkingLevel: e.defaultThinking || '',
+    }
+  }
+
   // 该 key 的常驻进程当前是否正持有指定会话（用于判断历史会话能否走 RPC 续接）
   function hasSession(cwd, flags, sessionId) {
     if (!sessionId) return false
@@ -285,7 +297,7 @@ function createRpcEngine(deps = {}) {
   const cleanupTimer = setInterval(cleanupIdle, CLEANUP_INTERVAL)
   if (cleanupTimer.unref) cleanupTimer.unref()
 
-  return { prewarm, isReady, hasSession, prompt, stop, ensure, keyOf, cleanupIdle, isBusy, _processes: processes }
+  return { prewarm, isReady, getCachedDefaults, hasSession, prompt, stop, ensure, keyOf, cleanupIdle, isBusy, _processes: processes }
 }
 
 const defaultEngine = createRpcEngine()

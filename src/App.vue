@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { loadGroups, saveGroups, loadActiveId, saveActiveId, loadDrafts, saveDrafts, TOOL_PRESETS } from './groups.js'
-import { readCache } from './storage.js'
+import { readCacheMeta, writeCache } from './storage.js'
 import { isRiskyTool, activeRiskSummary, toolSummary } from './constants.js'
 import Icon from './components/Icon.vue'
 import Sidebar from './components/Sidebar.vue'
@@ -46,6 +46,7 @@ const inputText = ref('')
 const images = ref([])
 const attachedFiles = ref([])
 const files = ref([])
+const filesLoading = ref(false)
 const running = ref(false)
 const runPhase = ref('') // spawning | connecting | generating
 const errorMsg = ref('')
@@ -84,14 +85,23 @@ const onboardingState = computed(() => {
   return ''
 })
 
-async function checkDefaultAuth() {
+async function checkDefaultAuth(force) {
   const provider = (envInfo.value && envInfo.value.defaultProvider) || ''
   if (!provider || !window.piBridge || !window.piBridge.configAuthCheck) return
+  const cacheKey = 'auth_' + provider.replace(/[^a-z0-9_-]/gi, '_')
+  if (!force) {
+    const cached = readCacheMeta(cacheKey)
+    if (cached && cached.fresh && cached.data && cached.data.status) {
+      const st = cached.data.status
+      if (st === 'ready') { defaultAuthOk.value = true; return }
+      if (st === 'not_ready' || st === 'invalid') { defaultAuthOk.value = false; return }
+    }
+  }
   try {
     const r = await window.piBridge.configAuthCheck(provider)
     const st = r && r.status
-    if (st === 'ready') defaultAuthOk.value = true
-    else if (st === 'not_ready' || st === 'invalid') defaultAuthOk.value = false
+    if (st === 'ready') { defaultAuthOk.value = true; writeCache(cacheKey, { status: 'ready' }) }
+    else if (st === 'not_ready' || st === 'invalid') { defaultAuthOk.value = false; writeCache(cacheKey, { status: st }) }
     else defaultAuthOk.value = null
   } catch (_) { defaultAuthOk.value = null }
 }
@@ -110,7 +120,7 @@ function effectiveGroupCwd(g) {
 const { toast, showToast, copyText } = useToast()
 const {
   defaultCwd, setDefaultCwd, commitDefaultCwd, pickDefaultCwd,
-  sendKeyMode, setSendKeyMode, displayCwd, layout, setLayout,
+  sendKeyMode, setSendKeyMode, displayCwd, clearCwdDisplayCache, layout, setLayout,
 } = usePrefs({
   showToast,
   onCwdChange: () => {
@@ -122,14 +132,17 @@ const {
 
 const {
   models, skills, piStatus, engine, rpcStatus, defaults, envInfo, showEnvHelp,
-  loadDefaults, loadModelsAsync, refreshModels, loadSkillsAsync,
-  loadEnv, recheckEnv, installPi, prewarmActive, setEngine, openPath, openExternal,
+  hydrateFromCache, loadDefaults, loadModelsAsync, refreshModels, loadSkillsAsync,
+  loadEnvAsync, recheckEnv, installPi, prewarmActive, setEngine, openPath, openExternal,
+  getLastSkillsCwd,
 } = usePiEnv({
   getCwd: () => effectiveGroupCwd(activeGroup.value),
   getLean: () => ({ tool: toolForSend(activeGroup.value) }),
   showToast,
   copyText,
 })
+
+const activeCwdLabel = computed(() => displayCwd(activeGroup.value && activeGroup.value.cwd))
 
 const sendKeyChip = computed(() => sendKeyMode.value === 'enter' ? 'Enter' : (isMac ? '⌘+↵' : 'Ctrl+↵'))
 function toggleSendKey() {
@@ -208,15 +221,39 @@ function onEnterEvent(e) {
   handleEnter(e.detail || e)
 }
 
+let idleTimers = []
+let unmounted = false
+let initialMountDone = false
+
+function scheduleIdle(fn, delay = 0) {
+  const run = () => {
+    if (unmounted) return
+    if (typeof requestIdleCallback === 'function') {
+      requestIdleCallback(() => { if (!unmounted) fn() }, { timeout: 1000 })
+    } else {
+      fn()
+    }
+  }
+  const id = setTimeout(run, delay)
+  idleTimers.push(id)
+  return id
+}
+
 onMounted(() => {
-  models.value = readCache('models') || []
-  skills.value = readCache('skills') || []
-  piStatus.value = null
-  refreshSessions()
-  restoreDraft()
+  // T0：同步首帧水合与焦点就绪（零阻塞，不派生子进程、不扫描目录）
+  if (window.piBridge && window.piBridge.getConfig) {
+    engine.value = (window.piBridge.getConfig() || {}).engine || 'json'
+  }
   window.addEventListener('pideck:enter', onEnterEvent)
   const queued = window.__pideckEnterQueue || []
-  while (queued.length) onEnterEvent({ detail: queued[0] })
+  if (queued.length) {
+    while (queued.length) onEnterEvent({ detail: queued[0] })
+  } else {
+    refreshSessions()
+    restoreDraft()
+  }
+  const cacheState = hydrateFromCache()
+  initialMountDone = true
 
   window.utools && window.utools.onPluginOut && window.utools.onPluginOut(isKill => {
     clearTimeout(draftTimer)
@@ -226,31 +263,49 @@ onMounted(() => {
       if (window.piBridge && window.piBridge.stopRpc) {
         try { window.piBridge.stopRpc() } catch (_) {}
       }
+      rpcStatus.value = ''
       return
     }
     if (!running.value && window.piBridge && window.piBridge.stopRpc) {
       try { window.piBridge.stopRpc() } catch (_) {}
+      rpcStatus.value = ''
     }
   })
 
+  window.utools && window.utools.onDbPull && window.utools.onDbPull(() => {
+    if (!running.value) sessions.value = listSessions(activeId.value)
+  })
+
   composerEl.value && composerEl.value.focusInput()
-  if (window.piBridge && window.piBridge.getConfig) {
-    engine.value = (window.piBridge.getConfig() || {}).engine || 'json'
-  }
+  requestAnimationFrame(() => { composerEl.value && composerEl.value.focusInput() })
   window.addEventListener('keydown', onGlobalKey)
 
-  setTimeout(() => {
-    loadModelsAsync()
-    loadSkillsAsync()
-    if (window.piBridge && window.piBridge.resolvePi) piStatus.value = window.piBridge.resolvePi()
-    maybePrewarmRpc()
-    loadDefaults()
-    loadEnv()
-    setTimeout(checkDefaultAuth, 600)
-  }, 150)
+  // T1/T2：首帧绘制后异步探测环境，并按空闲优先级交错刷新，不争抢冷启动 CPU
+  requestAnimationFrame(() => {
+    setTimeout(async () => {
+      if (unmounted) return
+      await loadEnvAsync()
+      if (unmounted) return
+
+      if (envInfo.value && envInfo.value.ok) {
+        if (engine.value === 'rpc') maybePrewarmRpc()
+        if (!cacheState.skillsFresh) scheduleIdle(() => loadSkillsAsync(), 60)
+        if (!cacheState.modelsFresh) scheduleIdle(() => loadModelsAsync(), engine.value === 'rpc' ? 280 : 120)
+        if (!cacheState.defaultsFresh && !(defaults.value && (defaults.value.modelId || defaults.value.modelName))) {
+          scheduleIdle(() => loadDefaults(), 450)
+        }
+        scheduleIdle(() => checkDefaultAuth(), 700)
+      } else {
+        if (!cacheState.skillsFresh) scheduleIdle(() => loadSkillsAsync(), 120)
+      }
+    }, 0)
+  })
 })
 
 onUnmounted(() => {
+  unmounted = true
+  for (const id of idleTimers) clearTimeout(id)
+  idleTimers = []
   window.removeEventListener('keydown', onGlobalKey)
   window.removeEventListener('pideck:enter', onEnterEvent)
   resetDeleteConfirm()
@@ -277,9 +332,26 @@ function openHistory() {
   if (!sessions.value.length) { showToast('还没有对话'); return }
   showHistory.value = true
 }
-function refreshFiles() {
-  if (!window.piBridge || !window.piBridge.listFiles) return
-  try { files.value = window.piBridge.listFiles(effectiveGroupCwd(activeGroup.value)) || [] } catch (_) { files.value = [] }
+let filesReqSeq = 0
+async function refreshFiles() {
+  if (!window.piBridge) return
+  const seq = ++filesReqSeq
+  const cwd = effectiveGroupCwd(activeGroup.value)
+  if (window.piBridge.listFilesAsync) {
+    filesLoading.value = true
+    try {
+      const list = await window.piBridge.listFilesAsync(cwd)
+      if (seq === filesReqSeq) files.value = list || []
+    } catch (_) {
+      if (seq === filesReqSeq) files.value = []
+    } finally {
+      if (seq === filesReqSeq) filesLoading.value = false
+    }
+    return
+  }
+  if (window.piBridge.listFiles) {
+    try { files.value = window.piBridge.listFiles(cwd) || [] } catch (_) { files.value = [] }
+  }
 }
 function refreshSessions() {
   sessions.value = listSessions(activeId.value)
@@ -294,23 +366,33 @@ function handleEnter(action) {
 
   if (code === 'translate') {
     const t = groups.value.find(g => g.kind === 'translate' || g.id === 'translate' || g.name === '翻译')
-    if (t) selectGroup(t.id)
+    if (t) selectGroup(t.id, { fromEnter: true })
     else showToast('未找到翻译分组，请在设置中创建')
   } else if (code === 'chat' || code === 'agent') {
     const t = groups.value.find(g => g.kind === code || g.id === code)
-    if (t) selectGroup(t.id)
+    if (t) selectGroup(t.id, { fromEnter: true })
   }
 
   sessionRiskConfirmed.value = false
   pendingRiskConfirm.value = false
   pendingRegenerate = false
+  historyFallbackNotified = false
+  files.value = []
   refreshSessions()
   resetPaging()
   showHistory.value = false
-  maybePrewarmRpc()
+  if (initialMountDone && engine.value === 'rpc' && envInfo.value && envInfo.value.ok) maybePrewarmRpc()
+  const curCwd = effectiveGroupCwd(activeGroup.value)
+  if (getLastSkillsCwd && getLastSkillsCwd() !== null && getLastSkillsCwd() !== curCwd) {
+    loadSkillsAsync()
+  }
 
   inputText.value = ''
-  const drafts = loadDrafts(); drafts[activeId.value] = ''; saveDrafts(drafts)
+  const drafts = loadDrafts()
+  if (drafts[activeId.value]) {
+    drafts[activeId.value] = ''
+    saveDrafts(drafts)
+  }
   errorMsg.value = ''
   previewImage.value = ''
   images.value = []
@@ -330,13 +412,15 @@ function handleEnter(action) {
   composerEl.value && composerEl.value.focusInput()
 }
 
-function selectGroup(id) {
+function selectGroup(id, opts) {
+  const fromEnter = !!(opts && opts.fromEnter)
   if (running.value || id === activeId.value) {
     if (running.value && id !== activeId.value) showToast('先停止当前回答再切换分组')
     return
   }
-  saveCurrentDraft()
+  if (!fromEnter) saveCurrentDraft()
   activeId.value = id
+  if (fromEnter) return
   sessionRiskConfirmed.value = false
   pendingRiskConfirm.value = false
   pendingRegenerate = false
@@ -605,7 +689,6 @@ async function send() {
   }
   const session = currentSession.value
   const hadHistory = session.messages.length > 0
-  updateSession(session.id, { config: { ...g } })
 
   const prompt = buildPromptText(g, userText)
   const fileNames = outFiles.map(f => String(f).split(/[\\/]/).pop()).filter(Boolean)
@@ -616,14 +699,15 @@ async function send() {
   if (session.title === '新对话') session.title = titleFromText(userText || fallbackUserText)
   currentAssistant = { role: 'assistant', text: '', thinking: '', tools: [], error: '', aborted: false }
   session.messages.push(currentAssistant)
-  updateSession(session.id, { messages: session.messages, title: session.title })
+  updateSession(session.id, { config: { ...g }, messages: session.messages, title: session.title })
 
   inputText.value = ''
   images.value = []
   attachedFiles.value = []
   errorMsg.value = ''
   composerEl.value && composerEl.value.closeMenus()
-  const d = loadDrafts(); d[activeId.value] = ''; saveDrafts(d)
+  const d = loadDrafts()
+  if (d[activeId.value]) { d[activeId.value] = ''; saveDrafts(d) }
 
   dispatchRun(session, g, {
     prompt,
@@ -749,6 +833,7 @@ function onSaveGroup(next, silent) {
     } catch (_) {}
   }
   if (cwdChanged || permChanged) {
+    if (cwdChanged) clearCwdDisplayCache()
     loadSkillsAsync()
     files.value = []
   }
@@ -810,11 +895,13 @@ function clearAllConversations() {
 
 function restartEngineForConfig() {
   if (window.piBridge && window.piBridge.stopRpc) { try { window.piBridge.stopRpc() } catch (_) {} }
+  rpcStatus.value = ''
   refreshModels()
   loadDefaults(true)
-  loadEnv()
-  setTimeout(checkDefaultAuth, 300)
-  maybePrewarmRpc()
+  loadEnvAsync().then(() => {
+    setTimeout(() => checkDefaultAuth(true), 250)
+    if (engine.value === 'rpc') maybePrewarmRpc()
+  })
 }
 function onConfigSaved() {
   if (running.value) {
@@ -882,7 +969,9 @@ function onConfigSaved() {
             :group="activeGroup"
             :models="models"
             :defaults="defaults"
-            :cwd-label="displayCwd(activeGroup.cwd)"
+            :cwd-label="activeCwdLabel"
+            :engine="engine"
+            :rpc-status="rpcStatus"
             :disabled="running"
             @update-group="onQuickUpdateGroup"
             @pick-cwd="pickGroupCwd"
@@ -927,10 +1016,13 @@ function onConfigSaved() {
           :attached-files="attachedFiles"
           :skills="skills"
           :files="files"
+          :files-loading="filesLoading"
           :active-group="activeGroup"
           :models="models"
           :defaults="defaults"
-          :cwd-label="displayCwd(activeGroup && activeGroup.cwd)"
+          :cwd-label="activeCwdLabel"
+          :engine="engine"
+          :rpc-status="rpcStatus"
           :running="running"
           :send-key-mode="sendKeyMode"
           :is-mac="isMac"
@@ -956,6 +1048,7 @@ function onConfigSaved() {
     </div>
 
     <HistoryDrawer
+      v-if="showHistory"
       :show="showHistory"
       :sessions="sessions"
       :current-session-id="currentSession ? currentSession.id : ''"
@@ -966,6 +1059,7 @@ function onConfigSaved() {
     />
 
     <SettingsModal
+      v-if="showSettings"
       ref="settingsModalEl"
       :show="showSettings"
       :groups="groups"

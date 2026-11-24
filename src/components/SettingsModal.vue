@@ -63,6 +63,7 @@ function switchTab(id) {
 
 function openTab(id, opts) {
   settingsTab.value = id
+  editingGroup.value = null
   if (id === 'groups' && opts && opts.editGroupId) {
     nextTick(() => {
       groupsTabEl.value && groupsTabEl.value.openGroupById(opts.editGroupId)

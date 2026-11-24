@@ -21,7 +21,7 @@ watch(() => props.show, val => {
   search.value = ''
   historyIndex.value = 0
   nextTick(() => searchEl.value && searchEl.value.focus())
-})
+}, { immediate: true })
 watch(search, () => { historyIndex.value = 0 })
 
 function moveHistory(delta) {

@@ -46,9 +46,21 @@ function copyCore() {
         // 等价重写：实际作用是剥掉 Vite 默认加的 crossorigin 属性（file:// 下可能被拦）
         html = html.replace(cssMatch[0], () => `<link rel="stylesheet" href="${href}">`)
       }
-      // 兜底占位：Vue 挂载会覆盖；若一直显示说明脚本未执行（便于诊断）
+      // 首帧零闪烁背景与极简骨架：不依赖任何内联脚本（兼容 CSP script-src 'self'），Vue 挂载后立即接管
+      const bootCss = [
+        '<style id="pideck-boot-style">',
+        'html,body,#app{margin:0;height:100%;background:#fbfaf7;color:#14161a;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+        '@media(prefers-color-scheme:dark){html,body,#app{background:#101215;color:#e6e7e9}}',
+        '.boot-shell{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}',
+        '.boot-mark{width:30px;height:30px;border-radius:9px;background:#1b6a5d;color:#fff;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:500}',
+        '@media(prefers-color-scheme:dark){.boot-mark{background:#57c4ac;color:#0b1a17}}',
+        '.boot-tip{font-size:12px;color:#8b949e;opacity:0;animation:pideck-boot-tip .25s ease 2.5s forwards}',
+        '@keyframes pideck-boot-tip{to{opacity:1}}',
+        '</style>',
+      ].join('')
+      html = html.replace('</head>', () => `  ${bootCss}\n  </head>`)
       html = html.replace('<div id="app"></div>',
-        '<div id="app"><div id="boot-hint" style="padding:24px;font:13px/1.6 -apple-system,Segoe UI,sans-serif;color:#8b949e">正在加载 PiDeck…<br>若长时间停留此页，说明脚本未执行。</div></div>')
+        '<div id="app"><div id="boot-hint" class="boot-shell"><span class="boot-mark">π</span><span class="boot-tip">正在加载 PiDeck… 若长时间停留此页，说明脚本未执行。</span></div></div>')
       writeFileSync(htmlPath, html)
     },
   }

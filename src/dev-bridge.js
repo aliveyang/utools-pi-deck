@@ -98,10 +98,18 @@ window.piBridge = {
   effectiveCwd: devCwd,
   resolveCwd: devCwd,
   listSkills: cwd => syncGet('/skills?cwd=' + encodeURIComponent(cwd || '')) || [],
+  listSkillsAsync: async cwd => {
+    try { return await fetch(BASE + '/skills?cwd=' + encodeURIComponent(cwd || '')).then(r => r.json()) }
+    catch (_) { return [] }
+  },
   listModels: () => syncGet('/models') || [],
   listModelsAsync,
   refreshModels: () => syncGet('/models?force=1') || [],
   listFiles: (cwd, query) => syncGet('/files?cwd=' + encodeURIComponent(cwd || '') + '&q=' + encodeURIComponent(query || '')) || [],
+  listFilesAsync: async (cwd, query) => {
+    try { return await fetch(BASE + '/files?cwd=' + encodeURIComponent(cwd || '') + '&q=' + encodeURIComponent(query || '')).then(r => r.json()) }
+    catch (_) { return [] }
+  },
   detectContextFiles: cwd => syncGet('/context?cwd=' + encodeURIComponent(cwd || '')) || [],
   getDefaults: async cwd => {
     try { return await fetch(BASE + '/defaults?cwd=' + encodeURIComponent(cwd || '')).then(r => r.json()) }
@@ -114,6 +122,10 @@ window.piBridge = {
   getEnv: () => {
     try { return syncGet('/env') || {} } catch (_) { return {} }
   },
+  getEnvAsync: async () => {
+    try { return await fetch(BASE + '/env').then(r => r.json()) }
+    catch (_) { return {} }
+  },
   openPath: () => false,   // 浏览器预览无法打开系统文件管理器
   saveTextFile: () => ({ ok: false, unsupported: true }),   // 走前端 Blob 降级
   openExternal: url => {
@@ -125,13 +137,20 @@ window.piBridge = {
     } catch (_) { return false }
   },
   // 本地缓存与本机状态（与 preload 签名对齐，走浏览器 localStorage 隔离前缀）
-  readCache: key => {
+  readCacheMeta: key => {
     try {
       const raw = localStorage.getItem('pideck.devcache.' + key)
       if (!raw) return null
       const e = JSON.parse(raw)
-      return (e && typeof e.t === 'number' && Date.now() - e.t <= 5 * 60 * 1000) ? (e.data ?? null) : null
+      if (!e || typeof e.t !== 'number' || e.data === undefined) return null
+      const ageMs = Math.max(0, Date.now() - e.t)
+      if (ageMs > 24 * 60 * 60 * 1000) return null
+      return { data: e.data, fresh: ageMs <= 5 * 60 * 1000, ageMs }
     } catch (_) { return null }
+  },
+  readCache: key => {
+    const meta = window.piBridge.readCacheMeta(key)
+    return (meta && meta.fresh) ? meta.data : null
   },
   writeCache: (key, data) => {
     try { localStorage.setItem('pideck.devcache.' + key, JSON.stringify({ t: Date.now(), data })); return true }
@@ -150,7 +169,12 @@ window.piBridge = {
   setConfig: () => ({}),
   prewarmRpc: () => Promise.resolve(false),
   stopRpc: () => {},
+  getRpcDefaults: () => null,
   resolvePi: () => syncGet('/resolve') || { ok: false, error: 'dev API 不可用' },
+  resolvePiAsync: async () => {
+    try { return await fetch(BASE + '/resolve').then(r => r.json()) }
+    catch (_) { return { ok: false, error: 'dev API 不可用' } }
+  },
   resetPiCache: () => { try { syncPost('/reset-cache') } catch (_) {} },
   installPiInTerminal: () => false,
   homedir: () => homedir,

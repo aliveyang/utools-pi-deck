@@ -303,3 +303,58 @@ describe('resolveCwd / effectiveCwd', () => {
     expect(core.effectiveCwd(fixtureDir)).toBe(fixtureDir)
   })
 })
+
+describe('异步路径解析、环境诊断、技能与文件扫描', () => {
+  it('resolvePiAsync 与 seedResolvedPaths 快路径命中与失效回退', async () => {
+    core.resetPiCache()
+    const r = await core.resolvePiAsync()
+    expect(r.node).toBe(process.execPath)
+    expect(r.cli).toBe(fakeCli)
+
+    // 测试 seedResolvedPaths：无 env override 时直接命中不存在的路径会被 access 拒绝并回退
+    core.resetPiCache()
+    const origNode = process.env.PIDECK_NODE
+    const origCli = process.env.PIDECK_PI_CLI
+    delete process.env.PIDECK_NODE
+    delete process.env.PIDECK_PI_CLI
+    core.seedResolvedPaths({ nodePath: process.execPath, nodeVersion: 'v22.19.0', piPath: fakeCli })
+    try {
+      const fast = await core.resolvePiAsync()
+      expect(fast.node).toBe(process.execPath)
+      expect(fast.cli).toBe(fakeCli)
+    } finally {
+      if (origNode !== undefined) process.env.PIDECK_NODE = origNode
+      if (origCli !== undefined) process.env.PIDECK_PI_CLI = origCli
+      core.resetPiCache()
+    }
+  })
+
+  it('getEnvAsync 与 getEnv 字段保持一致', async () => {
+    const syncEnv = core.getEnv()
+    const asyncEnv = await core.getEnvAsync()
+    expect(asyncEnv.ok).toBe(syncEnv.ok)
+    expect(asyncEnv.agentDir).toBe(syncEnv.agentDir)
+    expect(asyncEnv.configs.map(c => c.name)).toEqual(syncEnv.configs.map(c => c.name))
+  })
+
+  it('listFilesAsync 异步扫描目录并支持查询过滤', async () => {
+    const ws = mkdtempSync(join(fixtureDir, 'async-ws-'))
+    mkdirSync(join(ws, 'src'))
+    writeFileSync(join(ws, 'README.md'), '# hi')
+    writeFileSync(join(ws, 'src', 'app.js'), 'console.log(1)')
+    const all = await core.listFilesAsync(ws)
+    expect(all.some(f => f.path === 'README.md' && !f.dir)).toBe(true)
+    expect(all.some(f => f.path === 'src/app.js' && !f.dir)).toBe(true)
+    const filtered = await core.listFilesAsync(ws, 'app.js')
+    expect(filtered).toEqual([{ path: 'src/app.js', dir: false }])
+  })
+
+  it('listSkillsAsync 异步扫描工作区技能', async () => {
+    const ws = mkdtempSync(join(fixtureDir, 'async-sk-'))
+    const skDir = join(ws, '.pi', 'skills', 'demo-skill')
+    mkdirSync(skDir, { recursive: true })
+    writeFileSync(join(skDir, 'SKILL.md'), '---\nname: demo-skill\ndescription: demo async\n---\nbody\n')
+    const list = await core.listSkillsAsync(ws)
+    expect(list.some(s => s.name === 'demo-skill' && s.description === 'demo async')).toBe(true)
+  })
+})

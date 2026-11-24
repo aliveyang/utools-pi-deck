@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, writeFileSync, mkdirSync, existsSync, rmSync, utimesSync, readFileSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, mkdirSync, existsSync, rmSync, utimesSync, readFileSync, statSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -37,6 +37,24 @@ describe('local-store 缓存读写与校验', () => {
     expect(store.readCache('models')).toBeNull()
   })
 
+  it('readCacheMeta 支持 fresh / stale / expired 三态与 removeCache', () => {
+    expect(store.writeCache('models', [{ id: 'm1' }])).toBe(true)
+    const fresh = store.readCacheMeta('models')
+    expect(fresh).toMatchObject({ data: [{ id: 'm1' }], fresh: true })
+
+    clock += 5 * 60 * 1000 + 10
+    const stale = store.readCacheMeta('models')
+    expect(stale).toMatchObject({ data: [{ id: 'm1' }], fresh: false })
+    expect(store.readCache('models')).toBeNull()
+
+    clock += 24 * 60 * 60 * 1000
+    expect(store.readCacheMeta('models')).toBeNull()
+
+    expect(store.writeCache('pi-resolved', { nodePath: '/n' })).toBe(true)
+    expect(store.removeCache('pi-resolved')).toBe(true)
+    expect(store.readCacheMeta('pi-resolved')).toBeNull()
+  })
+
   it('非法 key 一律拒绝，坏 JSON 容错返回 null', () => {
     expect(store.writeCache('../evil', { a: 1 })).toBe(false)
     expect(store.writeCache('bad/key', { a: 1 })).toBe(false)
@@ -60,10 +78,20 @@ describe('local-store 配置读写与本地状态', () => {
     expect(store.loadConfig()).toEqual({ engine: 'rpc', theme: 'dark' })
   })
 
-  it('readLocal/writeLocal/removeLocal 读写本机状态字典', () => {
+  it('readLocal/writeLocal/removeLocal 读写本机状态字典且无变化时跳过重复写盘', () => {
     expect(store.readLocal('drafts', {})).toEqual({})
     expect(store.writeLocal('drafts', { chat: 'hello' })).toBe(true)
     expect(store.readLocal('drafts', {})).toEqual({ chat: 'hello' })
+
+    const oldTime = new Date(clock - 60000)
+    utimesSync(store.localStateFile, oldTime, oldTime)
+    expect(store.writeLocal('drafts', { chat: 'hello' })).toBe(true)
+    expect(existsSync(store.localStateFile)).toBe(true)
+    const afterSameWrite = readFileSync(store.localStateFile, 'utf8')
+    expect(JSON.parse(afterSameWrite).drafts).toEqual({ chat: 'hello' })
+    const mtimeAfterSame = statSync(store.localStateFile).mtimeMs
+    expect(mtimeAfterSame).toBe(oldTime.getTime())
+
     expect(store.removeLocal('drafts')).toBe(true)
     expect(store.readLocal('drafts', null)).toBeNull()
   })

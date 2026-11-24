@@ -1,6 +1,6 @@
 // Pi 运行环境：引擎、模型、技能、默认值、环境诊断与终端一键安装
 import { ref } from 'vue'
-import { readCache, writeCache } from '../storage.js'
+import { readCacheMeta, writeCache } from '../storage.js'
 import { PI_INSTALL_CMD } from '../constants.js'
 
 export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
@@ -13,10 +13,94 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
   const envInfo = ref(null)
   const showEnvHelp = ref(false)
 
-  // 读取 pi 实际默认模型/思考强度，带 5 分钟缓存
+  let modelsLoadingPromise = null
+  let envLoadingPromise = null
+  let lastSkillsCwd = null
+
+  function normalizeDefaultsFromEnv(env) {
+    if (!env || !env.defaultModel) return null
+    return {
+      modelId: env.defaultModel,
+      modelName: env.defaultModel,
+      thinkingLevel: env.defaultThinking || '',
+    }
+  }
+
+  function hydrateFromCache() {
+    const cwd = getCwd ? (getCwd() || '') : ''
+    const mMeta = readCacheMeta('models')
+    if (mMeta && Array.isArray(mMeta.data)) models.value = mMeta.data
+
+    let skillsFresh = false
+    const sMeta = readCacheMeta('skills')
+    if (sMeta && sMeta.data) {
+      if (Array.isArray(sMeta.data)) {
+        skills.value = sMeta.data
+        skillsFresh = sMeta.fresh
+      } else if (Array.isArray(sMeta.data.list)) {
+        const sameCwd = (sMeta.data.cwd || '') === cwd
+        if (sameCwd || !skills.value.length) skills.value = sMeta.data.list
+        if (sameCwd) {
+          lastSkillsCwd = cwd
+          skillsFresh = sMeta.fresh
+        }
+      }
+    }
+
+    const dMeta = readCacheMeta('defaults')
+    if (dMeta && dMeta.data && !dMeta.data.error) {
+      defaults.value = dMeta.data
+    }
+
+    const eMeta = readCacheMeta('env')
+    if (eMeta && eMeta.data) {
+      envInfo.value = eMeta.data
+      if (eMeta.data.ok) {
+        piStatus.value = { ok: true, node: eMeta.data.nodePath || '', cli: eMeta.data.piPath || '' }
+        if (!defaults.value.modelId && !defaults.value.modelName) {
+          const fallbackDef = normalizeDefaultsFromEnv(eMeta.data)
+          if (fallbackDef) defaults.value = fallbackDef
+        }
+      }
+    }
+
+    return {
+      modelsFresh: !!(mMeta && mMeta.fresh),
+      skillsFresh,
+      defaultsFresh: !!(dMeta && dMeta.fresh),
+      envFresh: !!(eMeta && eMeta.fresh),
+    }
+  }
+
+  function syncDefaultsFromRpc() {
+    if (!window.piBridge || !window.piBridge.getRpcDefaults) return false
+    try {
+      const rpcDef = window.piBridge.getRpcDefaults(getCwd(), { ...(getLean ? getLean() : {}) })
+      if (rpcDef && (rpcDef.modelId || rpcDef.modelName || rpcDef.thinkingLevel)) {
+        defaults.value = rpcDef
+        writeCache('defaults', rpcDef)
+        return true
+      }
+    } catch (_) {}
+    return false
+  }
+
+  // 读取 pi 实际生效的默认模型/思考强度，优先复用已预热 RPC 或 settings.json，避免冷启动额外派生子进程
   async function loadDefaults(force) {
-    const cached = force ? null : readCache('defaults')
-    if (cached) { defaults.value = cached; return }
+    if (!force) {
+      const dMeta = readCacheMeta('defaults')
+      if (dMeta && dMeta.fresh && dMeta.data && !dMeta.data.error) {
+        defaults.value = dMeta.data
+        return
+      }
+      if (syncDefaultsFromRpc()) return
+      const fromEnv = normalizeDefaultsFromEnv(envInfo.value)
+      if (fromEnv) {
+        defaults.value = fromEnv
+        writeCache('defaults', fromEnv)
+        return
+      }
+    }
     if (!window.piBridge || !window.piBridge.getDefaults) return
     try {
       const d = await window.piBridge.getDefaults(getCwd())
@@ -24,13 +108,31 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
     } catch (_) {}
   }
 
-  async function loadModelsAsync() {
-    try {
-      let list = null
-      if (window.piBridge && window.piBridge.listModelsAsync) list = await window.piBridge.listModelsAsync()
-      else if (window.piBridge && window.piBridge.listModels) list = window.piBridge.listModels()
-      if (list) { models.value = list; writeCache('models', list) }
-    } catch (_) { /* 保留上次缓存 */ }
+  async function loadModelsAsync(opts = {}) {
+    const force = !!(opts && opts.force)
+    if (!force) {
+      const mMeta = readCacheMeta('models')
+      if (mMeta && mMeta.fresh && Array.isArray(mMeta.data)) {
+        if (!models.value.length) models.value = mMeta.data
+        return mMeta.data
+      }
+    }
+    if (modelsLoadingPromise) return modelsLoadingPromise
+    modelsLoadingPromise = (async () => {
+      try {
+        let list = null
+        if (window.piBridge && window.piBridge.listModelsAsync) list = await window.piBridge.listModelsAsync()
+        else if (window.piBridge && window.piBridge.listModels) list = window.piBridge.listModels()
+        if (list) { models.value = list; writeCache('models', list) }
+        return list
+      } catch (_) {
+        /* 保留上次缓存 */
+        return null
+      } finally {
+        modelsLoadingPromise = null
+      }
+    })()
+    return modelsLoadingPromise
   }
 
   async function refreshModels() {
@@ -45,30 +147,86 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
     } catch (e) { showToast('刷新失败：' + e.message) }
   }
 
-  async function loadSkillsAsync() {
+  async function loadSkillsAsync(opts = {}) {
+    const force = !!(opts && opts.force)
+    const cwd = getCwd ? (getCwd() || '') : ''
+    if (!force) {
+      const sMeta = readCacheMeta('skills')
+      if (sMeta && sMeta.fresh && sMeta.data && !Array.isArray(sMeta.data) && (sMeta.data.cwd || '') === cwd && Array.isArray(sMeta.data.list)) {
+        skills.value = sMeta.data.list
+        lastSkillsCwd = cwd
+        return sMeta.data.list
+      }
+    }
     try {
-      const list = window.piBridge && window.piBridge.listSkills ? window.piBridge.listSkills(getCwd()) : null
-      if (list) { skills.value = list; writeCache('skills', list) }
+      let list = null
+      if (window.piBridge && window.piBridge.listSkillsAsync) list = await window.piBridge.listSkillsAsync(cwd)
+      else if (window.piBridge && window.piBridge.listSkills) list = window.piBridge.listSkills(cwd)
+      if (list) {
+        skills.value = list
+        lastSkillsCwd = cwd
+        writeCache('skills', { cwd, list })
+      }
+      return list
     } catch (_) { /* 保留上次缓存 */ }
+  }
+
+  function applyEnvResult(env) {
+    envInfo.value = env || null
+    if (env && env.ok) {
+      piStatus.value = { ok: true, node: env.nodePath || '', cli: env.piPath || '' }
+      showEnvHelp.value = false
+      writeCache('env', env)
+      if (!defaults.value.modelId && !defaults.value.modelName) {
+        const fromEnv = normalizeDefaultsFromEnv(env)
+        if (fromEnv) {
+          defaults.value = fromEnv
+          writeCache('defaults', fromEnv)
+        }
+      }
+    } else if (env) {
+      piStatus.value = { ok: false, error: env.error || '环境未就绪' }
+      showEnvHelp.value = true
+    }
   }
 
   function loadEnv() {
     if (!window.piBridge || !window.piBridge.getEnv) return
     try {
-      envInfo.value = window.piBridge.getEnv()
-      if (envInfo.value && !envInfo.value.ok) showEnvHelp.value = true
+      applyEnvResult(window.piBridge.getEnv())
     } catch (_) { envInfo.value = null }
   }
 
-  function recheckEnv() {
+  async function loadEnvAsync() {
+    if (envLoadingPromise) return envLoadingPromise
+    if (!window.piBridge) return null
+    envLoadingPromise = (async () => {
+      try {
+        const env = window.piBridge.getEnvAsync
+          ? await window.piBridge.getEnvAsync()
+          : (window.piBridge.getEnv ? window.piBridge.getEnv() : null)
+        applyEnvResult(env)
+        return env
+      } catch (_) {
+        return null
+      } finally {
+        envLoadingPromise = null
+      }
+    })()
+    return envLoadingPromise
+  }
+
+  async function recheckEnv() {
     if (window.piBridge && window.piBridge.resetPiCache) {
       try { window.piBridge.resetPiCache() } catch (_) {}
     }
-    loadEnv()
-    if (window.piBridge && window.piBridge.resolvePi) piStatus.value = window.piBridge.resolvePi()
+    const env = await loadEnvAsync()
+    if (!env && window.piBridge && window.piBridge.resolvePiAsync) {
+      piStatus.value = await window.piBridge.resolvePiAsync()
+    }
     if (envInfo.value && envInfo.value.ok) {
       showEnvHelp.value = false
-      loadModelsAsync()
+      loadModelsAsync({ force: true })
       loadDefaults(true)
       showToast('检测通过，Pi 可用')
     } else {
@@ -88,7 +246,17 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
 
   function prewarmActive() {
     if (!window.piBridge || !window.piBridge.prewarmRpc) return Promise.resolve(false)
+    rpcStatus.value = 'warming'
     return window.piBridge.prewarmRpc(getCwd(), { ...(getLean ? getLean() : {}) })
+      .then(ok => {
+        rpcStatus.value = ok ? 'ready' : 'failed'
+        if (ok) syncDefaultsFromRpc()
+        return ok
+      })
+      .catch(() => {
+        rpcStatus.value = 'failed'
+        return false
+      })
   }
 
   function setEngine(val) {
@@ -99,7 +267,6 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
       rpcStatus.value = 'warming'
       if (window.piBridge.prewarmRpc) {
         prewarmActive().then(ok => {
-          rpcStatus.value = ok ? 'ready' : 'failed'
           showToast(ok ? '已开启极速模式并完成预热' : '极速预热失败，将自动使用标准模式')
         })
       }
@@ -135,7 +302,8 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
 
   return {
     models, skills, piStatus, engine, rpcStatus, defaults, envInfo, showEnvHelp,
-    loadDefaults, loadModelsAsync, refreshModels, loadSkillsAsync,
-    loadEnv, recheckEnv, installPi, prewarmActive, setEngine, openPath, openExternal,
+    hydrateFromCache, loadDefaults, loadModelsAsync, refreshModels, loadSkillsAsync,
+    loadEnv, loadEnvAsync, recheckEnv, installPi, prewarmActive, setEngine, openPath, openExternal,
+    getLastSkillsCwd: () => lastSkillsCwd,
   }
 }

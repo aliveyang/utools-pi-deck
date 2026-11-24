@@ -244,9 +244,9 @@ function createRunner(deps = {}) {
     try { child.kill(); return true } catch (_) { return false }
   }
 
-  function listModelsAsync() {
+  async function listModelsAsync() {
+    const { node, cli } = core.resolvePiAsync ? await core.resolvePiAsync() : core.resolvePi()
     return new Promise((resolve, reject) => {
-      const { node, cli } = core.resolvePi()
       execFile(node, [cli, '--list-models'], { windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
         if (err) return reject(err)
         resolve(core.parseModelsOutput(stdout))
