@@ -60,20 +60,17 @@ if (!core || !localStoreMod) {
   const errMsg = coreErr || 'shared 模块加载失败'
   // 降级桥：字段需与正常分支保持一致，避免前端取到 undefined
   window.piBridge = {
-    resolvePi: () => ({ ok: false, error: 'pi-core 加载失败：' + errMsg }),
     resolvePiAsync: () => Promise.resolve({ ok: false, error: 'pi-core 加载失败：' + errMsg }),
     resetPiCache: () => {},
     installPiInTerminal: () => false,
-    getConfig: () => ({}), setConfig: () => ({}),
-    readCache: () => null, readCacheMeta: () => null, writeCache: () => false,
-    readLocal: (_k, fb) => fb, writeLocal: () => false,
+    getConfig: () => ({}), getConfigAsync: () => Promise.resolve({}), setConfig: () => ({}),
+    readCache: () => null, readCacheMeta: () => null, readCacheMetaAsync: () => Promise.resolve(null), writeCache: () => false,
+    readLocal: (_k, fb) => fb, readLocalAsync: (_k, fb) => Promise.resolve(fb), writeLocal: () => false,
     prewarmRpc: () => Promise.resolve(false), stopRpc: () => {}, getRpcDefaults: () => null,
-    listSkills: () => [], listSkillsAsync: () => Promise.resolve([]),
-    listModels: () => [], listModelsAsync: () => Promise.resolve([]),
-    listFiles: () => [], listFilesAsync: () => Promise.resolve([]),
-    refreshModels: () => [],
+    listSkillsAsync: () => Promise.resolve([]),
+    listModelsAsync: () => Promise.resolve([]),
+    listFilesAsync: () => Promise.resolve([]),
     detectContextFiles: () => [], getDefaults: () => Promise.resolve({}),
-    getEnv: () => ({ ok: false, errorCode: '', error: 'pi-core 加载失败', agentDir: '', configs: [] }),
     getEnvAsync: () => Promise.resolve({ ok: false, errorCode: '', error: 'pi-core 加载失败', agentDir: '', configs: [] }),
     deletePiSession: () => ({ ok: false, removed: 0 }),
     saveTextFile: () => ({ ok: false, unsupported: true }),
@@ -81,7 +78,7 @@ if (!core || !localStoreMod) {
     run: () => { throw new Error('pi-core 加载失败：' + errMsg) },
     cancel: () => {}, saveImage: () => { throw new Error('pi-core 加载失败') },
     pickFolder: () => null, pickFiles: () => null, pickExecutable: () => null,
-    validateCwd: () => false, effectiveCwd: p => p || os.homedir(), resolveCwd: p => p || os.homedir(),
+    validateCwd: () => false,
     homedir: () => os.homedir(),
     auditTail: () => [], auditExport: () => '', auditDir: () => '', auditClear: () => ({ removed: 0, failed: 0 }), auditRecord: () => false,
     configState: () => ({ ok: false, error: 'pi-core 加载失败' }),
@@ -95,7 +92,14 @@ if (!core || !localStoreMod) {
   boot()
 }
 
+function perfNow() {
+  return (typeof performance !== 'undefined' && typeof performance.now === 'function') ? performance.now() : Date.now()
+}
+
 function boot() {
+  const perf = window.__pideckPerf = window.__pideckPerf || {}
+  perf.preloadStart = perfNow()
+
   // uTools 可能在 Vue 挂载前派发进入事件：preload 最早接住并缓存，渲染层挂载后再取
   if (window.utools && window.utools.onPluginEnter) {
     window.__pideckEnterQueue = window.__pideckEnterQueue || []
@@ -105,33 +109,71 @@ function boot() {
     })
   }
 
-  // 优先使用 uTools 插件专属临时目录与本地数据目录（不参与云同步）
-  let pluginTempRoot = ''
-  let pluginLocalRoot = ''
-  try {
-    if (window.utools && typeof window.utools.getPluginTempPath === 'function') {
-      pluginTempRoot = window.utools.getPluginTempPath() || ''
-    }
-  } catch (_) {}
-  try {
-    if (window.utools && typeof window.utools.getPluginLocalDataPath === 'function') {
-      pluginLocalRoot = window.utools.getPluginLocalDataPath() || ''
-    }
-  } catch (_) {}
+  // 延迟获取 uTools 插件专属临时目录与本地数据目录（零启动期同步 IPC / 磁盘 I/O）
+  let _rootsResolved = false
+  let _pluginTempRoot = ''
+  let _pluginLocalRoot = ''
+  function getPluginRoots() {
+    if (_rootsResolved) return { tempRoot: _pluginTempRoot, localRoot: _pluginLocalRoot }
+    _rootsResolved = true
+    try {
+      if (window.utools && typeof window.utools.getPluginTempPath === 'function') {
+        _pluginTempRoot = window.utools.getPluginTempPath() || ''
+      }
+    } catch (_) {}
+    try {
+      if (window.utools && typeof window.utools.getPluginLocalDataPath === 'function') {
+        _pluginLocalRoot = window.utools.getPluginLocalDataPath() || ''
+      }
+    } catch (_) {}
+    return { tempRoot: _pluginTempRoot, localRoot: _pluginLocalRoot }
+  }
 
-  const store = localStoreMod.createLocalStore({
-    ...(pluginTempRoot ? { cacheDir: path.join(pluginTempRoot, 'cache'), imageDir: path.join(pluginTempRoot, 'images') } : {}),
-    ...(pluginLocalRoot ? { configFile: path.join(pluginLocalRoot, 'config.json'), localStateFile: path.join(pluginLocalRoot, 'state.json') } : {}),
-    legacyConfigFile: path.join(os.homedir(), '.pideck', 'config.json'),
-  })
+  let _storeInstance = null
+  function getStore() {
+    if (_storeInstance) return _storeInstance
+    const { tempRoot, localRoot } = getPluginRoots()
+    _storeInstance = localStoreMod.createLocalStore({
+      ...(tempRoot ? { cacheDir: path.join(tempRoot, 'cache'), imageDir: path.join(tempRoot, 'images') } : {}),
+      ...(localRoot ? { configFile: path.join(localRoot, 'config.json'), localStateFile: path.join(localRoot, 'state.json') } : {}),
+      legacyConfigFile: path.join(os.homedir(), '.pideck', 'config.json'),
+    })
+    return _storeInstance
+  }
 
-  // 启动时注入本机手动指定的 Node / pi CLI 路径覆盖；未覆盖时注入上次解析快路径缓存
-  const initCfg = store.loadConfig()
-  if (initCfg && (initCfg.nodePath || initCfg.piCliPath)) {
-    core.setPathOverrides({ nodePath: initCfg.nodePath || '', piCliPath: initCfg.piCliPath || '' })
-  } else if (core.seedResolvedPaths) {
-    const resolvedCache = store.readCacheMeta ? store.readCacheMeta('pi-resolved') : null
-    if (resolvedCache && resolvedCache.data) core.seedResolvedPaths(resolvedCache.data)
+  // 懒注入本机手动指定的 Node / pi CLI 路径覆盖；未覆盖时注入上次解析快路径缓存
+  let _piConfigured = false
+  let _piConfiguredAsyncPromise = null
+  function applyPiConfig(cfg, resolvedCache) {
+    if (cfg && (cfg.nodePath || cfg.piCliPath)) {
+      core.setPathOverrides({ nodePath: cfg.nodePath || '', piCliPath: cfg.piCliPath || '' })
+    } else if (core.seedResolvedPaths && resolvedCache && resolvedCache.data) {
+      core.seedResolvedPaths(resolvedCache.data)
+    }
+    _piConfigured = true
+  }
+  function ensurePiConfigured() {
+    if (_piConfigured) return
+    const st = getStore()
+    const cfg = st.loadConfig()
+    const resolvedCache = (cfg && (cfg.nodePath || cfg.piCliPath))
+      ? null
+      : (st.readCacheMeta ? st.readCacheMeta('pi-resolved') : null)
+    applyPiConfig(cfg, resolvedCache)
+  }
+  function ensurePiConfiguredAsync() {
+    if (_piConfigured) return Promise.resolve()
+    if (_piConfiguredAsyncPromise) return _piConfiguredAsyncPromise
+    _piConfiguredAsyncPromise = (async () => {
+      const st = getStore()
+      const cfg = await st.loadConfigAsync()
+      if (_piConfigured) return
+      const resolvedCache = (cfg && (cfg.nodePath || cfg.piCliPath))
+        ? null
+        : (st.readCacheMetaAsync ? await st.readCacheMetaAsync('pi-resolved') : null)
+      if (!_piConfigured) applyPiConfig(cfg, resolvedCache)
+    })().finally(() => { _piConfiguredAsyncPromise = null })
+    return _piConfiguredAsyncPromise
   }
 
   let _auditInstance = null
@@ -139,7 +181,8 @@ function boot() {
     if (_auditInstance) return _auditInstance
     const mod = getAuditMod()
     if (!mod) return null
-    _auditInstance = pluginLocalRoot ? mod.createAudit({ root: path.join(pluginLocalRoot, 'audit') }) : mod
+    const { localRoot } = getPluginRoots()
+    _auditInstance = localRoot ? mod.createAudit({ root: path.join(localRoot, 'audit') }) : mod
     return _auditInstance
   }
 
@@ -151,15 +194,18 @@ function boot() {
 
   let _runnerInstance = null
   function getRunner() {
+    ensurePiConfigured()
     if (_runnerInstance) return _runnerInstance
     const mod = getRunnerMod()
     if (!mod) throw new Error('runner 模块加载失败')
+    const { tempRoot } = getPluginRoots()
+    const st = getStore()
     _runnerInstance = mod.createRunner({
       core,
       rpcEngine: getRpcEngine(),
       auditRecord,
-      loadConfig: () => store.loadConfig(),
-      tempDir: pluginTempRoot || os.tmpdir(),
+      loadConfig: () => st.loadConfig(),
+      tempDir: tempRoot || os.tmpdir(),
     })
     return _runnerInstance
   }
@@ -168,9 +214,10 @@ function boot() {
   const workspaceRoots = new Set()
   function getAllowedOpenRoots() {
     const a = getAudit()
+    const { localRoot } = getPluginRoots()
     return [
       core.agentDir(),
-      a ? a.dir() : (pluginLocalRoot ? path.join(pluginLocalRoot, 'audit') : path.join(os.homedir(), '.pideck', 'audit')),
+      a ? a.dir() : (localRoot ? path.join(localRoot, 'audit') : path.join(os.homedir(), '.pideck', 'audit')),
       core.resolveCwd(''),
       ...workspaceRoots,
     ]
@@ -240,7 +287,7 @@ function boot() {
 
   // 用系统浏览器打开外链：严格仅允许 http/https，绝不回退 shellOpenPath
   function openExternal(url) {
-    const safeUrl = store.isAllowedExternalUrl(url)
+    const safeUrl = localStoreMod.isAllowedExternalUrl(url)
     if (!safeUrl) return false
     try {
       if (window.utools && window.utools.shellOpenExternal) {
@@ -253,7 +300,7 @@ function boot() {
 
   // 打开目录或定位文件：严格限定在白名单根目录内，且文件只做文件夹定位而不直接执行
   function openPath(p) {
-    const res = store.resolveSafeOpenTarget(p, getAllowedOpenRoots())
+    const res = localStoreMod.resolveSafeOpenTarget(p, getAllowedOpenRoots())
     if (!res.ok) return false
     try {
       if (res.isDir && window.utools && window.utools.shellOpenPath) {
@@ -271,53 +318,54 @@ function boot() {
   window.piBridge = {
     run: (opts, handlers) => getRunner().run(opts, handlers),
     cancel: () => (_runnerInstance ? _runnerInstance.cancel() : false),
-    saveImage: dataUrl => store.saveImage(dataUrl),
+    saveImage: dataUrl => getStore().saveImage(dataUrl),
     pickFolder,
     pickFiles,
     pickExecutable,
     validateCwd: core.validateCwd,
-    effectiveCwd: core.effectiveCwd,
-    resolveCwd: core.resolveCwd,
-    listSkills: core.listSkills,
     listSkillsAsync: cwd => core.listSkillsAsync(cwd),
-    listModels: core.listModels,
-    listModelsAsync: () => getRunner().listModelsAsync(),
-    refreshModels: () => core.listModels(true),
-    listFiles: core.listFiles,
+    listModelsAsync: () => ensurePiConfiguredAsync().then(() => getRunner().listModelsAsync()),
     listFilesAsync: (cwd, query) => core.listFilesAsync(cwd, query),
     detectContextFiles: cwd => core.detectContextFiles(cwd),
-    getDefaults: cwd => core.getDefaults(cwd),
+    getDefaults: cwd => { ensurePiConfigured(); return core.getDefaults(cwd) },
     deletePiSession: id => core.deletePiSession(id),
-    getEnv: () => core.getEnv(),
-    getEnvAsync: () => core.getEnvAsync().then(env => {
-      if (env && env.ok) {
-        store.writeCache('pi-resolved', { nodePath: env.nodePath, nodeVersion: env.nodeVersion, piPath: env.piPath })
-      }
-      return env
-    }),
+    getEnvAsync: () => ensurePiConfiguredAsync()
+      .then(() => core.getEnvAsync())
+      .then(env => {
+        if (env && env.ok) {
+          getStore().writeCache('pi-resolved', { nodePath: env.nodePath, nodeVersion: env.nodeVersion, piPath: env.piPath })
+        }
+        return env
+      }),
     saveTextFile,
     openExternal,
     openPath,
     // 本机缓存与本机状态（写入临时目录/本地数据目录，不进入同步数据库）
-    readCache: key => store.readCache(key),
-    readCacheMeta: key => store.readCacheMeta(key),
-    writeCache: (key, data) => store.writeCache(key, data),
-    readLocal: (key, fallback) => store.readLocal(key, fallback),
-    writeLocal: (key, value) => store.writeLocal(key, value),
+    readCache: key => getStore().readCache(key),
+    readCacheMeta: key => getStore().readCacheMeta(key),
+    readCacheMetaAsync: key => getStore().readCacheMetaAsync(key),
+    writeCache: (key, data) => getStore().writeCache(key, data),
+    readLocal: (key, fallback) => getStore().readLocal(key, fallback),
+    readLocalAsync: (key, fallback) => getStore().readLocalAsync(key, fallback),
+    writeLocal: (key, value) => getStore().writeLocal(key, value),
     // RPC 引擎与配置
-    getConfig: () => store.loadConfig(),
+    getConfig: () => getStore().loadConfig(),
+    getConfigAsync: () => getStore().loadConfigAsync(),
     setConfig: patch => {
-      const next = store.saveConfig(patch)
+      const st = getStore()
+      const next = st.saveConfig(patch)
       if (patch && ('nodePath' in patch || 'piCliPath' in patch)) {
         core.setPathOverrides({ nodePath: next.nodePath || '', piCliPath: next.piCliPath || '' })
-        if (store.removeCache) store.removeCache('pi-resolved')
+        if (st.removeCache) st.removeCache('pi-resolved')
+        _piConfigured = true
       }
       return next
     },
     prewarmRpc: (cwd, flags) => {
       const eng = getRpcEngine()
       if (!eng) return Promise.resolve(false)
-      return core.resolvePiAsync()
+      return ensurePiConfiguredAsync()
+        .then(() => core.resolvePiAsync())
         .then(() => eng.prewarm(cwd, core.applyLeanSystemPrompt(flags || {})))
         .catch(() => false)
     },
@@ -336,10 +384,12 @@ function boot() {
     configState: () => { const c = getConfigCore(); return c ? { ok: true, ...c.getState() } : { ok: false, error: '配置模块加载失败' } },
     configSave: input => { const c = getConfigCore(); return c ? c.save(input) : { ok: false, error: '配置模块加载失败' } },
     configRemoveKey: provider => { const c = getConfigCore(); return c ? c.removeKey(provider) : { ok: false, error: '配置模块加载失败' } },
-    configAuthCheck: provider => { const c = getConfigCore(); return c ? c.authCheck(provider) : Promise.resolve({ status: 'unavailable' }) },
-    configLoginCommand: provider => { const c = getConfigCore(); return c ? c.loginCommand(provider) : '' },
+    configAuthCheck: provider => ensurePiConfiguredAsync()
+      .then(() => { const c = getConfigCore(); return c ? c.authCheck(provider) : { status: 'unavailable' } })
+      .catch(() => ({ status: 'unavailable' })),
+    configLoginCommand: provider => { ensurePiConfigured(); const c = getConfigCore(); return c ? c.loginCommand(provider) : '' },
     openTerminalForProvider: provider => {
-      try { const c = getConfigCore(); return c ? getRunner().openTerminal(c.loginCommand(provider)) : false }
+      try { ensurePiConfigured(); const c = getConfigCore(); return c ? getRunner().openTerminal(c.loginCommand(provider)) : false }
       catch (_) { return false }
     },
     installPiInTerminal: () => {
@@ -348,15 +398,17 @@ function boot() {
     },
     resetPiCache: () => {
       core.resetPiCache()
-      if (store.removeCache) store.removeCache('pi-resolved')
+      const st = getStore()
+      if (st.removeCache) st.removeCache('pi-resolved')
+      _piConfigured = false
     },
-    resolvePi: () => {
-      try { const r = core.resolvePi(); return { ok: true, ...r } }
-      catch (e) { return { ok: false, error: String(e.message || e) } }
-    },
-    resolvePiAsync: () => core.resolvePiAsync()
+    resolvePiAsync: () => ensurePiConfiguredAsync()
+      .then(() => core.resolvePiAsync())
       .then(r => ({ ok: true, ...r }))
       .catch(e => ({ ok: false, error: String(e.message || e) })),
     homedir: () => os.homedir(),
   }
+
+  perf.preloadEnd = perfNow()
+  perf.preloadMs = Number((perf.preloadEnd - perf.preloadStart).toFixed(2))
 }

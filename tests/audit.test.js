@@ -88,4 +88,23 @@ describe('audit', () => {
     expect(md).toContain('| 时间 | 分组 | 类型 | 内容 |')
     expect(md).toContain('修改文件')
   })
+
+  it('敏感键名对应嵌套对象或数字值也整体打码为 ***', () => {
+    const a = createAudit({ root, now: () => Date.UTC(2026, 10, 23, 9, 0) })
+    a.record({
+      type: 'tool',
+      tool: {
+        name: 'bash',
+        args: {
+          authorization: { value: 'raw-nested-secret' },
+          secret: 123456,
+          normal: 'safe-value',
+        },
+      },
+    })
+    const rows = a.tail(1)
+    expect(rows[0].tool.args.authorization).toBe('***')
+    expect(rows[0].tool.args.secret).toBe('***')
+    expect(rows[0].tool.args.normal).toBe('safe-value')
+  })
 })

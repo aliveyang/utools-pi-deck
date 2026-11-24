@@ -223,4 +223,28 @@ describe('rpc-engine ensure 与 prompt 契约', () => {
     expect(children[0].stdinEnded).toBe(false)
     expect(eng._processes.size).toBe(2)
   })
+
+  it('svg 图片使用 image/svg+xml MIME，且超限本地图片同步抛错触发回退并清理监听', async () => {
+    const svgFile = join(fixtureDir, 'icon.svg')
+    const bigFile = join(fixtureDir, 'huge.png')
+    writeFileSync(svgFile, '<svg></svg>')
+    writeFileSync(bigFile, 'x'.repeat(200))
+
+    const child = makeMockChild()
+    const eng = createRpcEngine({ core, maxImageBytes: 50, spawn: () => child })
+    await eng.ensure(fixtureDir, {})
+
+    await new Promise((resolve, reject) => {
+      eng.prompt(fixtureDir, { prompt: 'see svg', files: [svgFile] }, {
+        onDone: resolve,
+        onError: m => reject(new Error(m)),
+      })
+    })
+    const promptCmd = child.sent.find(c => c.type === 'prompt')
+    expect(promptCmd.images[0].mimeType).toBe('image/svg+xml')
+
+    const baseListeners = child.listenerCount('exit')
+    expect(() => eng.prompt(fixtureDir, { prompt: 'huge', files: [bigFile] }, {})).toThrow('图片过大')
+    expect(child.listenerCount('exit')).toBe(baseListeners)
+  })
 })

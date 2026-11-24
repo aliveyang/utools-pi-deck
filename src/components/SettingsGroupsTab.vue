@@ -1,6 +1,6 @@
 <script setup>
 // 设置 -> 分组管理与编辑（无 lean 遗留，高级资源选项可折叠）
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onUnmounted } from 'vue'
 import { newGroup, PRESET_LIST, PRESET_LABEL, TOOL_PRESETS, TOOL_NAMES, presetOf } from '../groups.js'
 import {
   THINKING_LEVELS, THINKING_LABELS, TARGET_LANGS, TOOL_META,
@@ -32,23 +32,48 @@ watch(editing, val => {
   emit('editingChange', val)
 })
 
-function refreshEditEnv() {
+let envReqSeq = 0
+let envDebounceTimer = null
+
+async function refreshEditEnv() {
   if (!editing.value) return
+  const seq = ++envReqSeq
   const cwd = editing.value.cwd || props.defaultCwd || ''
   try {
     editContextFiles.value = (window.piBridge && window.piBridge.detectContextFiles)
       ? (window.piBridge.detectContextFiles(cwd) || []) : []
   } catch (_) { editContextFiles.value = [] }
   try {
-    editSkills.value = (window.piBridge && window.piBridge.listSkills)
-      ? (window.piBridge.listSkills(cwd) || []) : props.skills
-  } catch (_) { editSkills.value = props.skills }
+    if (window.piBridge && window.piBridge.listSkillsAsync) {
+      const list = await window.piBridge.listSkillsAsync(cwd)
+      if (seq === envReqSeq) editSkills.value = list || []
+    } else {
+      editSkills.value = props.skills
+    }
+  } catch (_) {
+    if (seq === envReqSeq) editSkills.value = props.skills
+  }
+}
+
+function scheduleRefreshEditEnv() {
+  clearTimeout(envDebounceTimer)
+  envDebounceTimer = setTimeout(() => { refreshEditEnv() }, 250)
 }
 
 watch(
   [() => editing.value && editing.value.id, () => editing.value && editing.value.cwd, () => props.defaultCwd],
-  () => { if (editing.value) refreshEditEnv() },
+  ([id], [oldId]) => {
+    if (!editing.value) return
+    if (id !== oldId) {
+      clearTimeout(envDebounceTimer)
+      refreshEditEnv()
+    } else {
+      scheduleRefreshEditEnv()
+    }
+  },
 )
+
+onUnmounted(() => { clearTimeout(envDebounceTimer) })
 
 function defaultModelLabel() {
   const d = props.defaults || {}
@@ -196,7 +221,7 @@ function groupSummary(g) {
   return parts
 }
 
-defineExpose({ editing, editGroup, openGroupById, clearEditing })
+defineExpose({ openGroupById, clearEditing })
 </script>
 
 <template>

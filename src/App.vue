@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import { loadGroups, saveGroups, loadActiveId, saveActiveId, loadDrafts, saveDrafts, TOOL_PRESETS } from './groups.js'
-import { readCacheMeta, writeCache } from './storage.js'
+import { loadGroups, saveGroups, saveActiveId, loadDrafts, saveDrafts, TOOL_PRESETS } from './groups.js'
+import { readCacheMetaAsync, readLocalAsync, writeCache, loadPrefsBundle, savePrefsBundle } from './storage.js'
 import { isRiskyTool, activeRiskSummary, toolSummary } from './constants.js'
 import Icon from './components/Icon.vue'
 import Sidebar from './components/Sidebar.vue'
@@ -22,7 +22,26 @@ import { usePiEnv } from './composables/usePiEnv.js'
 import { useConfirm } from './composables/useConfirm.js'
 
 const groups = ref(loadGroups())
-const activeId = ref(loadActiveId())
+const { prefs: initialPrefs, needsMigration: prefsNeedMigration } = loadPrefsBundle()
+
+function matchGroupIdForEnterCode(code, list) {
+  if (code === 'translate') {
+    const t = list.find(g => g.kind === 'translate' || g.id === 'translate' || g.name === '翻译')
+    return t ? t.id : ''
+  }
+  if (code === 'chat' || code === 'agent') {
+    const t = list.find(g => g.kind === code || g.id === code)
+    return t ? t.id : ''
+  }
+  return ''
+}
+
+const queuedEnterInit = typeof window !== 'undefined' ? window.__pideckEnterQueue : null
+const initEnterTarget = (queuedEnterInit && queuedEnterInit.length)
+  ? matchGroupIdForEnterCode(String((queuedEnterInit[queuedEnterInit.length - 1] || {}).code || ''), groups.value)
+  : ''
+const resolvedInitId = initEnterTarget || (groups.value.some(g => g.id === initialPrefs.activeId) ? initialPrefs.activeId : (groups.value[0] && groups.value[0].id) || 'chat')
+const activeId = ref(resolvedInitId)
 const activeGroup = computed(() => groups.value.find(g => g.id === activeId.value) || groups.value[0])
 
 const sessions = ref([])
@@ -90,7 +109,7 @@ async function checkDefaultAuth(force) {
   if (!provider || !window.piBridge || !window.piBridge.configAuthCheck) return
   const cacheKey = 'auth_' + provider.replace(/[^a-z0-9_-]/gi, '_')
   if (!force) {
-    const cached = readCacheMeta(cacheKey)
+    const cached = await readCacheMetaAsync(cacheKey)
     if (cached && cached.fresh && cached.data && cached.data.status) {
       const st = cached.data.status
       if (st === 'ready') { defaultAuthOk.value = true; return }
@@ -122,6 +141,7 @@ const {
   defaultCwd, setDefaultCwd, commitDefaultCwd, pickDefaultCwd,
   sendKeyMode, setSendKeyMode, displayCwd, clearCwdDisplayCache, layout, setLayout,
 } = usePrefs({
+  initialPrefs,
   showToast,
   onCwdChange: () => {
     loadSkillsAsync()
@@ -132,7 +152,7 @@ const {
 
 const {
   models, skills, piStatus, engine, rpcStatus, defaults, envInfo, showEnvHelp,
-  hydrateFromCache, loadDefaults, loadModelsAsync, refreshModels, loadSkillsAsync,
+  hydrateFromCacheAsync, loadDefaults, loadModelsAsync, refreshModels, loadSkillsAsync,
   loadEnvAsync, recheckEnv, installPi, prewarmActive, setEngine, openPath, openExternal,
   getLastSkillsCwd,
 } = usePiEnv({
@@ -214,16 +234,24 @@ function onEsc() {
   }
 }
 
-function onEnterEvent(e) {
+function onEnterEvent(e, opts) {
   const q = window.__pideckEnterQueue
   const i = q ? q.indexOf(e.detail) : -1
   if (i >= 0) q.splice(i, 1)
-  handleEnter(e.detail || e)
+  handleEnter(e.detail || e, opts)
 }
 
 let idleTimers = []
 let unmounted = false
 let initialMountDone = false
+let enteredOnMount = false
+let enteredGroupId = ''
+let userTouchedInput = false
+let restoringDraft = false
+
+function perfNow() {
+  return (typeof performance !== 'undefined' && typeof performance.now === 'function') ? performance.now() : Date.now()
+}
 
 function scheduleIdle(fn, delay = 0) {
   const run = () => {
@@ -240,20 +268,14 @@ function scheduleIdle(fn, delay = 0) {
 }
 
 onMounted(() => {
-  // T0：同步首帧水合与焦点就绪（零阻塞，不派生子进程、不扫描目录）
-  if (window.piBridge && window.piBridge.getConfig) {
-    engine.value = (window.piBridge.getConfig() || {}).engine || 'json'
-  }
+  // T0：仅做内存态就绪与聚焦（零同步磁盘 I/O、零额外同步 IPC）
   window.addEventListener('pideck:enter', onEnterEvent)
   const queued = window.__pideckEnterQueue || []
   if (queued.length) {
-    while (queued.length) onEnterEvent({ detail: queued[0] })
-  } else {
-    refreshSessions()
-    restoreDraft()
+    enteredOnMount = true
+    while (queued.length) onEnterEvent({ detail: queued[0] }, { deferIo: true })
+    enteredGroupId = activeId.value
   }
-  const cacheState = hydrateFromCache()
-  initialMountDone = true
 
   window.utools && window.utools.onPluginOut && window.utools.onPluginOut(isKill => {
     clearTimeout(draftTimer)
@@ -279,13 +301,67 @@ onMounted(() => {
   composerEl.value && composerEl.value.focusInput()
   requestAnimationFrame(() => { composerEl.value && composerEl.value.focusInput() })
   window.addEventListener('keydown', onGlobalKey)
+  initialMountDone = true
 
-  // T1/T2：首帧绘制后异步探测环境，并按空闲优先级交错刷新，不争抢冷启动 CPU
+  // T1/T2：首帧绘制后异步水合会话、草稿、缓存与环境，不阻塞 did-finish-load
   requestAnimationFrame(() => {
+    const perf = window.__pideckPerf = window.__pideckPerf || {}
+    perf.firstPaint = perfNow()
+    if (typeof perf.preloadStart === 'number') {
+      perf.toFirstPaintMs = Number((perf.firstPaint - perf.preloadStart).toFixed(2))
+    }
+
     setTimeout(async () => {
       if (unmounted) return
+
+      if (prefsNeedMigration) {
+        savePrefsBundle({
+          defaultCwd: defaultCwd.value,
+          sendKey: sendKeyMode.value,
+          layout: layout.value,
+          activeId: activeId.value,
+        })
+      } else if (activeId.value !== initialPrefs.activeId) {
+        saveActiveId(activeId.value)
+      }
+
+      const [cfg, cacheState, drafts] = await Promise.all([
+        (window.piBridge && window.piBridge.getConfigAsync)
+          ? window.piBridge.getConfigAsync().catch(() => ({}))
+          : Promise.resolve((window.piBridge && window.piBridge.getConfig) ? (window.piBridge.getConfig() || {}) : {}),
+        hydrateFromCacheAsync(),
+        readLocalAsync('pideck.drafts.v1', {}),
+      ])
+      if (unmounted) return
+
+      engine.value = (cfg && cfg.engine) || 'json'
+      // 仅刷新索引列表，不重置 currentSession，避免用户首帧已开始对话时被清屏
+      sessions.value = listSessions(activeId.value)
+
+      if (enteredOnMount) {
+        const targetDraftId = enteredGroupId || activeId.value
+        if (drafts && typeof drafts === 'object' && drafts[targetDraftId]) {
+          drafts[targetDraftId] = ''
+          saveDrafts(drafts)
+        }
+      } else if (!userTouchedInput && !inputText.value && drafts && typeof drafts === 'object' && drafts[activeId.value]) {
+        restoringDraft = true
+        inputText.value = drafts[activeId.value]
+        restoringDraft = false
+      }
+
+      perf.hydrated = perfNow()
+      if (typeof perf.preloadStart === 'number') {
+        perf.toHydratedMs = Number((perf.hydrated - perf.preloadStart).toFixed(2))
+      }
+
       await loadEnvAsync()
       if (unmounted) return
+
+      perf.envReady = perfNow()
+      if (typeof perf.preloadStart === 'number') {
+        perf.toEnvReadyMs = Number((perf.envReady - perf.preloadStart).toFixed(2))
+      }
 
       if (envInfo.value && envInfo.value.ok) {
         if (engine.value === 'rpc') maybePrewarmRpc()
@@ -334,23 +410,17 @@ function openHistory() {
 }
 let filesReqSeq = 0
 async function refreshFiles() {
-  if (!window.piBridge) return
+  if (!window.piBridge || !window.piBridge.listFilesAsync) return
   const seq = ++filesReqSeq
   const cwd = effectiveGroupCwd(activeGroup.value)
-  if (window.piBridge.listFilesAsync) {
-    filesLoading.value = true
-    try {
-      const list = await window.piBridge.listFilesAsync(cwd)
-      if (seq === filesReqSeq) files.value = list || []
-    } catch (_) {
-      if (seq === filesReqSeq) files.value = []
-    } finally {
-      if (seq === filesReqSeq) filesLoading.value = false
-    }
-    return
-  }
-  if (window.piBridge.listFiles) {
-    try { files.value = window.piBridge.listFiles(cwd) || [] } catch (_) { files.value = [] }
+  filesLoading.value = true
+  try {
+    const list = await window.piBridge.listFilesAsync(cwd)
+    if (seq === filesReqSeq) files.value = list || []
+  } catch (_) {
+    if (seq === filesReqSeq) files.value = []
+  } finally {
+    if (seq === filesReqSeq) filesLoading.value = false
   }
 }
 function refreshSessions() {
@@ -358,8 +428,9 @@ function refreshSessions() {
   currentSession.value = null
 }
 
-function handleEnter(action) {
+function handleEnter(action, opts) {
   if (running.value) { showToast('当前回答生成中，请先停止'); return }
+  const deferIo = !!(opts && opts.deferIo)
   const code = String(action.code || '')
   const type = String(action.type || '')
   const payload = action.payload
@@ -378,7 +449,7 @@ function handleEnter(action) {
   pendingRegenerate = false
   historyFallbackNotified = false
   files.value = []
-  refreshSessions()
+  if (!deferIo) refreshSessions()
   resetPaging()
   showHistory.value = false
   if (initialMountDone && engine.value === 'rpc' && envInfo.value && envInfo.value.ok) maybePrewarmRpc()
@@ -388,10 +459,12 @@ function handleEnter(action) {
   }
 
   inputText.value = ''
-  const drafts = loadDrafts()
-  if (drafts[activeId.value]) {
-    drafts[activeId.value] = ''
-    saveDrafts(drafts)
+  if (!deferIo) {
+    const drafts = loadDrafts()
+    if (drafts[activeId.value]) {
+      drafts[activeId.value] = ''
+      saveDrafts(drafts)
+    }
   }
   errorMsg.value = ''
   previewImage.value = ''
@@ -431,10 +504,15 @@ function selectGroup(id, opts) {
   restoreDraft()
   if (engine.value === 'rpc') maybePrewarmRpc()
 }
-watch(activeId, id => saveActiveId(id))
+watch(activeId, id => {
+  if (!initialMountDone) return
+  saveActiveId(id)
+})
 
 let draftTimer = null
 watch(inputText, () => {
+  if (restoringDraft) return
+  if (initialMountDone) userTouchedInput = true
   clearTimeout(draftTimer)
   draftTimer = setTimeout(saveCurrentDraft, 500)
 })
@@ -445,7 +523,9 @@ function saveCurrentDraft() {
 }
 function restoreDraft() {
   const d = loadDrafts()
+  restoringDraft = true
   inputText.value = d[activeId.value] || ''
+  restoringDraft = false
 }
 
 function loadSession(id) {
@@ -803,15 +883,9 @@ function toolForSend(g) {
     mcpServers: src.mcpServers || '',
     skillNames: (src.skillNames || []).slice(),
   }
-  if (t.skills === 'some') {
-    let pool = skills.value
-    if (g && g.cwd && (!activeGroup.value || g.cwd !== activeGroup.value.cwd) && window.piBridge && window.piBridge.listSkills) {
-      try { pool = window.piBridge.listSkills(effectiveGroupCwd(g)) || pool } catch (_) {}
-    }
-    t.skillPaths = (t.skillNames || []).map(n => (pool.find(x => x.name === n) || {}).dir).filter(Boolean)
-  } else {
-    t.skillPaths = []
-  }
+  t.skillPaths = t.skills === 'some'
+    ? (t.skillNames || []).map(n => (skills.value.find(x => x.name === n) || {}).dir).filter(Boolean)
+    : []
   return t
 }
 
@@ -1049,7 +1123,6 @@ function onConfigSaved() {
 
     <HistoryDrawer
       v-if="showHistory"
-      :show="showHistory"
       :sessions="sessions"
       :current-session-id="currentSession ? currentSession.id : ''"
       :confirm-delete-id="deleteConfirmId"
@@ -1061,7 +1134,6 @@ function onConfigSaved() {
     <SettingsModal
       v-if="showSettings"
       ref="settingsModalEl"
-      :show="showSettings"
       :groups="groups"
       :models="models"
       :skills="skills"

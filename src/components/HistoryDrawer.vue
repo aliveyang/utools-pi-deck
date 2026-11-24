@@ -1,11 +1,10 @@
 <script setup>
-import { ref, toRef, watch, nextTick } from 'vue'
+import { ref, toRef, watch, nextTick, onMounted } from 'vue'
 import { relTime } from '../sessions.js'
 import { useSessionFilter } from '../composables/useSessionFilter.js'
 import Icon from './Icon.vue'
 
 const props = defineProps({
-  show: { type: Boolean, default: false },
   sessions: { type: Array, default: () => [] },
   currentSessionId: { type: String, default: '' },
   confirmDeleteId: { type: String, default: '' },
@@ -16,12 +15,7 @@ const searchEl = ref(null)
 const historyIndex = ref(0)
 const { search, filteredSessions, groupedSessions } = useSessionFilter(toRef(props, 'sessions'))
 
-watch(() => props.show, val => {
-  if (!val) return
-  search.value = ''
-  historyIndex.value = 0
-  nextTick(() => searchEl.value && searchEl.value.focus())
-}, { immediate: true })
+onMounted(() => { nextTick(() => searchEl.value && searchEl.value.focus()) })
 watch(search, () => { historyIndex.value = 0 })
 
 function moveHistory(delta) {
@@ -46,7 +40,7 @@ function isFocusedSession(s) {
 </script>
 
 <template>
-  <div v-if="show" class="drawer-mask" @click.self="emit('close')">
+  <div class="drawer-mask" @click.self="emit('close')">
     <aside class="drawer" @keydown.down.prevent="moveHistory(1)" @keydown.up.prevent="moveHistory(-1)" @keydown.enter.prevent="openHistoryActive">
       <div class="drawer-head">
         <Icon name="search" :size="13" class="drawer-search-ico" />

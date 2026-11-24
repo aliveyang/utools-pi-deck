@@ -71,17 +71,6 @@ function syncPost(path) { return syncReq('POST', path) }
 
 let homedir = (syncGet('/homedir') || {}).homedir || ''
 
-// dev 侧生效目录计算（纯计算，无落盘副作用），effectiveCwd/resolveCwd 共用
-function devCwd(p) {
-  const dir = p || ''
-  const base = homedir || ''
-  if (!dir && base) {
-    const sep = base.includes('\\') ? '\\' : '/'
-    return base.replace(/[\\/]+$/, '') + sep + 'MyPiDeck'
-  }
-  return dir || base
-}
-
 function listModelsAsync() {
   // 与 preload.listModelsAsync 对齐：强制绕过 dev-server 的 60s TTL 缓存
   return fetch(BASE + '/models?force=1').then(r => r.json())
@@ -95,17 +84,11 @@ window.piBridge = {
   pickFiles: () => null,
   pickExecutable: () => null,
   validateCwd: p => !!(p),
-  effectiveCwd: devCwd,
-  resolveCwd: devCwd,
-  listSkills: cwd => syncGet('/skills?cwd=' + encodeURIComponent(cwd || '')) || [],
   listSkillsAsync: async cwd => {
     try { return await fetch(BASE + '/skills?cwd=' + encodeURIComponent(cwd || '')).then(r => r.json()) }
     catch (_) { return [] }
   },
-  listModels: () => syncGet('/models') || [],
   listModelsAsync,
-  refreshModels: () => syncGet('/models?force=1') || [],
-  listFiles: (cwd, query) => syncGet('/files?cwd=' + encodeURIComponent(cwd || '') + '&q=' + encodeURIComponent(query || '')) || [],
   listFilesAsync: async (cwd, query) => {
     try { return await fetch(BASE + '/files?cwd=' + encodeURIComponent(cwd || '') + '&q=' + encodeURIComponent(query || '')).then(r => r.json()) }
     catch (_) { return [] }
@@ -118,9 +101,6 @@ window.piBridge = {
   deletePiSession: id => {
     try { return syncPost('/delete-session?id=' + encodeURIComponent(id || '')) || { ok: false } }
     catch (_) { return { ok: false } }
-  },
-  getEnv: () => {
-    try { return syncGet('/env') || {} } catch (_) { return {} }
   },
   getEnvAsync: async () => {
     try { return await fetch(BASE + '/env').then(r => r.json()) }
@@ -148,6 +128,7 @@ window.piBridge = {
       return { data: e.data, fresh: ageMs <= 5 * 60 * 1000, ageMs }
     } catch (_) { return null }
   },
+  readCacheMetaAsync: key => Promise.resolve(window.piBridge.readCacheMeta(key)),
   readCache: key => {
     const meta = window.piBridge.readCacheMeta(key)
     return (meta && meta.fresh) ? meta.data : null
@@ -160,17 +141,18 @@ window.piBridge = {
     try { const raw = localStorage.getItem(key); return raw == null ? fallback : JSON.parse(raw) }
     catch (_) { return fallback }
   },
+  readLocalAsync: (key, fallback) => Promise.resolve(window.piBridge.readLocal(key, fallback)),
   writeLocal: (key, value) => {
     try { localStorage.setItem(key, JSON.stringify(value)); return true }
     catch (_) { return false }
   },
   // dev 模式不启用 RPC（走 dev-server JSON），保留接口形状一致
   getConfig: () => ({ engine: 'json' }),
+  getConfigAsync: () => Promise.resolve({ engine: 'json' }),
   setConfig: () => ({}),
   prewarmRpc: () => Promise.resolve(false),
   stopRpc: () => {},
   getRpcDefaults: () => null,
-  resolvePi: () => syncGet('/resolve') || { ok: false, error: 'dev API 不可用' },
   resolvePiAsync: async () => {
     try { return await fetch(BASE + '/resolve').then(r => r.json()) }
     catch (_) { return { ok: false, error: 'dev API 不可用' } }

@@ -34,6 +34,7 @@ function createRunner(deps = {}) {
   const path = deps.path || nodePath
 
   let currentChild = null
+  let activeJsonCancel = null
   let activeRpcCancel = null
 
   // 包装 handlers：工具级立即落盘，运行结束补一条汇总（幂等收口）
@@ -81,15 +82,17 @@ function createRunner(deps = {}) {
     }
   }
 
-  // 打开终端执行登录命令：Windows 写插件临时目录 .cmd 规避引号转义，macOS 走 AppleScript
+  // 打开终端执行登录命令：Windows 写插件临时目录 .cmd 规避引号转义（转义 % 并拒绝换行），macOS 走 AppleScript
   function openTerminal(command) {
     const safeCmd = String(command || '').trim()
-    if (!safeCmd) return false
+    if (!safeCmd || /[\r\n\0]/.test(safeCmd)) return false
     try {
       if (process.platform === 'win32') {
         fs.mkdirSync(tempDir, { recursive: true })
         const file = path.join(tempDir, `pideck-login-${process.pid}.cmd`)
-        fs.writeFileSync(file, `@echo off\r\n${safeCmd}\r\n`, { encoding: 'utf8', mode: 0o600 })
+        if (/["\r\n\0]/.test(file)) return false
+        const batchCmd = safeCmd.replace(/%/g, '%%')
+        fs.writeFileSync(file, `@echo off\r\n${batchCmd}\r\n`, { encoding: 'utf8', mode: 0o600 })
         // start 的第一个参数是窗口标题（空串）；文件路径加引号以兼容含空格的目录
         const child = spawn('cmd.exe', ['/c', 'start', '', 'cmd.exe', '/k', `"${file}"`], {
           detached: true, stdio: 'ignore', windowsHide: false,
@@ -187,7 +190,14 @@ function createRunner(deps = {}) {
 
     const release = () => {
       if (currentChild === child) currentChild = null
+      if (activeJsonCancel === doJsonCancel) activeJsonCancel = null
     }
+    const doJsonCancel = () => {
+      aborted = true
+      release()
+      try { child.kill() } catch (_) {}
+    }
+    activeJsonCancel = doJsonCancel
     child.on('error', err => {
       settled = true
       release()
@@ -196,9 +206,9 @@ function createRunner(deps = {}) {
     child.on('close', code => {
       release()
       if (!settled) {
-        settled = true
         if (aborted) finish({ aborted: true })
         else {
+          settled = true
           const msg = stderr.trim()
           wrapped.onError && wrapped.onError(msg ? `pi 退出（code ${code}）：${msg.slice(-1200)}` : `pi 退出（code ${code}）`)
         }
@@ -220,12 +230,7 @@ function createRunner(deps = {}) {
     child.on('close', () => clearTimeout(timer))
 
     return {
-      cancel: () => {
-        aborted = true
-        // 立即释放，避免 kill→close 窗口期内新发送被"任务运行中"拒绝
-        if (currentChild === child) currentChild = null
-        try { child.kill() } catch (_) {}
-      },
+      cancel: doJsonCancel,
       mode: 'json',
       sessionResumed,
     }
@@ -235,6 +240,10 @@ function createRunner(deps = {}) {
     if (activeRpcCancel) {
       const fn = activeRpcCancel
       activeRpcCancel = null
+      try { fn(); return true } catch (_) { return false }
+    }
+    if (activeJsonCancel) {
+      const fn = activeJsonCancel
       try { fn(); return true } catch (_) { return false }
     }
     if (!currentChild) return false

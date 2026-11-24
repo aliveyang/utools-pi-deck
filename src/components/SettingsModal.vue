@@ -1,14 +1,13 @@
 <script setup>
 // 设置模态框外壳：4 个子 Tab（对话默认 / 分组 / 环境与模型 / 操作记录）
-import { ref, watch, nextTick } from 'vue'
+import { ref, nextTick } from 'vue'
 import Icon from './Icon.vue'
 import SettingsGeneralTab from './SettingsGeneralTab.vue'
 import SettingsGroupsTab from './SettingsGroupsTab.vue'
 import SettingsModelTab from './SettingsModelTab.vue'
 import SettingsAuditTab from './SettingsAuditTab.vue'
 
-const props = defineProps({
-  show: { type: Boolean, default: false },
+defineProps({
   groups: { type: Array, default: () => [] },
   models: { type: Array, default: () => [] },
   skills: { type: Array, default: () => [] },
@@ -38,23 +37,7 @@ const SETTINGS_TABS = [
 
 const settingsTab = ref('general')
 const editingGroup = ref(null)
-const generalTabEl = ref(null)
 const groupsTabEl = ref(null)
-const modelTabEl = ref(null)
-const auditTabEl = ref(null)
-
-watch(() => props.show, val => {
-  if (val) {
-    settingsTab.value = 'general'
-    editingGroup.value = null
-  } else {
-    editingGroup.value = null
-    generalTabEl.value && generalTabEl.value.reset()
-    groupsTabEl.value && groupsTabEl.value.clearEditing()
-    modelTabEl.value && modelTabEl.value.clearKeyDraft()
-    auditTabEl.value && auditTabEl.value.reset()
-  }
-})
 
 function switchTab(id) {
   settingsTab.value = id
@@ -83,7 +66,7 @@ defineExpose({ handleEsc, openTab })
 </script>
 
 <template>
-  <div v-if="show" class="modal-mask" @click.self="emit('close')">
+  <div class="modal-mask" @click.self="emit('close')">
     <div class="modal" :class="{ wide: settingsTab === 'groups' && !editingGroup }">
       <div class="modal-head">
         <button v-if="editingGroup" class="back-btn" @click="groupsTabEl && groupsTabEl.clearEditing()" title="返回分组列表"><Icon name="back" :size="13" /></button>
@@ -101,7 +84,6 @@ defineExpose({ handleEsc, openTab })
 
       <SettingsGeneralTab
         v-if="settingsTab === 'general'"
-        ref="generalTabEl"
         :layout="layout"
         :engine="engine"
         :rpc-status="rpcStatus"
@@ -135,7 +117,6 @@ defineExpose({ handleEsc, openTab })
 
       <SettingsModelTab
         v-else-if="settingsTab === 'diag'"
-        ref="modelTabEl"
         :env-info="envInfo"
         @config-saved="emit('configSaved')"
         @notify="emit('notify', $event)"
@@ -148,7 +129,6 @@ defineExpose({ handleEsc, openTab })
 
       <SettingsAuditTab
         v-else
-        ref="auditTabEl"
         @notify="emit('notify', $event)"
         @open-path="emit('openPath', $event)"
       />

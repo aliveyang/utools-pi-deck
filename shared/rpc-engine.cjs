@@ -4,6 +4,14 @@ const childProcess = require('node:child_process')
 const defaultCore = require('./pi-core.cjs')
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'avif'])
+const DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+function mimeTypeForExt(ext) {
+  const e = String(ext || '').toLowerCase()
+  if (e === 'jpg' || e === 'jpeg') return 'image/jpeg'
+  if (e === 'svg') return 'image/svg+xml'
+  return 'image/' + (e || 'png')
+}
 
 function isImageFile(f) {
   if (typeof f !== 'string' || !f) return false
@@ -22,6 +30,7 @@ function createRpcEngine(deps = {}) {
   const IDLE_TTL = deps.idleTtl ?? (10 * 60 * 1000)
   const MAX_PROCS = deps.maxProcs ?? 3
   const CLEANUP_INTERVAL = deps.cleanupInterval ?? (60 * 1000)
+  const MAX_IMAGE_BYTES = deps.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES
 
   const processes = new Map() // key -> entry
   let seq = 0
@@ -155,6 +164,23 @@ function createRpcEngine(deps = {}) {
     if (!entry || !entry.alive || !entry.ready) throw new Error('RPC 未预热')
     if (isBusy(entry)) throw new Error('RPC 进程忙碌中')
 
+    // 图片：在注册 listener / watchdog 前先同步校验大小并读取，超限或失败直接抛错触发上层回退 JSON
+    const images = []
+    for (const f of (o.files || [])) {
+      if (f.startsWith('data:')) {
+        const m = /^data:image\/([a-zA-Z0-9+.-]+);base64,(.*)$/s.exec(f)
+        if (m) images.push({ type: 'image', data: m[2], mimeType: mimeTypeForExt(m[1]) })
+      } else {
+        const st = core.fs.statSync(f)
+        if (st.size > MAX_IMAGE_BYTES) {
+          throw new Error(`图片过大（${(st.size / 1048576).toFixed(1)}MB），回退标准模式`)
+        }
+        const data = core.fs.readFileSync(f)
+        const ext = core.path.extname(f).slice(1).toLowerCase()
+        images.push({ type: 'image', data: data.toString('base64'), mimeType: mimeTypeForExt(ext) })
+      }
+    }
+
     const applyCfg = async () => {
       // PiDeck 会话切换时先重置进程内对话；未传 sessionId 时也强制重置防止串上下文
       if (!o.sessionId || (entry.sessionId || '') !== (o.sessionId || '')) {
@@ -215,21 +241,6 @@ function createRpcEngine(deps = {}) {
     // 进程中途退出：立即报错收口，不等 15 分钟 watchdog
     const onExit = () => fail('RPC 进程已退出，本次回答中断')
     entry.child.once('exit', onExit)
-
-    // 图片：RPC 不支持 @file，用 images 字段
-    const images = []
-    for (const f of (o.files || [])) {
-      try {
-        if (f.startsWith('data:')) {
-          const m = /^data:image\/([a-zA-Z0-9+.-]+);base64,(.*)$/s.exec(f)
-          if (m) images.push({ type: 'image', data: m[2], mimeType: 'image/' + m[1] })
-        } else {
-          const data = core.fs.readFileSync(f)
-          const ext = core.path.extname(f).slice(1).toLowerCase()
-          images.push({ type: 'image', data: data.toString('base64'), mimeType: 'image/' + (ext === 'jpg' ? 'jpeg' : ext || 'png') })
-        }
-      } catch (_) {}
-    }
 
     applyCfg()
       .then(() => {
@@ -305,6 +316,5 @@ const defaultEngine = createRpcEngine()
 module.exports = {
   ...defaultEngine,
   createRpcEngine,
-  isImageFile,
   hasNonImageFiles,
 }

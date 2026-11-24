@@ -1,6 +1,7 @@
 // 本地存储与安全校验：缓存、配置、本机状态、临时图片落盘/清理、外链与路径白名单校验
 // 职责：把业务逻辑与本机临时/持久化存储从 preload.js 剥离，避免非用户数据写入同步数据库
 const fs = require('node:fs')
+const fsp = fs.promises
 const path = require('node:path')
 const os = require('node:os')
 
@@ -78,6 +79,15 @@ function readJsonObject(file) {
   }
 }
 
+async function readJsonObjectAsync(file) {
+  try {
+    const parsed = JSON.parse(await fsp.readFile(file, 'utf8'))
+    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : null
+  } catch (_) {
+    return null
+  }
+}
+
 function writeJsonAtomic(file, data, opts) {
   const options = typeof opts === 'boolean' ? { pretty: opts } : (opts || {})
   const pretty = !!options.pretty
@@ -130,6 +140,16 @@ function createLocalStore(options = {}) {
     const file = cacheFilePath(key)
     if (!file) return null
     const entry = readJsonObject(file)
+    if (!entry || typeof entry.t !== 'number' || entry.data === undefined) return null
+    const ageMs = Math.max(0, now() - entry.t)
+    if (ageMs > staleTtl) return null
+    return { data: entry.data, fresh: ageMs <= cacheTtl, ageMs }
+  }
+
+  async function readCacheMetaAsync(key) {
+    const file = cacheFilePath(key)
+    if (!file) return null
+    const entry = await readJsonObjectAsync(file)
     if (!entry || typeof entry.t !== 'number' || entry.data === undefined) return null
     const ageMs = Math.max(0, now() - entry.t)
     if (ageMs > staleTtl) return null
@@ -191,6 +211,27 @@ function createLocalStore(options = {}) {
     return {}
   }
 
+  async function loadConfigAsync() {
+    try {
+      const st = await fsp.stat(configFile)
+      if (_cfgCache && _cfgCacheMtime === st.mtimeMs) return _cfgCache
+      const primary = await readJsonObjectAsync(configFile)
+      if (primary) {
+        _cfgCache = primary
+        _cfgCacheMtime = st.mtimeMs
+        return primary
+      }
+    } catch (_) {
+      _cfgCache = null
+      _cfgCacheMtime = -1
+    }
+    if (legacyConfigFile && legacyConfigFile !== configFile) {
+      const legacy = await readJsonObjectAsync(legacyConfigFile)
+      if (legacy) return legacy
+    }
+    return {}
+  }
+
   function saveConfig(patch) {
     const next = { ...loadConfig(), ...(patch && typeof patch === 'object' ? patch : {}) }
     if (writeJsonAtomic(configFile, next, true)) {
@@ -207,10 +248,25 @@ function createLocalStore(options = {}) {
     return dict
   }
 
+  async function loadLocalDictAsync() {
+    if (_localDictCache) return _localDictCache
+    const dict = await readJsonObjectAsync(localStateFile)
+    if (dict) _localDictCache = dict
+    return dict
+  }
+
   function readLocal(key, fallback) {
     const k = String(key || '')
     if (!k) return fallback
     const dict = loadLocalDict()
+    if (!dict || !Object.prototype.hasOwnProperty.call(dict, k)) return fallback
+    return dict[k] === undefined ? fallback : dict[k]
+  }
+
+  async function readLocalAsync(key, fallback) {
+    const k = String(key || '')
+    if (!k) return fallback
+    const dict = await loadLocalDictAsync()
     if (!dict || !Object.prototype.hasOwnProperty.call(dict, k)) return fallback
     return dict[k] === undefined ? fallback : dict[k]
   }
@@ -301,12 +357,15 @@ function createLocalStore(options = {}) {
     imageDir,
     readCache,
     readCacheMeta,
+    readCacheMetaAsync,
     writeCache,
     removeCache,
     clearCache,
     loadConfig,
+    loadConfigAsync,
     saveConfig,
     readLocal,
+    readLocalAsync,
     writeLocal,
     removeLocal,
     cleanupImages,
@@ -326,11 +385,5 @@ module.exports = {
   isAllowedExternalUrl,
   isPathWithinRoot,
   resolveSafeOpenTarget,
-  readJsonObject,
   writeJsonAtomic,
-  DEFAULT_CACHE_TTL,
-  DEFAULT_STALE_TTL,
-  DEFAULT_MAX_IMAGE_BYTES,
-  IMAGE_MAX_AGE_MS,
-  ALLOWED_IMAGE_EXTS,
 }

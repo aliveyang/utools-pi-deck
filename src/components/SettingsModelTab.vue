@@ -248,12 +248,7 @@ function applyPathOverrides() {
   emit('recheckEnv')
 }
 
-function clearKeyDraft() {
-  cfgKey.value = ''
-}
-
 onMounted(loadCfg)
-defineExpose({ loadCfg, clearKeyDraft })
 </script>
 
 <template>

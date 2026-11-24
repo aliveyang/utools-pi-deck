@@ -80,13 +80,14 @@ function listItemIds() {
 }
 
 // 索引损坏/丢失但单会话仍在时，从 item key 重建，避免会话"集体消失"
+// 空库时也写回 []，防止每次冷启动都重复触发 allDocs 全库扫描
 function rebuildIndex() {
   const idx = []
   for (const id of listItemIds()) {
     const s = read(itemKey(id), null)
     if (s && s.id) idx.push(stripMessages(s))
   }
-  if (idx.length) writeIndex(idx)
+  writeIndex(idx)
   return idx
 }
 

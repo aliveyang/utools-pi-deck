@@ -1,6 +1,6 @@
 // Pi 运行环境：引擎、模型、技能、默认值、环境诊断与终端一键安装
 import { ref } from 'vue'
-import { readCacheMeta, writeCache } from '../storage.js'
+import { readCacheMetaAsync, writeCache } from '../storage.js'
 import { PI_INSTALL_CMD } from '../constants.js'
 
 export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
@@ -26,13 +26,10 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
     }
   }
 
-  function hydrateFromCache() {
-    const cwd = getCwd ? (getCwd() || '') : ''
-    const mMeta = readCacheMeta('models')
+  function applyHydratedCache(cwd, { mMeta, sMeta, dMeta, eMeta }) {
     if (mMeta && Array.isArray(mMeta.data)) models.value = mMeta.data
 
     let skillsFresh = false
-    const sMeta = readCacheMeta('skills')
     if (sMeta && sMeta.data) {
       if (Array.isArray(sMeta.data)) {
         skills.value = sMeta.data
@@ -47,12 +44,10 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
       }
     }
 
-    const dMeta = readCacheMeta('defaults')
     if (dMeta && dMeta.data && !dMeta.data.error) {
       defaults.value = dMeta.data
     }
 
-    const eMeta = readCacheMeta('env')
     if (eMeta && eMeta.data) {
       envInfo.value = eMeta.data
       if (eMeta.data.ok) {
@@ -72,6 +67,17 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
     }
   }
 
+  async function hydrateFromCacheAsync() {
+    const [mMeta, sMeta, dMeta, eMeta] = await Promise.all([
+      readCacheMetaAsync('models'),
+      readCacheMetaAsync('skills'),
+      readCacheMetaAsync('defaults'),
+      readCacheMetaAsync('env'),
+    ])
+    const cwd = getCwd ? (getCwd() || '') : ''
+    return applyHydratedCache(cwd, { mMeta, sMeta, dMeta, eMeta })
+  }
+
   function syncDefaultsFromRpc() {
     if (!window.piBridge || !window.piBridge.getRpcDefaults) return false
     try {
@@ -88,7 +94,7 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
   // 读取 pi 实际生效的默认模型/思考强度，优先复用已预热 RPC 或 settings.json，避免冷启动额外派生子进程
   async function loadDefaults(force) {
     if (!force) {
-      const dMeta = readCacheMeta('defaults')
+      const dMeta = await readCacheMetaAsync('defaults')
       if (dMeta && dMeta.fresh && dMeta.data && !dMeta.data.error) {
         defaults.value = dMeta.data
         return
@@ -111,7 +117,7 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
   async function loadModelsAsync(opts = {}) {
     const force = !!(opts && opts.force)
     if (!force) {
-      const mMeta = readCacheMeta('models')
+      const mMeta = await readCacheMetaAsync('models')
       if (mMeta && mMeta.fresh && Array.isArray(mMeta.data)) {
         if (!models.value.length) models.value = mMeta.data
         return mMeta.data
@@ -120,9 +126,8 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
     if (modelsLoadingPromise) return modelsLoadingPromise
     modelsLoadingPromise = (async () => {
       try {
-        let list = null
-        if (window.piBridge && window.piBridge.listModelsAsync) list = await window.piBridge.listModelsAsync()
-        else if (window.piBridge && window.piBridge.listModels) list = window.piBridge.listModels()
+        const list = (window.piBridge && window.piBridge.listModelsAsync)
+          ? await window.piBridge.listModelsAsync() : null
         if (list) { models.value = list; writeCache('models', list) }
         return list
       } catch (_) {
@@ -137,10 +142,8 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
 
   async function refreshModels() {
     try {
-      let list = null
-      if (window.piBridge && window.piBridge.listModelsAsync) list = await window.piBridge.listModelsAsync()
-      else if (window.piBridge && window.piBridge.refreshModels) list = window.piBridge.refreshModels()
-      else if (window.piBridge && window.piBridge.listModels) list = window.piBridge.listModels()
+      const list = (window.piBridge && window.piBridge.listModelsAsync)
+        ? await window.piBridge.listModelsAsync() : null
       if (list) { models.value = list; writeCache('models', list) }
       await loadDefaults(true)
       showToast('模型列表已刷新')
@@ -151,7 +154,7 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
     const force = !!(opts && opts.force)
     const cwd = getCwd ? (getCwd() || '') : ''
     if (!force) {
-      const sMeta = readCacheMeta('skills')
+      const sMeta = await readCacheMetaAsync('skills')
       if (sMeta && sMeta.fresh && sMeta.data && !Array.isArray(sMeta.data) && (sMeta.data.cwd || '') === cwd && Array.isArray(sMeta.data.list)) {
         skills.value = sMeta.data.list
         lastSkillsCwd = cwd
@@ -159,9 +162,8 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
       }
     }
     try {
-      let list = null
-      if (window.piBridge && window.piBridge.listSkillsAsync) list = await window.piBridge.listSkillsAsync(cwd)
-      else if (window.piBridge && window.piBridge.listSkills) list = window.piBridge.listSkills(cwd)
+      const list = (window.piBridge && window.piBridge.listSkillsAsync)
+        ? await window.piBridge.listSkillsAsync(cwd) : null
       if (list) {
         skills.value = list
         lastSkillsCwd = cwd
@@ -190,21 +192,12 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
     }
   }
 
-  function loadEnv() {
-    if (!window.piBridge || !window.piBridge.getEnv) return
-    try {
-      applyEnvResult(window.piBridge.getEnv())
-    } catch (_) { envInfo.value = null }
-  }
-
   async function loadEnvAsync() {
     if (envLoadingPromise) return envLoadingPromise
     if (!window.piBridge) return null
     envLoadingPromise = (async () => {
       try {
-        const env = window.piBridge.getEnvAsync
-          ? await window.piBridge.getEnvAsync()
-          : (window.piBridge.getEnv ? window.piBridge.getEnv() : null)
+        const env = window.piBridge.getEnvAsync ? await window.piBridge.getEnvAsync() : null
         applyEnvResult(env)
         return env
       } catch (_) {
@@ -302,8 +295,8 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
 
   return {
     models, skills, piStatus, engine, rpcStatus, defaults, envInfo, showEnvHelp,
-    hydrateFromCache, loadDefaults, loadModelsAsync, refreshModels, loadSkillsAsync,
-    loadEnv, loadEnvAsync, recheckEnv, installPi, prewarmActive, setEngine, openPath, openExternal,
+    hydrateFromCacheAsync, loadDefaults, loadModelsAsync, refreshModels, loadSkillsAsync,
+    loadEnvAsync, recheckEnv, installPi, prewarmActive, setEngine, openPath, openExternal,
     getLastSkillsCwd: () => lastSkillsCwd,
   }
 }

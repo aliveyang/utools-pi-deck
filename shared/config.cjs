@@ -27,11 +27,6 @@ const PROVIDER_PRESETS = [
   { id: 'custom', name: '+ 自定义端点', builtin: false, isCustomTemplate: true, env: '', site: '', note: '中转站 / LM Studio / 企业网关，可自定义标识保存多个' },
 ]
 
-function readJson(file, fallback) {
-  const r = readJsonResult(file)
-  return r.data == null ? fallback : r.data
-}
-
 // 与 pi 对齐：支持 BOM 与 JSONC 注释（pi 用 strip-json-comments 解析）
 function stripJsonComments(text) {
   const s = String(text).replace(/^\uFEFF/, '')
@@ -108,11 +103,23 @@ function backupFile(file, now) {
   } catch (_) { return '' }
 }
 
+function quoteForShell(val, platform = process.platform) {
+  const s = String(val || '')
+  if (!s || /[\r\n\0]/.test(s)) return ''
+  if (platform === 'win32') {
+    if (s.includes('"')) return ''
+    return `"${s}"`
+  }
+  return `'${s.replace(/'/g, "'\\''")}'`
+}
+
 function createConfig(options) {
   const opts = options || {}
   const agentDir = opts.agentDir || defaultCore.agentDir()
   const now = opts.now || Date.now
   const resolvePi = opts.resolvePi || defaultCore.resolvePi
+  const resolvePiAsync = opts.resolvePiAsync
+    || (opts.resolvePi ? () => Promise.resolve(opts.resolvePi()) : defaultCore.resolvePiAsync)
   const settingsPath = path.join(agentDir, SETTINGS_FILE)
   const modelsPath = path.join(agentDir, MODELS_FILE)
 
@@ -202,7 +209,7 @@ function createConfig(options) {
     const thinking = typeof req.thinking === 'string' ? req.thinking.trim() : ''
 
     if (!isBuiltin) {
-      if (!/^https?:\/\//i.test(baseUrl)) return { ok: false, error: '自定义端点需要 http(s) 开头的 Base URL' }
+      if (!localStore.isAllowedExternalUrl(baseUrl)) return { ok: false, error: '自定义端点需要合法的 http(s) Base URL' }
       if (!API_VALUES.includes(api)) return { ok: false, error: 'API 类型不在支持范围内' }
     }
 
@@ -249,7 +256,7 @@ function createConfig(options) {
       defaultSet = true
     }
 
-    const settingsBak = backupFile(settingsPath, now)
+    const settingsBak = defaultSet ? backupFile(settingsPath, now) : ''
     const modelsBak = backupFile(modelsPath, now)
     try {
       writeJsonAtomic(modelsPath, models)
@@ -275,7 +282,9 @@ function createConfig(options) {
   function removeKey(provider) {
     const id = String(provider || '').trim()
     if (!PROVIDER_ID_RE.test(id)) return { ok: false, error: 'provider 名称不合法' }
-    const models = readJson(modelsPath, {}) || {}
+    const modelsR = readJsonResult(modelsPath)
+    if (modelsR.error) return { ok: false, error: 'models.json 解析失败，已保留原文件：' + modelsR.error }
+    const models = (modelsR.data && typeof modelsR.data === 'object') ? modelsR.data : {}
     const p = models.providers && models.providers[id]
     if (!p || typeof p !== 'object') return { ok: true, removed: false }
     if (!('apiKey' in p)) return { ok: true, removed: false }
@@ -287,15 +296,15 @@ function createConfig(options) {
     return { ok: true, removed: true }
   }
 
-  // 凭证就绪检测：不刷新 OAuth、不输出凭证
-  function authCheck(provider) {
+  // 凭证就绪检测：不刷新 OAuth、不输出凭证（全异步解析，避免阻塞渲染进程）
+  async function authCheck(provider) {
     const id = String(provider || '').trim()
-    if (!PROVIDER_ID_RE.test(id)) return Promise.resolve({ status: 'invalid', error: 'provider 名称不合法' })
+    if (!PROVIDER_ID_RE.test(id)) return { status: 'invalid', error: 'provider 名称不合法' }
+    let node, cli
+    try { ({ node, cli } = await resolvePiAsync()) } catch (e) {
+      return { status: 'unavailable', error: String(e.message || e) }
+    }
     return new Promise(resolve => {
-      let node, cli
-      try { ({ node, cli } = resolvePi()) } catch (e) {
-        return resolve({ status: 'unavailable', error: String(e.message || e) })
-      }
       execFile(node, [cli, 'auth', 'check', '--provider', id, '--no-refresh', '--json'], {
         windowsHide: true, timeout: 20000, maxBuffer: 1024 * 1024,
       }, (err, stdout) => {
@@ -312,13 +321,16 @@ function createConfig(options) {
     })
   }
 
-  // 供终端登录使用：返回用绝对路径拼好的命令，避免 GUI 环境 PATH 缺失
+  // 供终端登录使用：返回用绝对路径拼好的安全命令，避免 GUI 环境 PATH 缺失与元字符注入
   function loginCommand(provider) {
     const id = String(provider || '').trim()
     if (!PROVIDER_ID_RE.test(id)) return ''
     let node, cli
     try { ({ node, cli } = resolvePi()) } catch (_) { return `pi auth login ${id}` }
-    return `"${node}" "${cli}" auth login ${id}`
+    const qNode = quoteForShell(node)
+    const qCli = quoteForShell(cli)
+    if (!qNode || !qCli) return `pi auth login ${id}`
+    return `${qNode} ${qCli} auth login ${id}`
   }
 
   return {
@@ -334,9 +346,7 @@ const defaultConfig = createConfig()
 module.exports = {
   ...defaultConfig,
   createConfig,
-  PROVIDER_PRESETS,
-  API_VALUES,
+  quoteForShell,
   keyKind,
   writeJsonAtomic,
-  backupFile,
 }

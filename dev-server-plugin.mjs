@@ -11,6 +11,12 @@ function readJson(req) {
     let size = 0
     let d = ''
     let tooLarge = false
+    let settled = false
+    const finish = val => {
+      if (settled) return
+      settled = true
+      resolve(val)
+    }
     const ts = core.makeTextStream()   // 跨 chunk UTF-8 安全
     req.on('data', c => {
       size += c.length
@@ -18,10 +24,12 @@ function readJson(req) {
       d += ts.push(c)
     })
     req.on('end', () => {
-      if (tooLarge) return resolve({ __tooLarge: true })
+      if (tooLarge) return finish({ __tooLarge: true })
       d += ts.end()
-      try { resolve(JSON.parse(d || '{}')) } catch (_) { resolve({}) }
+      try { finish(JSON.parse(d || '{}')) } catch (_) { finish({}) }
     })
+    req.on('error', () => finish({}))
+    req.on('aborted', () => finish({}))
   })
 }
 
@@ -45,7 +53,7 @@ export function piDevApi() {
 
         if (p === 'resolve') {
           res.setHeader('Content-Type', 'application/json')
-          try { const r = core.resolvePi(); res.end(JSON.stringify({ ok: true, ...r })) }
+          try { const r = await core.resolvePiAsync(); res.end(JSON.stringify({ ok: true, ...r })) }
           catch (e) { res.end(JSON.stringify({ ok: false, error: e.message })) }
           return
         }
@@ -62,12 +70,12 @@ export function piDevApi() {
         }
         if (p === 'files') {
           res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify(core.listFiles(url.searchParams.get('cwd'), url.searchParams.get('q'))))
+          res.end(JSON.stringify(await core.listFilesAsync(url.searchParams.get('cwd'), url.searchParams.get('q'))))
           return
         }
         if (p === 'skills') {
           res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify(core.listSkills(url.searchParams.get('cwd'))))
+          res.end(JSON.stringify(await core.listSkillsAsync(url.searchParams.get('cwd'))))
           return
         }
         if (p === 'context') {
@@ -78,7 +86,7 @@ export function piDevApi() {
         }
         if (p === 'env') {
           res.setHeader('Content-Type', 'application/json')
-          try { res.end(JSON.stringify(core.getEnv())) }
+          try { res.end(JSON.stringify(await core.getEnvAsync())) }
           catch (e) { res.end(JSON.stringify({ ok: false, error: String(e.message || e) })) }
           return
         }

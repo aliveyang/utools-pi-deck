@@ -445,6 +445,16 @@ function effectiveCwd(p) {
   return dir
 }
 
+async function validateCwdAsync(p) {
+  if (!p) return false
+  try { return (await fsp.stat(p)).isDirectory() } catch (_) { return false }
+}
+async function effectiveCwdAsync(p) {
+  if (p && await validateCwdAsync(p)) return p
+  const dir = path.join(os.homedir(), 'MyPiDeck')
+  try { await fsp.mkdir(dir, { recursive: true }) } catch (_) {}
+  return dir
+}
 // pi 配置目录：与 pi 的 getAgentDir() 保持一致，可用 PI_CODING_AGENT_DIR 覆盖
 function agentDir() {
   return process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), '.pi', 'agent')
@@ -610,7 +620,7 @@ function listFiles(cwd, query) {
 }
 
 async function listFilesAsync(cwd, query) {
-  const root = effectiveCwd(cwd)
+  const root = await effectiveCwdAsync(cwd)
   const out = []
   const q = (query || '').toLowerCase()
   const skip = new Set(['node_modules', '.git', 'dist', 'build', '.cache', '.venv', '__pycache__'])
@@ -767,11 +777,15 @@ const LEAN_SYSTEM_PROMPT = [
 // 读取 pi 实际生效的默认模型与思考强度（用于 UI 显示"默认=什么"）
 // 通过一次性 RPC get_state 获取，不污染会话
 function getDefaults(cwd) {
-  return new Promise(resolve => {
-    let node, cli
-    try { ({ node, cli } = resolvePi()) } catch (e) { return resolve({ error: String(e.message || e) }) }
+  return new Promise(async resolve => {
+    let node, cli, workDir
+    try {
+      [{ node, cli }, workDir] = await Promise.all([resolvePiAsync(), effectiveCwdAsync(cwd)])
+    } catch (e) {
+      return resolve({ error: String(e.message || e) })
+    }
     const child = spawn(node, [cli, '--mode', 'rpc', '--no-session'], {
-      cwd: effectiveCwd(cwd), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: workDir, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     })
     const buf = makeLineBuffer()
     let done = false
@@ -1039,9 +1053,9 @@ function detectContextFiles(cwd) {
 
 module.exports = {
   PI_INSTALL_CMD,
-  READ_TOOL_NAMES, RISK_TOOL_NAMES, TOOL_NAMES, PRESET_LISTS,
-  resolvePi, resolvePiAsync, findNodeAsync, findPiCliAsync, resetPiCache, setPathOverrides, seedResolvedPaths,
-  makeLineBuffer, pushChunk, makeTextStream, validateCwd, effectiveCwd, resolveCwd, defaultWorkspace,
-  parseSkillMd, scanSkillsDir, listSkills, listSkillsAsync, parseModelsOutput, listModels, listFiles, listFilesAsync, buildArgs, buildPermArgs, normalizeTool, permFlags, applyLeanSystemPrompt, detectContextFiles, LEAN_SYSTEM_PROMPT, getDefaults, findPiSession, hasPiSession, deletePiSession, getEnv, getEnvAsync, mapPiEvent, agentDir,
+  READ_TOOL_NAMES, TOOL_NAMES,
+  resolvePi, resolvePiAsync, resetPiCache, setPathOverrides, seedResolvedPaths,
+  makeLineBuffer, pushChunk, makeTextStream, validateCwd, effectiveCwd, resolveCwd,
+  listSkills, listSkillsAsync, parseModelsOutput, listModels, listFiles, listFilesAsync, buildArgs, buildPermArgs, normalizeTool, permFlags, applyLeanSystemPrompt, detectContextFiles, LEAN_SYSTEM_PROMPT, getDefaults, hasPiSession, deletePiSession, getEnv, getEnvAsync, mapPiEvent, agentDir,
   os, path, fs,
 }

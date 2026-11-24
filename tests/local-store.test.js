@@ -64,6 +64,18 @@ describe('local-store 缓存读写与校验', () => {
     writeFileSync(join(tmpRoot, 'cache', 'broken.json'), '{not-json')
     expect(store.readCache('broken')).toBeNull()
   })
+
+  it('readCacheMetaAsync 支持 fresh / stale / expired 与非法 key 拒绝', async () => {
+    expect(await store.readCacheMetaAsync('../evil')).toBeNull()
+    expect(store.writeCache('models', [{ id: 'm1' }])).toBe(true)
+    expect(await store.readCacheMetaAsync('models')).toMatchObject({ data: [{ id: 'm1' }], fresh: true })
+
+    clock += 5 * 60 * 1000 + 10
+    expect(await store.readCacheMetaAsync('models')).toMatchObject({ data: [{ id: 'm1' }], fresh: false })
+
+    clock += 24 * 60 * 60 * 1000
+    expect(await store.readCacheMetaAsync('models')).toBeNull()
+  })
 })
 
 describe('local-store 配置读写与本地状态', () => {
@@ -94,6 +106,23 @@ describe('local-store 配置读写与本地状态', () => {
 
     expect(store.removeLocal('drafts')).toBe(true)
     expect(store.readLocal('drafts', null)).toBeNull()
+  })
+
+  it('loadConfigAsync 含 legacy 回退与 mtime 缓存复用；readLocalAsync 正确读取并回退', async () => {
+    expect(await store.loadConfigAsync()).toEqual({})
+
+    mkdirSync(join(tmpRoot, 'legacy'), { recursive: true })
+    writeFileSync(join(tmpRoot, 'legacy', 'config.json'), JSON.stringify({ engine: 'rpc' }))
+    expect(await store.loadConfigAsync()).toEqual({ engine: 'rpc' })
+
+    store.saveConfig({ theme: 'dark' })
+    expect(await store.loadConfigAsync()).toEqual({ engine: 'rpc', theme: 'dark' })
+    // 命中内存 mtime 缓存分支
+    expect(await store.loadConfigAsync()).toEqual({ engine: 'rpc', theme: 'dark' })
+
+    expect(await store.readLocalAsync('drafts', {})).toEqual({})
+    expect(store.writeLocal('drafts', { chat: 'async-hi' })).toBe(true)
+    expect(await store.readLocalAsync('drafts', {})).toEqual({ chat: 'async-hi' })
   })
 })
 

@@ -66,6 +66,31 @@ describe('索引重建', () => {
     write(ITEM_PREFIX + 'orphan-1', { id: 'orphan-1', groupId: 'chat', title: '孤立', messages: [] })
     expect(listSessions()).toEqual([])
   })
+
+  it('无索引且为空库时，首次 listSessions 写回 []，后续不再重复调用 utools.db.allDocs', () => {
+    const origUtools = globalThis.window.utools
+    let allDocsCalls = 0
+    const mem = new Map()
+    globalThis.window.utools = {
+      dbStorage: {
+        getItem: k => (mem.has(k) ? mem.get(k) : null),
+        setItem: (k, v) => { mem.set(k, v) },
+        removeItem: k => { mem.delete(k); return true },
+      },
+      db: {
+        allDocs: () => { allDocsCalls++; return [] },
+      },
+    }
+    try {
+      expect(listSessions()).toEqual([])
+      expect(allDocsCalls).toBe(1)
+      expect(JSON.parse(mem.get(IDX_KEY))).toEqual([])
+      expect(listSessions()).toEqual([])
+      expect(allDocsCalls).toBe(1)
+    } finally {
+      globalThis.window.utools = origUtools
+    }
+  })
 })
 
 describe('辅助函数', () => {

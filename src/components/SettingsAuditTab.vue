@@ -8,7 +8,7 @@ const emit = defineEmits(['notify', 'openPath'])
 
 const auditRows = ref([])
 const auditRiskOnly = ref(false)
-const { isConfirming, confirm, reset } = useConfirm()
+const { isConfirming, confirm } = useConfirm()
 
 function loadAudit() {
   try {
@@ -74,7 +74,6 @@ function clearAudit() {
 }
 
 onMounted(loadAudit)
-defineExpose({ loadAudit, reset })
 </script>
 
 <template>

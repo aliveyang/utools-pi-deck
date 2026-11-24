@@ -179,7 +179,7 @@ const typingText = () => props.runPhase === 'spawning' ? '正在启动引擎…'
           <div v-if="m.fileNames && m.fileNames.length" class="msg-files">
             <span v-for="(fn, fi) in m.fileNames" :key="fi" class="file-chip">{{ fn }}</span>
           </div>
-          <div class="turn-text" v-html="renderText(m)"></div>
+          <div class="turn-text" v-html="renderText(m)" @click="onTextClick"></div>
         </div>
       </template>
       <template v-else>

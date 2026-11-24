@@ -25,7 +25,7 @@ export const TOOL_META = [
   { id: 'powershell', label: 'pwsh', note: '执行 PowerShell（仅 Windows）', risk: true },
 ]
 
-export const RISK_TOOL_SET = new Set(['edit', 'write', 'bash', 'powershell'])
+const RISK_TOOL_SET = new Set(['edit', 'write', 'bash', 'powershell'])
 
 export function riskKeysOf(tool) {
   const t = tool || {}

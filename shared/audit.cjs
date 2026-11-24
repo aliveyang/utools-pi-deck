@@ -46,8 +46,8 @@ function redact(value, depth) {
   if (typeof value === 'object') {
     const out = {}
     for (const [k, v] of Object.entries(value)) {
-      // 键名本身命中敏感词时直接打码，避免值以嵌套对象形式绕过正则
-      out[k] = /(api[_-]?key|token|secret|password|passwd|authorization|cookie)/i.test(k) && typeof v === 'string'
+      // 键名本身命中敏感词时直接打码，避免值以嵌套对象或数值形式绕过正则
+      out[k] = /(api[_-]?key|token|secret|password|passwd|authorization|cookie)/i.test(k) && v != null
         ? '***' : redact(v, d + 1)
     }
     return out
@@ -233,10 +233,4 @@ module.exports = {
   createAudit,
   describe,
   redactString,
-  redact,
-  dayKey,
-  fmtTime,
-  DEFAULT_ROOT,
-  DEFAULT_RETENTION_DAYS,
-  DEFAULT_MAX_FILE_BYTES,
 }

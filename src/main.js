@@ -16,6 +16,10 @@ if (window.utools && !window.__pideckEnterQueue) {
   })
 }
 
+const perfNow = () => (typeof performance !== 'undefined' && typeof performance.now === 'function') ? performance.now() : Date.now()
+const perf = window.__pideckPerf = window.__pideckPerf || {}
+perf.scriptStart = perfNow()
+
 const app = createApp(App)
 // 全局错误兜底：避免渲染异常导致纯白屏，至少把错误显示出来
 app.config.errorHandler = (err, _vm, info) => {
@@ -28,3 +32,5 @@ app.config.errorHandler = (err, _vm, info) => {
 }
 window.addEventListener('unhandledrejection', e => console.error('[PiDeck] unhandled:', e.reason))
 app.mount('#app')
+perf.mounted = perfNow()
+perf.mountMs = Number((perf.mounted - perf.scriptStart).toFixed(2))

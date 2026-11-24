@@ -10,12 +10,12 @@ uTools 内的 [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi
 | Node.js | **≥ 22.19** | pi CLI 的运行时要求 |
 | pi CLI | `npm i -g @earendil-works/pi-coding-agent` | 安装后可运行 `pi` 完成登录，或直接在插件「设置 → 环境与模型」里粘贴 API Key |
 
-默认模型与凭证不经过 PiDeck 配置，一切以 pi 侧为准；插件只透传 `--model` / `--thinking` 覆盖项。
+默认模型与凭证保存在 pi 标准的 `~/.pi/agent/{settings,models}.json`，可在终端 `pi` 或插件「设置 → 环境与模型」中配置；各分组可按需单独覆盖 `--model` / `--thinking`。
 
 ## 安装到 uTools
 
 1. 构建产物：`npm run build` → 生成自包含的 `dist/`（外链 IIFE JS + 单文件 CSS + `shared/*.cjs` + `preload.js`）。
-2. uTools → 设置 → 开发者 → 新建插件，选择包含 `plugin.json` 的目录（开发调试选 `public/`，正式使用选 `dist/`）。
+2. uTools → 设置 → 开发者 → 新建插件，选择 `dist/plugin.json`（运行 `npm run build` 后加载 `dist/`；浏览器热重载预览请运行 `npm run dev`）。
 
 ## 环境变量（可选）
 

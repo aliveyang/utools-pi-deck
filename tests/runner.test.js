@@ -1,4 +1,8 @@
 import { describe, it, expect } from 'vitest'
+import { EventEmitter } from 'node:events'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 
 const { toolSummary, isRiskTool, createRunner } = await import('../shared/runner.cjs')
 
@@ -49,5 +53,54 @@ describe('runner 审计与工具判定', () => {
     expect(entries).toHaveLength(2)
     expect(entries[0]).toMatchObject({ type: 'tool', risk: true, engine: 'json' })
     expect(entries[1]).toMatchObject({ type: 'run', engine: 'json', usage: { totalTokens: 42 }, aborted: false })
+  })
+
+  it('独立调用 runner.cancel() 取消 JSON 子进程时触发 onDone({ aborted: true }) 而非 onError', () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'pideck-runner-'))
+    const fakeCli = join(tmp, 'cli.js')
+    writeFileSync(fakeCli, '// fake\n')
+    try {
+      let childRef = null
+      const runner = createRunner({
+        core: {
+          applyLeanSystemPrompt: o => o,
+          resolvePi: () => ({ node: process.execPath, cli: fakeCli }),
+          buildArgs: () => [fakeCli],
+          effectiveCwd: () => tmp,
+          makeLineBuffer: () => ({ value: '' }),
+          makeTextStream: () => ({ push: () => '', end: () => '' }),
+          pushChunk: () => {},
+          mapPiEvent: () => false,
+        },
+        spawn: () => {
+          const c = new EventEmitter()
+          c.stdout = new EventEmitter()
+          c.stderr = new EventEmitter()
+          c.kill = () => { c.emit('close', null) }
+          childRef = c
+          return c
+        },
+      })
+
+      let donePayload = null
+      let errMsg = ''
+      runner.run({ prompt: 'hi', cwd: tmp }, {
+        onDone: p => { donePayload = p },
+        onError: m => { errMsg = m },
+      })
+      expect(childRef).toBeTruthy()
+      expect(runner.cancel()).toBe(true)
+      expect(donePayload).toEqual({ aborted: true })
+      expect(errMsg).toBe('')
+    } finally {
+      rmSync(tmp, { recursive: true, force: true })
+    }
+  })
+
+  it('openTerminal 拒绝包含换行或空字符的命令', () => {
+    const runner = createRunner()
+    expect(runner.openTerminal('')).toBe(false)
+    expect(runner.openTerminal('echo ok\ncalc.exe')).toBe(false)
+    expect(runner.openTerminal('echo ok\r\ncalc.exe')).toBe(false)
   })
 })

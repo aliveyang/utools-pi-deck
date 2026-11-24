@@ -18,7 +18,7 @@ const emit = defineEmits([
   'pickDefaultCwd', 'setSendKeyMode', 'clearAllSessions',
 ])
 
-const { isConfirming, confirm, reset } = useConfirm()
+const { isConfirming, confirm } = useConfirm()
 
 function rpcBadgeText(status) {
   if (status === 'ready') return '后台已预热'
@@ -26,8 +26,6 @@ function rpcBadgeText(status) {
   if (status === 'failed') return '预热失败（自动回退标准模式）'
   return ''
 }
-
-defineExpose({ reset })
 </script>
 
 <template>

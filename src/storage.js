@@ -55,6 +55,15 @@ export function readLocal(key, fallback) {
   } catch (_) { return fallback }
 }
 
+export async function readLocalAsync(key, fallback) {
+  try {
+    if (window.piBridge && typeof window.piBridge.readLocalAsync === 'function') {
+      return await window.piBridge.readLocalAsync(key, fallback)
+    }
+  } catch (_) {}
+  return readLocal(key, fallback)
+}
+
 export function writeLocal(key, value) {
   try {
     if (window.piBridge && typeof window.piBridge.writeLocal === 'function') {
@@ -94,6 +103,15 @@ export function readCacheMeta(key) {
   } catch (_) { return null }
 }
 
+export async function readCacheMetaAsync(key) {
+  try {
+    if (window.piBridge && typeof window.piBridge.readCacheMetaAsync === 'function') {
+      return await window.piBridge.readCacheMetaAsync(key)
+    }
+  } catch (_) {}
+  return readCacheMeta(key)
+}
+
 export function readCache(key) {
   const meta = readCacheMeta(key)
   return (meta && meta.fresh) ? meta.data : null
@@ -110,4 +128,53 @@ export function writeCache(key, data) {
     localStorage.setItem(LOCAL_CACHE_PREFIX + key, JSON.stringify({ t: Date.now(), data }))
     return true
   } catch (_) { return false }
+}
+
+// 用户偏好合并读写（单 key 减少启动期同步 IPC 往返，兼容旧 4 个分离 key）
+export const PREFS_KEY = 'pideck.prefs.v1'
+export const LEGACY_PREF_KEYS = {
+  defaultCwd: 'pideck.defaultCwd.v1',
+  sendKey: 'pideck.sendKey.v1',
+  layout: 'pideck.layout.v1',
+  activeId: 'pideck.active.v1',
+}
+
+function normalizePrefs(raw) {
+  const src = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {}
+  return {
+    defaultCwd: typeof src.defaultCwd === 'string' ? src.defaultCwd : '',
+    sendKey: src.sendKey === 'enter' ? 'enter' : 'ctrl',
+    layout: src.layout === 'console' ? 'console' : 'classic',
+    activeId: (typeof src.activeId === 'string' && src.activeId) ? src.activeId : 'chat',
+  }
+}
+
+export function loadPrefsBundle() {
+  const bundled = read(PREFS_KEY, null)
+  if (bundled && typeof bundled === 'object' && !Array.isArray(bundled)) {
+    return { prefs: normalizePrefs(bundled), needsMigration: false }
+  }
+  const legacyCwd = read(LEGACY_PREF_KEYS.defaultCwd, null)
+  const legacySendKey = read(LEGACY_PREF_KEYS.sendKey, null)
+  const legacyLayout = read(LEGACY_PREF_KEYS.layout, null)
+  const legacyActiveId = read(LEGACY_PREF_KEYS.activeId, null)
+  const hasLegacy = legacyCwd !== null || legacySendKey !== null || legacyLayout !== null || legacyActiveId !== null
+  const prefs = normalizePrefs({
+    defaultCwd: legacyCwd || '',
+    sendKey: legacySendKey || 'ctrl',
+    layout: legacyLayout || 'classic',
+    activeId: legacyActiveId || 'chat',
+  })
+  return { prefs, needsMigration: hasLegacy }
+}
+
+export function savePrefsBundle(prefs) {
+  const next = normalizePrefs(prefs)
+  write(PREFS_KEY, next)
+  return next
+}
+
+export function savePrefsPatch(patch) {
+  const { prefs } = loadPrefsBundle()
+  return savePrefsBundle({ ...prefs, ...(patch && typeof patch === 'object' ? patch : {}) })
 }

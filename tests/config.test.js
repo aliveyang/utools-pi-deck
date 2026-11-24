@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { createConfig } from '../shared/config.cjs'
+import { createConfig, quoteForShell } from '../shared/config.cjs'
 
 let dir
 let settingsPath
@@ -185,5 +185,38 @@ describe('config', () => {
     const savedProviders = readJson(modelsPath).providers
     expect(savedProviders['relay-a'].baseUrl).toBe('https://a.test/v1')
     expect(savedProviders['relay-b'].baseUrl).toBe('https://b.test/v1')
+  })
+
+  it('非法 baseUrl 被拒绝；setDefault=false 不备份 settings.json', () => {
+    fs.writeFileSync(settingsPath, JSON.stringify({ theme: 'light' }))
+    const cfg = createConfig({ agentDir: dir })
+    expect(cfg.save({ provider: 'my-proxy', baseUrl: 'http://', api: 'openai-completions', modelId: 'm' }).ok).toBe(false)
+    expect(cfg.save({ provider: 'my-proxy', baseUrl: 'https://a b/v1', api: 'openai-completions', modelId: 'm' }).ok).toBe(false)
+
+    const r = cfg.save({
+      provider: 'my-proxy', baseUrl: 'https://ok.test/v1', api: 'openai-completions',
+      apiKey: 'fake-key', modelId: 'm', setDefault: false,
+    })
+    expect(r.ok).toBe(true)
+    const settingsBaks = fs.readdirSync(dir).filter(n => n.startsWith('settings.json.pideck-bak-'))
+    expect(settingsBaks).toHaveLength(0)
+  })
+
+  it('authCheck 使用异步 resolvePiAsync；loginCommand 与 quoteForShell 防控制字符/引号注入', async () => {
+    let asyncCalled = false
+    const cfg = createConfig({
+      agentDir: dir,
+      resolvePi: () => ({ node: 'C:\\bad\npath\\node.exe', cli: 'C:\\ok\\cli.js' }),
+      resolvePiAsync: async () => { asyncCalled = true; throw new Error('missing') },
+    })
+    const authRes = await cfg.authCheck('deepseek')
+    expect(asyncCalled).toBe(true)
+    expect(authRes.status).toBe('unavailable')
+    expect(cfg.loginCommand('deepseek')).toBe('pi auth login deepseek')
+
+    expect(quoteForShell('C:\\Program Files\\node.exe', 'win32')).toBe('"C:\\Program Files\\node.exe"')
+    expect(quoteForShell('C:\\bad"quote\\node.exe', 'win32')).toBe('')
+    expect(quoteForShell("/opt/it's/node", 'darwin')).toBe("'/opt/it'\\''s/node'")
+    expect(quoteForShell('/bad\nnode', 'darwin')).toBe('')
   })
 })
