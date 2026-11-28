@@ -10,9 +10,13 @@ const auditRows = ref([])
 const auditRiskOnly = ref(false)
 const { isConfirming, confirm } = useConfirm()
 
-function loadAudit() {
+async function loadAudit() {
   try {
-    auditRows.value = (window.piBridge && window.piBridge.auditTail) ? (window.piBridge.auditTail(200) || []) : []
+    if (window.piBridge && typeof window.piBridge.auditTailAsync === 'function') {
+      auditRows.value = (await window.piBridge.auditTailAsync(200)) || []
+    } else {
+      auditRows.value = (window.piBridge && window.piBridge.auditTail) ? (window.piBridge.auditTail(200) || []) : []
+    }
   } catch (_) { auditRows.value = [] }
 }
 
@@ -49,9 +53,11 @@ function isAuditRisk(r) {
   return !!(r.risk || r.type === 'perm' || r.type === 'data')
 }
 
-function exportAudit() {
-  if (!window.piBridge || !window.piBridge.auditExport) return
-  const md = window.piBridge.auditExport(30)
+async function exportAudit() {
+  if (!window.piBridge) return
+  const md = typeof window.piBridge.auditExportAsync === 'function'
+    ? await window.piBridge.auditExportAsync(30)
+    : (window.piBridge.auditExport ? window.piBridge.auditExport(30) : '')
   const r = window.piBridge.saveTextFile && window.piBridge.saveTextFile('PiDeck-操作记录.md', md)
   if (r && r.ok) emit('notify', '已导出：' + r.path)
   else if (r && r.canceled) return
@@ -100,7 +106,7 @@ onMounted(loadAudit)
       <button class="mini-btn" @click="exportAudit"><Icon name="download" :size="12" />导出 Markdown</button>
       <button class="mini-btn danger" @click="clearAudit">{{ isConfirming('clearAudit') ? '再点一次确认清空' : '清空记录' }}</button>
     </div>
-    <span class="hint">只保存在本机，不上传；不记录对话全文、完整文件内容与密钥（工具参数/结果仅保留截断摘要）。仅保留最近 30 天。</span>
+    <span class="hint">仅由运行引擎在本地记录工具调用与对话摘要，不上传；不记录对话全文、完整文件内容与密钥（工具参数/结果仅保留截断摘要）。仅保留最近 30 天。</span>
   </div>
 </template>
 

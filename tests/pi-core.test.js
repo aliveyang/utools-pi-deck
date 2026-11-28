@@ -358,3 +358,131 @@ describe('异步路径解析、环境诊断、技能与文件扫描', () => {
     expect(list.some(s => s.name === 'demo-skill' && s.description === 'demo async')).toBe(true)
   })
 })
+
+describe('validateNodeExecutable 与 validatePiCliPath 安全校验', () => {
+  it('isNodeExecutableName 仅放行 node 可执行文件名', () => {
+    expect(core.isNodeExecutableName('/usr/local/bin/node')).toBe(true)
+    expect(core.isNodeExecutableName('C:\\Program Files\\nodejs\\node.exe')).toBe(true)
+    expect(core.isNodeExecutableName('node-v22.19.0.exe')).toBe(true)
+    expect(core.isNodeExecutableName('/bin/sh')).toBe(false)
+    expect(core.isNodeExecutableName('bash')).toBe(false)
+    expect(core.isNodeExecutableName('x.sh')).toBe(false)
+    expect(core.isNodeExecutableName('node.js')).toBe(false)
+    expect(core.isNodeExecutableName('node.cmd')).toBe(false)
+  })
+
+  it('validateNodeExecutable 放行合法 >=22.19 的 Node，拒绝目录、不存在路径及非 node 脚本', () => {
+    const okRes = core.validateNodeExecutable(process.execPath)
+    const [maj, min] = process.versions.node.split('.').map(Number)
+    if (maj > 22 || (maj === 22 && min >= 19)) {
+      expect(okRes.ok).toBe(true)
+      expect(okRes.version).toMatch(/^v\d+/)
+    } else {
+      expect(okRes.ok).toBe(false)
+    }
+
+    expect(core.validateNodeExecutable('').ok).toBe(false)
+    expect(core.validateNodeExecutable(fixtureDir).ok).toBe(false)
+    expect(core.validateNodeExecutable(join(fixtureDir, 'missing-node.exe')).ok).toBe(false)
+
+    const fakeSh = join(fixtureDir, 'evil.sh')
+    writeFileSync(fakeSh, '#!/bin/sh\necho v24.0.0\n')
+    expect(core.validateNodeExecutable(fakeSh).ok).toBe(false)
+
+    const fakeNodeFile = join(fixtureDir, 'node.exe')
+    writeFileSync(fakeNodeFile, 'not a binary')
+    expect(core.validateNodeExecutable(fakeNodeFile).ok).toBe(false)
+  })
+
+  it('validatePiCliPath 仅放行 @earendil-works/pi-coding-agent 包内的常规 JS 文件', async () => {
+    const pkgRoot = join(fixtureDir, 'nm', '@earendil-works', 'pi-coding-agent')
+    const cliFile = join(pkgRoot, 'dist', 'bundle', 'cli.js')
+    mkdirSync(join(pkgRoot, 'dist', 'bundle'), { recursive: true })
+    writeFileSync(join(pkgRoot, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent', version: '0.9.1' }))
+    writeFileSync(cliFile, '// valid cli')
+
+    const ok = core.validatePiCliPath(cliFile)
+    expect(ok.ok).toBe(true)
+    expect(ok.version).toBe('0.9.1')
+
+    expect(core.validatePiCliPath(fakeCli).ok).toBe(false)
+    expect(core.validatePiCliPath(pkgRoot).ok).toBe(false)
+    expect(core.validatePiCliPath(join(pkgRoot, 'package.json')).ok).toBe(false)
+
+    // 目录名伪造但 package.json 名称不匹配应拒绝
+    const spoofRoot = join(fixtureDir, 'spoof', '@earendil-works', 'pi-coding-agent')
+    const spoofCli = join(spoofRoot, 'cli.js')
+    mkdirSync(spoofRoot, { recursive: true })
+    writeFileSync(join(spoofRoot, 'package.json'), JSON.stringify({ name: 'evil-pkg', version: '1.0.0' }))
+    writeFileSync(spoofCli, '// spoof')
+    expect(core.validatePiCliPath(spoofCli).ok).toBe(false)
+
+    // 符号链接逃逸到包外脚本应被 realpathSync 拦截
+    const escapeLink = join(pkgRoot, 'dist', 'escape.js')
+    let linked = false
+    try { symlinkSync(fakeCli, escapeLink); linked = true } catch (_) {}
+    if (linked) {
+      expect(core.validatePiCliPath(escapeLink).ok).toBe(false)
+      expect((await core.validatePiCliPathAsync(escapeLink)).ok).toBe(false)
+    }
+
+    // 异步校验函数 validateNodeExecutableAsync / validatePiCliPathAsync 与同步版本一致
+    expect((await core.validateNodeExecutableAsync(process.execPath)).ok).toBe(true)
+    expect((await core.validateNodeExecutableAsync(fakeCli)).ok).toBe(false)
+    expect((await core.validatePiCliPathAsync(cliFile)).ok).toBe(true)
+    expect((await core.validatePiCliPathAsync(fakeCli)).ok).toBe(false)
+  })
+
+  it('严格校验参数边界、listFiles 拦截目录外符号链接及 deletePiSessions 批量安全删除', async () => {
+    expect(core.validateCwd(null)).toBe(false)
+    expect(core.validateCwd(123)).toBe(false)
+    expect(() => core.buildArgs({ prompt: 'hi', files: ['data:image/png;base64,abc'] })).toThrow('data URL')
+
+    // 非法 mcpServers、- 开头 skillPath、非 pideck- sessionId 与 - 开头 systemPrompt 处理
+    const permArgs = core.buildPermArgs(tool({
+      mcp: 'servers',
+      mcpServers: 'good_1, bad server, --inject',
+      skills: 'some',
+      skillPaths: ['/ok/skill', '-evil', 'bad\npath'],
+    }))
+    expect(permArgs).toContain('read,grep,find,ls,mcp__good_1__*')
+    expect(permArgs).not.toContain('-evil')
+    expect(permArgs).toContain('/ok/skill')
+
+    const args = core.buildArgs({ prompt: '@/etc/passwd', sessionId: 'other-id', systemPrompt: '--as-flag' })
+    expect(args).toContain('--no-session')
+    expect(args[args.indexOf('--system-prompt') + 1]).toBe(' --as-flag')
+    expect(args[args.length - 1].startsWith('@')).toBe(false)
+    expect(args[args.length - 1]).toContain('@/etc/passwd')
+
+    // listFiles / listFilesAsync 拦截指向目录外的符号链接
+    const ws = mkdtempSync(join(fixtureDir, 'ws-escape-'))
+    const outside = mkdtempSync(join(fixtureDir, 'outside-'))
+    writeFileSync(join(ws, 'in.txt'), 'ok')
+    writeFileSync(join(outside, 'secret.txt'), 'no')
+    let symOk = false
+    try {
+      symlinkSync(outside, join(ws, 'out-dir'))
+      symlinkSync(join(outside, 'secret.txt'), join(ws, 'out-file.txt'))
+      symOk = true
+    } catch (_) {}
+    if (symOk) {
+      const syncList = core.listFiles(ws)
+      const asyncList = await core.listFilesAsync(ws)
+      expect(syncList.some(f => f.path.includes('secret.txt') || f.path.includes('out-dir'))).toBe(false)
+      expect(asyncList.some(f => f.path.includes('secret.txt') || f.path.includes('out-dir'))).toBe(false)
+    }
+
+    // deletePiSessions 一次扫描批量删除且不删符号链接
+    const sessRoot = mkdtempSync(join(fixtureDir, 'sess-batch-'))
+    const sub = join(sessRoot, 'ws1')
+    mkdirSync(sub)
+    writeFileSync(join(sub, '20260101_000000_pideck-s1111.jsonl'), '')
+    writeFileSync(join(sub, '20260101_000000_pideck-s2222.jsonl'), '')
+    const linkSess = join(sub, '20260101_000000_pideck-link1.jsonl')
+    try { symlinkSync(join(outside, 'secret.txt'), linkSess) } catch (_) {}
+    const delRes = core.deletePiSessions(['pideck-s1111', 'pideck-s2222', 'pideck-link1'], sessRoot)
+    expect(delRes).toEqual({ ok: true, removed: 2 })
+    expect(existsSync(join(outside, 'secret.txt'))).toBe(true)
+  })
+})

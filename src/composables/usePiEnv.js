@@ -123,11 +123,11 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
         return mMeta.data
       }
     }
-    if (modelsLoadingPromise) return modelsLoadingPromise
+    if (modelsLoadingPromise && !force) return modelsLoadingPromise
     modelsLoadingPromise = (async () => {
       try {
         const list = (window.piBridge && window.piBridge.listModelsAsync)
-          ? await window.piBridge.listModelsAsync() : null
+          ? await window.piBridge.listModelsAsync({ force }) : null
         if (list) { models.value = list; writeCache('models', list) }
         return list
       } catch (_) {
@@ -143,7 +143,7 @@ export function usePiEnv({ getCwd, showToast, copyText, getLean }) {
   async function refreshModels() {
     try {
       const list = (window.piBridge && window.piBridge.listModelsAsync)
-        ? await window.piBridge.listModelsAsync() : null
+        ? await window.piBridge.listModelsAsync({ force: true }) : null
       if (list) { models.value = list; writeCache('models', list) }
       await loadDefaults(true)
       showToast('模型列表已刷新')

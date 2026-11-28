@@ -164,7 +164,7 @@ function handlePickedBrowserFiles(fileList) {
     if ((file.type && file.type.startsWith('image/')) || IMAGE_FILE_RE.test(file.name)) {
       emit('readImageFile', file)
     } else if (file.path) {
-      emit('addFile', file.path)
+      emit('notify', '非图片文件需点击回形针按钮通过系统选择器授权，或使用 @ 引用工作区内文件')
     } else {
       emit('notify', '浏览器预览仅支持图片拖拽/粘贴；文件引用请用 @ 或在 uTools 中使用')
     }

@@ -10,6 +10,10 @@ const SETTINGS_FILE = 'settings.json'
 const MODELS_FILE = 'models.json'
 const API_VALUES = ['openai-completions', 'openai-responses', 'anthropic-messages', 'google-generative-ai']
 const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i
+const FORBIDDEN_PROVIDER_IDS = new Set(['__proto__', 'constructor', 'prototype'])
+function isValidProviderId(id) {
+  return PROVIDER_ID_RE.test(id) && !FORBIDDEN_PROVIDER_IDS.has(id)
+}
 const BACKUP_KEEP = 5
 
 // 内置与常用 OpenAI 兼容服务商预设（builtin: true 表示模型目录由 pi 自带）
@@ -195,12 +199,15 @@ function createConfig(options) {
   function save(input) {
     const req = input || {}
     const provider = String(req.provider || '').trim()
-    if (!PROVIDER_ID_RE.test(provider) || provider === 'custom') {
+    if (!isValidProviderId(provider) || provider === 'custom') {
       return { ok: false, error: 'provider 标识不合法（请使用字母、数字、横线或下划线）' }
     }
     const preset = PROVIDER_PRESETS.find(p => p.id === provider && !p.isCustomTemplate)
     const isBuiltin = !!(preset && preset.builtin)
     const apiKey = typeof req.apiKey === 'string' ? req.apiKey.trim() : ''
+    if (apiKey.startsWith('!')) {
+      return { ok: false, error: '安全限制：不支持在界面中保存以 ! 开头的命令型凭证，请直接填写 API Key 或环境变量名' }
+    }
     const baseUrl = typeof req.baseUrl === 'string' ? req.baseUrl.trim() : ''
     const api = typeof req.api === 'string' ? req.api.trim() : ''
     const modelId = typeof req.modelId === 'string' ? req.modelId.trim() : ''
@@ -281,7 +288,7 @@ function createConfig(options) {
   // 清除 models.json 里的 apiKey（保留 provider 与模型定义）
   function removeKey(provider) {
     const id = String(provider || '').trim()
-    if (!PROVIDER_ID_RE.test(id)) return { ok: false, error: 'provider 名称不合法' }
+    if (!isValidProviderId(id)) return { ok: false, error: 'provider 名称不合法' }
     const modelsR = readJsonResult(modelsPath)
     if (modelsR.error) return { ok: false, error: 'models.json 解析失败，已保留原文件：' + modelsR.error }
     const models = (modelsR.data && typeof modelsR.data === 'object') ? modelsR.data : {}
@@ -299,7 +306,7 @@ function createConfig(options) {
   // 凭证就绪检测：不刷新 OAuth、不输出凭证（全异步解析，避免阻塞渲染进程）
   async function authCheck(provider) {
     const id = String(provider || '').trim()
-    if (!PROVIDER_ID_RE.test(id)) return { status: 'invalid', error: 'provider 名称不合法' }
+    if (!isValidProviderId(id)) return { status: 'invalid', error: 'provider 名称不合法' }
     let node, cli
     try { ({ node, cli } = await resolvePiAsync()) } catch (e) {
       return { status: 'unavailable', error: String(e.message || e) }
@@ -324,7 +331,7 @@ function createConfig(options) {
   // 供终端登录使用：返回用绝对路径拼好的安全命令，避免 GUI 环境 PATH 缺失与元字符注入
   function loginCommand(provider) {
     const id = String(provider || '').trim()
-    if (!PROVIDER_ID_RE.test(id)) return ''
+    if (!isValidProviderId(id)) return ''
     let node, cli
     try { ({ node, cli } = resolvePi()) } catch (_) { return `pi auth login ${id}` }
     const qNode = quoteForShell(node)
@@ -347,6 +354,7 @@ module.exports = {
   ...defaultConfig,
   createConfig,
   quoteForShell,
+  isValidProviderId,
   keyKind,
   writeJsonAtomic,
 }

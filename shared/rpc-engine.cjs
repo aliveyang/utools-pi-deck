@@ -2,6 +2,7 @@
 // 失败/不存活/含非图片附件时由调用方回退 JSON 模式
 const childProcess = require('node:child_process')
 const defaultCore = require('./pi-core.cjs')
+const { estimateBase64Bytes } = require('./local-store.cjs')
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'avif'])
 const DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -27,13 +28,30 @@ function hasNonImageFiles(files) {
 function createRpcEngine(deps = {}) {
   const spawn = deps.spawn || childProcess.spawn
   const core = deps.core || defaultCore
-  const IDLE_TTL = deps.idleTtl ?? (10 * 60 * 1000)
+  const IDLE_TTL = deps.idleTtl ?? (5 * 60 * 1000)
   const MAX_PROCS = deps.maxProcs ?? 3
   const CLEANUP_INTERVAL = deps.cleanupInterval ?? (60 * 1000)
   const MAX_IMAGE_BYTES = deps.maxImageBytes ?? DEFAULT_MAX_IMAGE_BYTES
 
   const processes = new Map() // key -> entry
   let seq = 0
+
+  function scheduleForceKill(child) {
+    if (!child) return
+    let killed = false
+    const timer = setTimeout(() => {
+      if (killed) return
+      killed = true
+      try { child.kill() } catch (_) {}
+    }, 3000)
+    if (timer.unref) timer.unref()
+    if (typeof child.once === 'function') {
+      child.once('exit', () => {
+        killed = true
+        clearTimeout(timer)
+      })
+    }
+  }
 
   function isBusy(e) {
     return !!(e && (e.listeners.size > 0 || e.pending.size > 0))
@@ -50,7 +68,7 @@ function createRpcEngine(deps = {}) {
       if (!oldestKey) break
       const e = processes.get(oldestKey)
       try { e.child.stdin.end() } catch (_) {}
-      setTimeout(() => { try { e.child.kill() } catch (_) {} }, 3000)
+      scheduleForceKill(e.child)
       processes.delete(oldestKey)
     }
   }
@@ -95,7 +113,8 @@ function createRpcEngine(deps = {}) {
     const { node, cli } = core.resolvePi()
     const args = [cli, '--mode', 'rpc', '--no-session']
     args.push(...core.buildPermArgs(f.tool, f))
-    if (f.systemPrompt) args.push('--system-prompt', f.systemPrompt)
+    const sp = core.safeSystemPrompt ? core.safeSystemPrompt(f.systemPrompt) : f.systemPrompt
+    if (sp) args.push('--system-prompt', sp)
     const child = spawn(node, args, {
       cwd: core.effectiveCwd(cwd), windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -169,7 +188,13 @@ function createRpcEngine(deps = {}) {
     for (const f of (o.files || [])) {
       if (f.startsWith('data:')) {
         const m = /^data:image\/([a-zA-Z0-9+.-]+);base64,(.*)$/s.exec(f)
-        if (m) images.push({ type: 'image', data: m[2], mimeType: mimeTypeForExt(m[1]) })
+        if (m) {
+          const estBytes = estimateBase64Bytes(m[2])
+          if (estBytes > MAX_IMAGE_BYTES) {
+            throw new Error(`图片过大（${(estBytes / 1048576).toFixed(1)}MB），回退标准模式`)
+          }
+          images.push({ type: 'image', data: m[2], mimeType: mimeTypeForExt(m[1]) })
+        }
       } else {
         const st = core.fs.statSync(f)
         if (st.size > MAX_IMAGE_BYTES) {
@@ -288,7 +313,7 @@ function createRpcEngine(deps = {}) {
   function stop() {
     for (const [, e] of processes) {
       try { e.child.stdin.end() } catch (_) {}
-      setTimeout(() => { try { e.child.kill() } catch (_) {} }, 3000)
+      scheduleForceKill(e.child)
     }
     processes.clear()
   }
@@ -299,7 +324,7 @@ function createRpcEngine(deps = {}) {
       if (e.alive && !isBusy(e) && now - e.lastUsed > IDLE_TTL) {
         try { e.child.stdin.end() } catch (_) {}
         // 对齐 stop/evict：stdin 关闭后 3s 仍不退出则强杀，避免孤儿进程滞留
-        setTimeout(() => { try { e.child.kill() } catch (_) {} }, 3000)
+        scheduleForceKill(e.child)
         processes.delete(key)
       }
     }

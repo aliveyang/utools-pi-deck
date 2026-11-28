@@ -107,4 +107,23 @@ describe('audit', () => {
     expect(rows[0].tool.args.secret).toBe('***')
     expect(rows[0].tool.args.normal).toBe('safe-value')
   })
+
+  it('支持 tailAsync / exportMdAsync、脱敏 AWS/URL凭据/PEM 并保留 token 用量字段', async () => {
+    expect(redactString('AKIAIOSFODNN7EXAMPLE')).toBe('***')
+    expect(redactString('https://user:s3cret@proxy.example.com/v1')).toBe('https://user:***@proxy.example.com/v1')
+    expect(redactString('-----BEGIN RSA PRIVATE KEY-----\nMIIE')).toBe('***[PRIVATE_KEY]***')
+
+    const a = createAudit({ root, now: () => Date.UTC(2026, 10, 23, 10, 0) })
+    a.record({
+      type: 'run',
+      groupName: '测试',
+      usage: { totalTokens: 120, max_tokens: 4096, input_tokens: 80 },
+    })
+    const rows = await a.tailAsync(10)
+    expect(rows).toHaveLength(1)
+    expect(rows[0].usage.max_tokens).toBe(4096)
+    expect(rows[0].usage.input_tokens).toBe(80)
+    const md = await a.exportMdAsync(30)
+    expect(md).toContain('# PiDeck 操作记录')
+  })
 })

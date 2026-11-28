@@ -6,6 +6,7 @@ const path = require('node:path')
 const os = require('node:os')
 const { execFile, execFileSync, spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
+const { isPathWithinRoot } = require('./local-store.cjs')
 
 // ---------- pi 定位（多平台） ----------
 const PI_INSTALL_CMD = 'npm i -g @earendil-works/pi-coding-agent'
@@ -51,6 +52,165 @@ function parseNodeVersionStr(out) {
 
 function isSupportedNodeVersion(v) {
   return !!(v && (v.major > 22 || (v.major === 22 && v.minor >= 19)))
+}
+
+function isNodeExecutableName(filePath) {
+  const base = path.basename(String(filePath || ''))
+  return /^node([.-]?v?\d+(\.\d+)*)?(\.exe)?$/i.test(base)
+}
+
+function validateNodeExecutable(rawPath) {
+  const raw = typeof rawPath === 'string' ? rawPath.trim() : ''
+  if (!raw) return { ok: false, error: '请选择有效的 Node 可执行文件' }
+  let real
+  try {
+    real = fs.realpathSync(raw)
+  } catch (_) {
+    return { ok: false, error: '所选 Node 文件不存在或无法访问' }
+  }
+  try {
+    if (!fs.statSync(real).isFile()) {
+      return { ok: false, error: '所选 Node 路径必须是常规文件' }
+    }
+  } catch (_) {
+    return { ok: false, error: '所选 Node 文件不存在或无法访问' }
+  }
+  if (!isNodeExecutableName(real)) {
+    return { ok: false, error: '所选文件不是有效的 Node 可执行文件' }
+  }
+  let out = ''
+  try {
+    out = execFileSync(real, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 5000 }).trim()
+  } catch (_) {
+    return { ok: false, error: '无法执行 --version 验证所选 Node 文件' }
+  }
+  const m = /^v(\d+)\.(\d+)(?:\.\d+)?(?:[-+].*)?$/.exec(out)
+  if (!m) {
+    return { ok: false, error: `所选文件的 --version 输出异常：${out || '空'}` }
+  }
+  if (!isSupportedNodeVersion({ major: +m[1], minor: +m[2] })) {
+    return { ok: false, error: `Node 版本过低（${out}），需 >= 22.19` }
+  }
+  return { ok: true, path: real, version: out }
+}
+
+function validatePiCliPath(rawPath) {
+  const raw = typeof rawPath === 'string' ? rawPath.trim() : ''
+  if (!raw) return { ok: false, error: '请选择有效的 pi CLI 脚本' }
+  let real
+  try {
+    real = fs.realpathSync(raw)
+  } catch (_) {
+    return { ok: false, error: '所选 pi CLI 文件不存在或无法访问' }
+  }
+  try {
+    if (!fs.statSync(real).isFile()) {
+      return { ok: false, error: '所选 pi CLI 路径必须是常规文件' }
+    }
+  } catch (_) {
+    return { ok: false, error: '所选 pi CLI 文件不存在或无法访问' }
+  }
+  if (!/\.(js|mjs|cjs)$/i.test(real)) {
+    return { ok: false, error: '所选 pi CLI 必须是 .js / .mjs / .cjs 脚本文件' }
+  }
+  let dir = path.dirname(real)
+  for (let i = 0; i < 6; i++) {
+    const pkgBase = path.basename(dir).toLowerCase()
+    const scopeBase = path.basename(path.dirname(dir)).toLowerCase()
+    if (pkgBase === 'pi-coding-agent' && scopeBase === '@earendil-works') {
+      const pkgFile = path.join(dir, 'package.json')
+      try {
+        if (fs.statSync(pkgFile).isFile()) {
+          const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'))
+          if (pkg && pkg.name === '@earendil-works/pi-coding-agent') {
+            return { ok: true, path: real, version: typeof pkg.version === 'string' ? pkg.version : '' }
+          }
+        }
+      } catch (_) {}
+    }
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return { ok: false, error: '所选文件必须位于 @earendil-works/pi-coding-agent 包目录内' }
+}
+
+async function validateNodeExecutableAsync(rawPath) {
+  const raw = typeof rawPath === 'string' ? rawPath.trim() : ''
+  if (!raw) return { ok: false, error: '请选择有效的 Node 可执行文件' }
+  let real
+  try {
+    real = await fsp.realpath(raw)
+  } catch (_) {
+    return { ok: false, error: '所选 Node 文件不存在或无法访问' }
+  }
+  try {
+    if (!(await fsp.stat(real)).isFile()) {
+      return { ok: false, error: '所选 Node 路径必须是常规文件' }
+    }
+  } catch (_) {
+    return { ok: false, error: '所选 Node 文件不存在或无法访问' }
+  }
+  if (!isNodeExecutableName(real)) {
+    return { ok: false, error: '所选文件不是有效的 Node 可执行文件' }
+  }
+  const v = await new Promise(resolve => {
+    execFile(real, ['--version'], { encoding: 'utf8', windowsHide: true, timeout: 5000 }, (err, stdout) => {
+      resolve(err ? null : String(stdout || '').trim())
+    })
+  })
+  if (v === null) {
+    return { ok: false, error: '无法执行 --version 验证所选 Node 文件' }
+  }
+  const m = /^v(\d+)\.(\d+)(?:\.\d+)?(?:[-+].*)?$/.exec(v)
+  if (!m) {
+    return { ok: false, error: `所选文件的 --version 输出异常：${v || '空'}` }
+  }
+  if (!isSupportedNodeVersion({ major: +m[1], minor: +m[2] })) {
+    return { ok: false, error: `Node 版本过低（${v}），需 >= 22.19` }
+  }
+  return { ok: true, path: real, version: v }
+}
+
+async function validatePiCliPathAsync(rawPath) {
+  const raw = typeof rawPath === 'string' ? rawPath.trim() : ''
+  if (!raw) return { ok: false, error: '请选择有效的 pi CLI 脚本' }
+  let real
+  try {
+    real = await fsp.realpath(raw)
+  } catch (_) {
+    return { ok: false, error: '所选 pi CLI 文件不存在或无法访问' }
+  }
+  try {
+    if (!(await fsp.stat(real)).isFile()) {
+      return { ok: false, error: '所选 pi CLI 路径必须是常规文件' }
+    }
+  } catch (_) {
+    return { ok: false, error: '所选 pi CLI 文件不存在或无法访问' }
+  }
+  if (!/\.(js|mjs|cjs)$/i.test(real)) {
+    return { ok: false, error: '所选 pi CLI 必须是 .js / .mjs / .cjs 脚本文件' }
+  }
+  let dir = path.dirname(real)
+  for (let i = 0; i < 6; i++) {
+    const pkgBase = path.basename(dir).toLowerCase()
+    const scopeBase = path.basename(path.dirname(dir)).toLowerCase()
+    if (pkgBase === 'pi-coding-agent' && scopeBase === '@earendil-works') {
+      const pkgFile = path.join(dir, 'package.json')
+      try {
+        if ((await fsp.stat(pkgFile)).isFile()) {
+          const pkg = JSON.parse(await fsp.readFile(pkgFile, 'utf8'))
+          if (pkg && pkg.name === '@earendil-works/pi-coding-agent') {
+            return { ok: true, path: real, version: typeof pkg.version === 'string' ? pkg.version : '' }
+          }
+        }
+      } catch (_) {}
+    }
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return { ok: false, error: '所选文件必须位于 @earendil-works/pi-coding-agent 包目录内' }
 }
 
 function nodeMajor(cmd) {
@@ -426,7 +586,12 @@ function makeTextStream() {
 
 // ---------- 目录/路径 ----------
 function validateCwd(p) {
-  return !!(p && fs.existsSync(p) && fs.statSync(p).isDirectory())
+  if (typeof p !== 'string' || !p.trim()) return false
+  try {
+    return fs.statSync(p).isDirectory()
+  } catch (_) {
+    return false
+  }
 }
 // 默认工作区：~/MyPiDeck（首次使用时自动创建）
 function defaultWorkspace() {
@@ -499,8 +664,8 @@ async function parseSkillMdAsync(file) {
   } catch (_) { return null }
 }
 
-function scanSkillsDir(dir, out, seen, visited) {
-  if (!dir) return
+function scanSkillsDir(dir, out, seen, visited, depth = 0) {
+  if (!dir || depth > 4) return
   if (!visited) visited = new Set()
   // 技能目录多为符号链接：按真实路径记 visited，防止链接成环导致无限递归
   let real = dir
@@ -514,12 +679,12 @@ function scanSkillsDir(dir, out, seen, visited) {
   if (direct && !seen.has(direct.name)) { out.push(direct); seen.add(direct.name) }
   for (const e of entries) {
     if (e.name.startsWith('.')) continue
-    if (e.isDirectory() || e.isSymbolicLink()) scanSkillsDir(path.join(dir, e.name), out, seen, visited)
+    if (e.isDirectory() || e.isSymbolicLink()) scanSkillsDir(path.join(dir, e.name), out, seen, visited, depth + 1)
   }
 }
 
-async function scanSkillsDirAsync(dir, out, seen, visited) {
-  if (!dir) return
+async function scanSkillsDirAsync(dir, out, seen, visited, depth = 0) {
+  if (!dir || depth > 4) return
   if (!visited) visited = new Set()
   let real = dir
   try { real = await fsp.realpath(dir) } catch (_) {}
@@ -532,7 +697,7 @@ async function scanSkillsDirAsync(dir, out, seen, visited) {
   if (direct && !seen.has(direct.name)) { out.push(direct); seen.add(direct.name) }
   for (const e of entries) {
     if (e.name.startsWith('.')) continue
-    if (e.isDirectory() || e.isSymbolicLink()) await scanSkillsDirAsync(path.join(dir, e.name), out, seen, visited)
+    if (e.isDirectory() || e.isSymbolicLink()) await scanSkillsDirAsync(path.join(dir, e.name), out, seen, visited, depth + 1)
   }
 }
 
@@ -587,6 +752,8 @@ function listModels(force) {
 // ---------- 工作区文件列表 ----------
 function listFiles(cwd, query) {
   const root = effectiveCwd(cwd)
+  let realRoot = root
+  try { realRoot = fs.realpathSync(root) } catch (_) {}
   const out = []
   const q = (query || '').toLowerCase()
   const skip = new Set(['node_modules', '.git', 'dist', 'build', '.cache', '.venv', '__pycache__'])
@@ -594,18 +761,24 @@ function listFiles(cwd, query) {
   function walk(dir, depth, prefix) {
     if (depth > 3 || out.length >= 200) return
     let real = dir
-    try { real = fs.realpathSync(dir) } catch (_) {}
+    try { real = fs.realpathSync(dir) } catch (_) { return }
+    if (!isPathWithinRoot(real, realRoot)) return
     if (visited.has(real)) return
     visited.add(real)
     let entries
     try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch (_) { return }
     for (const e of entries) {
+      if (out.length >= 200) return
       if (e.name.startsWith('.') || skip.has(e.name)) continue
       const rel = prefix ? `${prefix}/${e.name}` : e.name
       const full = path.join(dir, e.name)
       let isDir = e.isDirectory()
-      if (!isDir && e.isSymbolicLink()) {
-        try { isDir = fs.statSync(full).isDirectory() } catch (_) { continue }
+      if (e.isSymbolicLink()) {
+        try {
+          const realTarget = fs.realpathSync(full)
+          if (!isPathWithinRoot(realTarget, realRoot)) continue
+          isDir = fs.statSync(realTarget).isDirectory()
+        } catch (_) { continue }
       }
       if (q && !rel.toLowerCase().includes(q)) {
         if (isDir) walk(full, depth + 1, rel)
@@ -621,6 +794,8 @@ function listFiles(cwd, query) {
 
 async function listFilesAsync(cwd, query) {
   const root = await effectiveCwdAsync(cwd)
+  let realRoot = root
+  try { realRoot = await fsp.realpath(root) } catch (_) {}
   const out = []
   const q = (query || '').toLowerCase()
   const skip = new Set(['node_modules', '.git', 'dist', 'build', '.cache', '.venv', '__pycache__'])
@@ -628,7 +803,8 @@ async function listFilesAsync(cwd, query) {
   async function walk(dir, depth, prefix) {
     if (depth > 3 || out.length >= 200) return
     let real = dir
-    try { real = await fsp.realpath(dir) } catch (_) {}
+    try { real = await fsp.realpath(dir) } catch (_) { return }
+    if (!isPathWithinRoot(real, realRoot)) return
     if (visited.has(real)) return
     visited.add(real)
     let entries
@@ -639,8 +815,12 @@ async function listFilesAsync(cwd, query) {
       const rel = prefix ? `${prefix}/${e.name}` : e.name
       const full = path.join(dir, e.name)
       let isDir = e.isDirectory()
-      if (!isDir && e.isSymbolicLink()) {
-        try { isDir = (await fsp.stat(full)).isDirectory() } catch (_) { continue }
+      if (e.isSymbolicLink()) {
+        try {
+          const realTarget = await fsp.realpath(full)
+          if (!isPathWithinRoot(realTarget, realRoot)) continue
+          isDir = (await fsp.stat(realTarget)).isDirectory()
+        } catch (_) { continue }
       }
       if (q && !rel.toLowerCase().includes(q)) {
         if (isDir) await walk(full, depth + 1, rel)
@@ -676,17 +856,32 @@ const PRESET_LISTS = {
   full: [...TOOL_NAMES],
 }
 
+const SESSION_ID_RE = /^pideck-[a-z0-9]{4,40}$/i
+const MCP_SERVER_RE = /^[a-z0-9_][a-z0-9_-]{0,63}$/i
+
+function safeSystemPrompt(raw) {
+  if (typeof raw !== 'string' || !raw) return ''
+  // 防止以 '-' 开头的提示词被 CLI 解析为额外 flag
+  return raw.startsWith('-') ? ' ' + raw : raw
+}
+
 // 规范化工具权限结构（缺失时默认最安全的只读档）
 function normalizeTool(tool) {
   const t = (tool && typeof tool === 'object') ? tool : {}
   const list = Array.isArray(t.list) ? t.list.filter(n => TOOL_NAMES.includes(n)) : PRESET_LISTS.read.slice()
+  const skillPaths = Array.isArray(t.skillPaths)
+    ? t.skillPaths
+      .filter(p => typeof p === 'string')
+      .map(p => p.trim())
+      .filter(p => p && !p.startsWith('-') && !/[\r\n\0]/.test(p))
+    : []
   return {
     list,
     mcp: t.mcp === 'all' || t.mcp === 'servers' ? t.mcp : 'off',
     mcpServers: typeof t.mcpServers === 'string' ? t.mcpServers : '',
     ext: !!t.ext,
     skills: t.skills === 'all' || t.skills === 'some' ? t.skills : 'off',
-    skillPaths: Array.isArray(t.skillPaths) ? t.skillPaths.filter(Boolean) : [],
+    skillPaths,
     context: !!t.context,
     templates: !!t.templates,
     trust: !!t.trust,
@@ -697,8 +892,11 @@ function normalizeTool(tool) {
 function buildPermArgs(tool) {
   const t = normalizeTool(tool)
   const args = []
-  const servers = String(t.mcpServers || '').split(',').map(x => x.trim()).filter(Boolean)
-  // "指定 server" 但没填名字时不能当成"全部"放行，按关闭处理
+  const servers = String(t.mcpServers || '')
+    .split(',')
+    .map(x => x.trim())
+    .filter(x => x && MCP_SERVER_RE.test(x))
+  // "指定 server" 但没填合法名字时不能当成"全部"放行，按关闭处理
   const mcpOff = t.mcp === 'off' || (t.mcp === 'servers' && !servers.length)
   const list = t.list.slice()
   if (!list.length) {
@@ -735,7 +933,10 @@ function buildPermArgs(tool) {
 function permFlags(toolOrOpts) {
   const src = (toolOrOpts && toolOrOpts.tool !== undefined) ? toolOrOpts.tool : toolOrOpts
   const t = normalizeTool(src)
-  const servers = String(t.mcpServers || '').split(',').map(x => x.trim()).filter(Boolean)
+  const servers = String(t.mcpServers || '')
+    .split(',')
+    .map(x => x.trim())
+    .filter(x => x && MCP_SERVER_RE.test(x))
   const mcpOff = t.mcp === 'off' || (t.mcp === 'servers' && !servers.length)
   return { noTools: !t.list.length && mcpOff && !t.ext }
 }
@@ -748,9 +949,10 @@ function applyLeanSystemPrompt(opts) {
 // ---------- spawn 参数构造（统一 argv 规则） ----------
 function buildArgs(opts) {
   // 防御：-- 之前的选项值不能以 - 开头（否则被 pi 解析为选项）
-  const safe = v => (v && !String(v).startsWith('-')) ? v : ''
+  const safe = v => (v && !String(v).startsWith('-') && !/[\r\n\0]/.test(String(v))) ? v : ''
   const args = [findPiCli(), '--mode', 'json']
-  if (opts.sessionId && safe(opts.sessionId)) args.push('--session-id', safe(opts.sessionId))
+  const sid = opts.sessionId && SESSION_ID_RE.test(String(opts.sessionId)) ? String(opts.sessionId) : ''
+  if (sid) args.push('--session-id', sid)
   else args.push('--no-session')
   if (opts.model && safe(opts.model)) args.push('--model', safe(opts.model))
   if (opts.thinking && safe(opts.thinking)) args.push('--thinking', safe(opts.thinking))
@@ -758,10 +960,20 @@ function buildArgs(opts) {
   args.push(...buildPermArgs(opts.tool))
   // 禁工具时必须替换 system prompt：否则 pi 仍自称 coding assistant 可执行命令，
   // 模型会输出原始工具调用标记（如 <||DSML||>）而非正常回答
-  if (opts.systemPrompt) args.push('--system-prompt', opts.systemPrompt)
+  const sp = safeSystemPrompt(opts.systemPrompt)
+  if (sp) args.push('--system-prompt', sp)
   args.push('--')
-  for (const f of (opts.files || [])) args.push(`@${f}`)
-  args.push(opts.prompt || '')
+  for (const f of (opts.files || [])) {
+    const item = String(f || '').trim()
+    if (!item || /^data:/i.test(item) || /[\r\n\0]/.test(item)) {
+      throw new Error('标准模式附件不支持 data URL 或非法路径')
+    }
+    args.push(`@${item}`)
+  }
+  // 防止用户 prompt 以 '@' 开头被 pi CLI 误解析为 @file 附件，从而绕过 files 门禁
+  const rawPrompt = typeof opts.prompt === 'string' ? opts.prompt : ''
+  const safePrompt = /^\s*@/.test(rawPrompt) ? `\u200B${rawPrompt}` : rawPrompt
+  args.push(safePrompt)
   return args
 }
 
@@ -784,18 +996,20 @@ function getDefaults(cwd) {
     } catch (e) {
       return resolve({ error: String(e.message || e) })
     }
-    const child = spawn(node, [cli, '--mode', 'rpc', '--no-session'], {
+    const child = spawn(node, [cli, '--mode', 'rpc', '--no-session', '-nt', '--no-mcp', '-ne', '-ns', '-nc', '--no-approve'], {
       cwd: workDir, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     })
     const buf = makeLineBuffer()
     let done = false
     let timeout = null
+    let killTimer = null
     const finish = data => {
       if (done) return
       done = true
       if (timeout) clearTimeout(timeout)
       try { child.stdin.end() } catch (_) {}
-      setTimeout(() => { try { child.kill() } catch (_) {} }, 500)
+      killTimer = setTimeout(() => { try { child.kill() } catch (_) {} }, 500)
+      if (killTimer.unref) killTimer.unref()
       resolve(data)
     }
     child.stdout.on('data', chunk => {
@@ -812,7 +1026,10 @@ function getDefaults(cwd) {
     })
     child.stderr.on('data', () => {})
     child.on('error', e => finish({ error: String(e.message || e) }))
-    child.on('exit', () => { if (!done) finish({ error: 'pi 进程退出' }) })
+    child.on('exit', () => {
+      if (killTimer) { clearTimeout(killTimer); killTimer = null }
+      if (!done) finish({ error: 'pi 进程退出' })
+    })
     try { child.stdin.write(JSON.stringify({ id: 'def1', type: 'get_state' }) + '\n') } catch (_) {}
     timeout = setTimeout(() => { if (!done) finish({ error: '获取默认配置超时' }) }, 20000)
   })
@@ -822,7 +1039,7 @@ function getDefaults(cwd) {
 // 仅接受 pideck- 前缀的合法 id，避免误删其他会话；root 仅供测试注入
 function findPiSession(sessionId, root) {
   const id = String(sessionId || '')
-  if (!/^pideck-[a-z0-9]{4,40}$/i.test(id)) return ''
+  if (!SESSION_ID_RE.test(id)) return ''
   root = root || path.join(agentDir(), 'sessions')
   if (!fs.existsSync(root)) return ''
   const suffix = `_${id}.jsonl`
@@ -844,12 +1061,29 @@ function findPiSession(sessionId, root) {
 }
 function hasPiSession(sessionId, root) { return !!findPiSession(sessionId, root) }
 
-function deletePiSession(sessionId, root) {
-  const id = String(sessionId || '')
-  if (!/^pideck-[a-z0-9]{4,40}$/i.test(id)) return { ok: false, removed: 0, error: 'sessionId 格式不合法' }
+function safeUnlinkSessionFile(target, realRoot) {
+  try {
+    const lst = fs.lstatSync(target)
+    if (lst.isSymbolicLink() || !lst.isFile()) return false
+    const realTarget = fs.realpathSync(target)
+    if (!isPathWithinRoot(realTarget, realRoot)) return false
+    fs.unlinkSync(target)
+    return true
+  } catch (_) {
+    return false
+  }
+}
+
+function deletePiSessions(sessionIds, root) {
+  const validIds = [...new Set((Array.isArray(sessionIds) ? sessionIds : [sessionIds])
+    .map(x => String(x || ''))
+    .filter(id => SESSION_ID_RE.test(id)))]
+  if (!validIds.length) return { ok: false, removed: 0, error: 'sessionId 格式不合法' }
   root = root || path.join(agentDir(), 'sessions')
   if (!fs.existsSync(root)) return { ok: true, removed: 0 }
-  const suffix = `_${id}.jsonl`
+  let realRoot = root
+  try { realRoot = fs.realpathSync(root) } catch (_) { return { ok: true, removed: 0 } }
+  const suffixes = validIds.map(id => `_${id}.jsonl`)
   let removed = 0
   let dirs = []
   try { dirs = fs.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory()) }
@@ -859,14 +1093,17 @@ function deletePiSession(sessionId, root) {
     let files = []
     try { files = fs.readdirSync(dir) } catch (_) { continue }
     for (const f of files) {
-      // 精确后缀匹配，且必须落在 sessions 子目录内
-      if (!f.endsWith(suffix)) continue
+      if (!suffixes.some(sfx => f.endsWith(sfx))) continue
       const target = path.join(dir, f)
       if (!target.startsWith(root + path.sep)) continue
-      try { fs.unlinkSync(target); removed++ } catch (_) {}
+      if (safeUnlinkSessionFile(target, realRoot)) removed++
     }
   }
   return { ok: true, removed }
+}
+
+function deletePiSession(sessionId, root) {
+  return deletePiSessions([sessionId], root)
 }
 
 // 环境诊断：Node/pi 可用性、配置目录与关键文件状态
@@ -1053,9 +1290,10 @@ function detectContextFiles(cwd) {
 
 module.exports = {
   PI_INSTALL_CMD,
-  READ_TOOL_NAMES, TOOL_NAMES,
+  READ_TOOL_NAMES, TOOL_NAMES, SESSION_ID_RE,
   resolvePi, resolvePiAsync, resetPiCache, setPathOverrides, seedResolvedPaths,
+  isNodeExecutableName, validateNodeExecutable, validateNodeExecutableAsync, validatePiCliPath, validatePiCliPathAsync,
   makeLineBuffer, pushChunk, makeTextStream, validateCwd, effectiveCwd, resolveCwd,
-  listSkills, listSkillsAsync, parseModelsOutput, listModels, listFiles, listFilesAsync, buildArgs, buildPermArgs, normalizeTool, permFlags, applyLeanSystemPrompt, detectContextFiles, LEAN_SYSTEM_PROMPT, getDefaults, hasPiSession, deletePiSession, getEnv, getEnvAsync, mapPiEvent, agentDir,
+  listSkills, listSkillsAsync, skillRoots, parseModelsOutput, listModels, listFiles, listFilesAsync, buildArgs, buildPermArgs, normalizeTool, permFlags, applyLeanSystemPrompt, safeSystemPrompt, detectContextFiles, LEAN_SYSTEM_PROMPT, getDefaults, hasPiSession, deletePiSession, deletePiSessions, getEnv, getEnvAsync, mapPiEvent, agentDir,
   os, path, fs,
 }

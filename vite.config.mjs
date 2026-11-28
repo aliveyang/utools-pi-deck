@@ -58,7 +58,8 @@ function copyCore() {
         '@keyframes pideck-boot-tip{to{opacity:1}}',
         '</style>',
       ].join('')
-      html = html.replace('</head>', () => `  ${bootCss}\n  </head>`)
+      const cspMeta = '<meta http-equiv="Content-Security-Policy" content="default-src \'self\'; script-src \'self\'; style-src \'self\' \'unsafe-inline\'; img-src \'self\' data: file:; font-src \'self\' data:; connect-src \'self\'; object-src \'none\'; base-uri \'none\';">'
+      html = html.replace('</head>', () => `  ${cspMeta}\n  ${bootCss}\n  </head>`)
       html = html.replace('<div id="app"></div>',
         '<div id="app"><div id="boot-hint" class="boot-shell"><span class="boot-mark">π</span><span class="boot-tip">正在加载 PiDeck… 若长时间停留此页，说明脚本未执行。</span></div></div>')
       writeFileSync(htmlPath, html)

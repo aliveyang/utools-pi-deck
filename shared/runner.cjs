@@ -4,6 +4,7 @@ const nodeFs = require('node:fs')
 const nodePath = require('node:path')
 const os = require('node:os')
 const defaultCore = require('./pi-core.cjs')
+const { quoteForShell, isValidProviderId } = require('./config.cjs')
 
 function toolSummary(t) {
   if (!t) return '无工具'
@@ -36,6 +37,10 @@ function createRunner(deps = {}) {
   let currentChild = null
   let activeJsonCancel = null
   let activeRpcCancel = null
+  let _modelsPromise = null
+  let _modelsCache = null
+  let _modelsAt = 0
+  const MODELS_TTL = 60 * 1000
 
   // 包装 handlers：工具级立即落盘，运行结束补一条汇总（幂等收口）
   function wrapHandlers(opts, handlers, ctx) {
@@ -83,19 +88,33 @@ function createRunner(deps = {}) {
   }
 
   // 打开终端执行登录命令：Windows 写插件临时目录 .cmd 规避引号转义（转义 % 并拒绝换行），macOS 走 AppleScript
-  function openTerminal(command) {
+  function cleanupOldLoginScripts() {
+    try {
+      const cutoff = Date.now() - 10 * 60 * 1000
+      for (const name of fs.readdirSync(tempDir)) {
+        if (!/^pideck-login-.*\.cmd$/i.test(name)) continue
+        const p = path.join(tempDir, name)
+        try {
+          if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p)
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  function launchTerminalCommand(command) {
     const safeCmd = String(command || '').trim()
     if (!safeCmd || /[\r\n\0]/.test(safeCmd)) return false
     try {
       if (process.platform === 'win32') {
         fs.mkdirSync(tempDir, { recursive: true })
-        const file = path.join(tempDir, `pideck-login-${process.pid}.cmd`)
-        if (/["\r\n\0]/.test(file)) return false
+        cleanupOldLoginScripts()
+        const file = path.join(tempDir, `pideck-login-${process.pid}-${Date.now().toString(36)}.cmd`)
+        if (/["\r\n\0&|<>^%!]/.test(file)) return false
         const batchCmd = safeCmd.replace(/%/g, '%%')
         fs.writeFileSync(file, `@echo off\r\n${batchCmd}\r\n`, { encoding: 'utf8', mode: 0o600 })
-        // start 的第一个参数是窗口标题（空串）；文件路径加引号以兼容含空格的目录
-        const child = spawn('cmd.exe', ['/c', 'start', '', 'cmd.exe', '/k', `"${file}"`], {
-          detached: true, stdio: 'ignore', windowsHide: false,
+        // start 的第一个参数是窗口标题（空串）；启用 windowsVerbatimArguments 避免 libuv 二次转义破坏含空格路径
+        const child = spawn('cmd.exe', ['/d', '/c', `start "" cmd.exe /k "${file}"`], {
+          detached: true, stdio: 'ignore', windowsHide: false, windowsVerbatimArguments: true,
         })
         child.on('error', () => {})
         child.unref()
@@ -110,6 +129,23 @@ function createRunner(deps = {}) {
       }
       return false
     } catch (_) { return false }
+  }
+
+  function openInstallTerminal() {
+    return launchTerminalCommand(core.PI_INSTALL_CMD || defaultCore.PI_INSTALL_CMD)
+  }
+
+  function openLoginTerminal(provider) {
+    const id = String(provider || '').trim()
+    if (!isValidProviderId(id)) return false
+    let cmd = `pi auth login ${id}`
+    try {
+      const { node, cli } = core.resolvePi()
+      const qNode = quoteForShell(node)
+      const qCli = quoteForShell(cli)
+      if (qNode && qCli) cmd = `${qNode} ${qCli} auth login ${id}`
+    } catch (_) {}
+    return launchTerminalCommand(cmd)
   }
 
   function run(opts, handlers) {
@@ -188,7 +224,9 @@ function createRunner(deps = {}) {
       if (stderr.length < 16000) stderr += errStream.push(c).slice(0, 8000)
     })
 
+    let timer = null
     const release = () => {
+      if (timer) { clearTimeout(timer); timer = null }
       if (currentChild === child) currentChild = null
       if (activeJsonCancel === doJsonCancel) activeJsonCancel = null
     }
@@ -218,7 +256,7 @@ function createRunner(deps = {}) {
     })
 
     // watchdog：15 分钟无结束则强杀
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       if (!settled) {
         settled = true
         aborted = true
@@ -227,7 +265,7 @@ function createRunner(deps = {}) {
         wrapped.onError && wrapped.onError('pi 运行超时（15 分钟），已终止')
       }
     }, 15 * 60 * 1000)
-    child.on('close', () => clearTimeout(timer))
+    if (timer.unref) timer.unref()
 
     return {
       cancel: doJsonCancel,
@@ -253,17 +291,35 @@ function createRunner(deps = {}) {
     try { child.kill(); return true } catch (_) { return false }
   }
 
-  async function listModelsAsync() {
-    const { node, cli } = core.resolvePiAsync ? await core.resolvePiAsync() : core.resolvePi()
-    return new Promise((resolve, reject) => {
-      execFile(node, [cli, '--list-models'], { windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
-        if (err) return reject(err)
-        resolve(core.parseModelsOutput(stdout))
-      })
-    })
+  function resetModelsCache() {
+    _modelsCache = null
+    _modelsAt = 0
   }
 
-  return { run, cancel, listModelsAsync, openTerminal, wrapHandlers }
+  async function listModelsAsync(opts) {
+    const force = !!(opts && opts.force)
+    if (!force && _modelsCache && Date.now() - _modelsAt < MODELS_TTL) {
+      return _modelsCache
+    }
+    if (!force && _modelsPromise) return _modelsPromise
+    const runFetch = async () => {
+      const { node, cli } = core.resolvePiAsync ? await core.resolvePiAsync() : core.resolvePi()
+      return new Promise((resolve, reject) => {
+        execFile(node, [cli, '--list-models'], { windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+          if (err) return reject(err)
+          const list = core.parseModelsOutput(stdout)
+          _modelsCache = list
+          _modelsAt = Date.now()
+          resolve(list)
+        })
+      })
+    }
+    if (force) return runFetch()
+    _modelsPromise = runFetch().finally(() => { _modelsPromise = null })
+    return _modelsPromise
+  }
+
+  return { run, cancel, listModelsAsync, resetModelsCache, openInstallTerminal, openLoginTerminal, wrapHandlers }
 }
 
 module.exports = {

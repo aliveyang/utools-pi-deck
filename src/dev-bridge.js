@@ -71,9 +71,9 @@ function syncPost(path) { return syncReq('POST', path) }
 
 let homedir = (syncGet('/homedir') || {}).homedir || ''
 
-function listModelsAsync() {
-  // 与 preload.listModelsAsync 对齐：强制绕过 dev-server 的 60s TTL 缓存
-  return fetch(BASE + '/models?force=1').then(r => r.json())
+function listModelsAsync(opts) {
+  const force = !!(opts && opts.force)
+  return fetch(BASE + '/models' + (force ? '?force=1' : '')).then(r => r.json())
 }
 
 window.piBridge = {
@@ -84,8 +84,9 @@ window.piBridge = {
   clearImages: () => 0,
   pickFolder: () => null,
   pickFiles: () => null,
-  pickExecutable: () => null,
-  validateCwd: p => !!(p),
+  pickExecutable: () => ({ ok: false, error: 'dev 预览不支持选择可执行文件，请在 uTools 中使用' }),
+  clearExecutable: () => ({ ok: false, error: 'dev 预览不支持修改路径配置，请在 uTools 中使用' }),
+  isWorkspaceApproved: () => true,
   listSkillsAsync: async cwd => {
     try { return await fetch(BASE + '/skills?cwd=' + encodeURIComponent(cwd || '')).then(r => r.json()) }
     catch (_) { return [] }
@@ -103,6 +104,15 @@ window.piBridge = {
   deletePiSession: id => {
     try { return syncPost('/delete-session?id=' + encodeURIComponent(id || '')) || { ok: false } }
     catch (_) { return { ok: false } }
+  },
+  deletePiSessions: ids => {
+    const list = Array.isArray(ids) ? ids : []
+    let removed = 0
+    for (const id of list) {
+      const r = window.piBridge.deletePiSession(id)
+      if (r && r.removed) removed += r.removed
+    }
+    return { ok: true, removed }
   },
   getEnvAsync: async () => {
     try { return await fetch(BASE + '/env').then(r => r.json()) }
@@ -164,10 +174,11 @@ window.piBridge = {
   homedir: () => homedir,
   // dev 预览不读写真实 pi 配置与审计目录
   auditTail: () => [],
+  auditTailAsync: () => Promise.resolve([]),
   auditExport: () => '',
+  auditExportAsync: () => Promise.resolve(''),
   auditDir: () => '',
   auditClear: () => ({ removed: 0, failed: 0 }),
-  auditRecord: () => false,
   configState: () => ({ ok: false, error: 'dev 预览不支持修改 pi 配置，请在 uTools 中使用' }),
   configSave: () => ({ ok: false, error: 'dev 预览不支持修改 pi 配置' }),
   configRemoveKey: () => ({ ok: false, error: 'dev 预览不支持修改 pi 配置' }),

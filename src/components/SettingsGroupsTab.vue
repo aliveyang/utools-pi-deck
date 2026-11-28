@@ -16,15 +16,17 @@ const props = defineProps({
   defaults: { type: Object, default: () => ({}) },
   defaultCwd: { type: String, default: '' },
   displayCwd: { type: Function, required: true },
+  workspaceAuthRev: { type: Number, default: 0 },
 })
 
-const emit = defineEmits(['saveGroup', 'deleteGroup', 'refreshModels', 'editingChange'])
+const emit = defineEmits(['saveGroup', 'deleteGroup', 'refreshModels', 'editingChange', 'workspaceAuthorized'])
 
 const editing = ref(null)
 const editOrigRiskKeys = ref(new Set())
 const editContextFiles = ref([])
 const editSkills = ref([])
 const showAdvanced = ref(false)
+const localAuthRev = ref(0)
 const { isConfirming, confirm, reset } = useConfirm()
 
 watch(editing, val => {
@@ -61,7 +63,7 @@ function scheduleRefreshEditEnv() {
 }
 
 watch(
-  [() => editing.value && editing.value.id, () => editing.value && editing.value.cwd, () => props.defaultCwd],
+  [() => editing.value && editing.value.id, () => editing.value && editing.value.cwd, () => props.defaultCwd, () => props.workspaceAuthRev],
   ([id], [oldId]) => {
     if (!editing.value) return
     if (id !== oldId) {
@@ -158,7 +160,13 @@ function requestDeleteGroup() {
 function pickCwd() {
   if (!window.piBridge || !window.piBridge.pickFolder) return
   const dir = window.piBridge.pickFolder()
-  if (dir && editing.value) editing.value.cwd = dir
+  if (dir && editing.value) {
+    const same = editing.value.cwd === dir
+    editing.value.cwd = dir
+    localAuthRev.value++
+    emit('workspaceAuthorized')
+    if (same) refreshEditEnv()
+  }
 }
 
 const editTool = computed(() => (editing.value && editing.value.tool) || TOOL_PRESETS.read)
@@ -195,6 +203,14 @@ function toggleSkill(name) {
 
 const editRisk = computed(() => editRiskReasons(editing.value && editing.value.tool))
 const editHasExec = computed(() => hasExecRisk(editing.value && editing.value.tool))
+const editCwdApproved = computed(() => {
+  void props.workspaceAuthRev
+  void localAuthRev.value
+  const cwd = (editing.value && editing.value.cwd) || props.defaultCwd || ''
+  if (!cwd) return true
+  if (!window.piBridge || typeof window.piBridge.isWorkspaceApproved !== 'function') return true
+  return window.piBridge.isWorkspaceApproved(cwd)
+})
 
 const advActiveCount = computed(() => {
   const t = editTool.value
@@ -254,10 +270,12 @@ defineExpose({ openGroupById, clearEditing })
     <label>
       <span>工作文件夹（留空则用全局默认）</span>
       <div class="cwd-row">
-        <input v-model="editing.cwd" type="text" :placeholder="`留空 = ${displayCwd('')}`" />
+        <input :value="editing.cwd" type="text" readonly :placeholder="`留空 = ${displayCwd('')}`" />
         <button class="mini-btn" @click="pickCwd">选择</button>
+        <button v-if="editing.cwd" class="mini-btn" @click="editing.cwd = ''">清除</button>
       </div>
-      <span class="hint accent">当前生效：{{ displayCwd(editing.cwd) }}{{ editing.cwd ? '' : '（默认值）' }}</span>
+      <span v-if="!editCwdApproved" class="hint warn">当前生效目录尚未在本机授权（可能来自其他设备同步），请点击「选择」重新授权。</span>
+      <span v-else class="hint accent">当前生效：{{ displayCwd(editing.cwd) }}{{ editing.cwd ? '' : '（默认值）' }}</span>
     </label>
 
     <div class="perm-section">

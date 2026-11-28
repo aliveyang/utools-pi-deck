@@ -1,11 +1,10 @@
 <script setup>
 // 对话流：两套布局共用同一份渲染，外层风格通过 variant（console | classic）控制
-import { ref, watch } from 'vue'
-import { formatText } from '../format.js'
 import { PI_INSTALL_CMD } from '../constants.js'
 import Icon from './Icon.vue'
+import TurnItem from './TurnItem.vue'
 
-const props = defineProps({
+defineProps({
   variant: { type: String, default: 'console' },   // console | classic
   sessionId: { type: String, default: '' },
   visible: { type: Array, default: () => [] },
@@ -23,90 +22,6 @@ const props = defineProps({
   envInfo: { type: Object, default: null },
 })
 const emit = defineEmits(['earlier', 'chip', 'copy', 'link', 'preview', 'regenerate', 'installPi', 'openConfig', 'recheckEnv'])
-
-const thinkOpenMap = ref({})
-const toolsOpenMap = ref({})
-const toolExpandedMap = ref({})
-const brokenImageMap = ref({})
-
-watch([() => props.sessionId, () => props.total === 0], ([id, isEmpty], [oldId]) => {
-  if (isEmpty || id !== oldId) {
-    thinkOpenMap.value = {}
-    toolsOpenMap.value = {}
-    toolExpandedMap.value = {}
-    brokenImageMap.value = {}
-  }
-})
-
-const htmlCache = new WeakMap()
-function renderText(m) {
-  const text = (m && m.text) || ''
-  if (!m || typeof m !== 'object') return formatText(text)
-  const hit = htmlCache.get(m)
-  if (hit && hit.text === text) return hit.html
-  const html = formatText(text)
-  htmlCache.set(m, { text, html })
-  return html
-}
-
-function imageSrc(p) {
-  if (!p) return ''
-  if (/^(data:|https?:|file:)/.test(p)) return p
-  const clean = String(p).replace(/\\/g, '/').replace(/^\/+/, '')
-  return 'file:///' + encodeURI(clean).replace(/#/g, '%23').replace(/\?/g, '%3F')
-}
-function imageKey(i, pi) { return `${msgKey(i)}:${pi}` }
-function isImageBroken(i, pi) { return !!brokenImageMap.value[imageKey(i, pi)] }
-function markImageBroken(i, pi) { brokenImageMap.value[imageKey(i, pi)] = true }
-
-function msgKey(i) { return props.hiddenCount + i }
-function isLast(i) { return props.hiddenCount + i === props.total - 1 }
-function thinkOpen(i) {
-  const k = msgKey(i)
-  if (k in thinkOpenMap.value) return thinkOpenMap.value[k]
-  return props.running && isLast(i)
-}
-function toggleThink(i) {
-  const k = msgKey(i)
-  thinkOpenMap.value[k] = !thinkOpen(i)
-}
-function toolsOpen(i) { return !!toolsOpenMap.value[msgKey(i)] }
-function toggleTools(i) {
-  const k = msgKey(i)
-  toolsOpenMap.value[k] = !toolsOpenMap.value[k]
-}
-function toolExpanded(i, t, k) {
-  return !!toolExpandedMap.value[`${msgKey(i)}:${t.id || k}`]
-}
-function toggleTool(i, t, k) {
-  const key = `${msgKey(i)}:${t.id || k}`
-  toolExpandedMap.value[key] = !toolExpandedMap.value[key]
-}
-
-function toolPillText(m) {
-  const list = m.tools || []
-  if (!list.length) return ''
-  const uniq = [...new Set(list.map(t => t.name))]
-  if (uniq.length === 1) return `${uniq[0]} ×${list.length}`
-  return `${list.length} 个操作`
-}
-function fmtArgs(v) {
-  try { return JSON.stringify(v, null, 2) } catch (_) { return String(v) }
-}
-function onTextClick(e) {
-  const copyBtn = e.target && e.target.closest && e.target.closest('.code-copy-btn')
-  if (copyBtn) {
-    const codeEl = copyBtn.parentElement && copyBtn.parentElement.querySelector('pre code')
-    if (codeEl) emit('copy', codeEl.innerText)
-    return
-  }
-  const a = e.target && e.target.closest && e.target.closest('a.md-link')
-  if (!a) return
-  e.preventDefault()
-  emit('link', a.getAttribute('href'))
-}
-const typingText = () => props.runPhase === 'spawning' ? '正在启动引擎…'
-  : props.runPhase === 'connecting' ? '正在连接模型…' : '正在思考…'
 </script>
 
 <template>
@@ -172,60 +87,19 @@ const typingText = () => props.runPhase === 'spawning' ? '正在启动引擎…'
       加载更早的 {{ Math.min(pageSize, hiddenCount) }} 条（还有 {{ hiddenCount }} 条）
     </button>
 
-    <div v-for="(m, i) in visible" :key="hiddenCount + i" class="turn" :class="m.role">
-      <template v-if="m.role === 'user'">
-        <div class="turn-gutter">›</div>
-        <div class="turn-body">
-          <div v-if="m.imageCount" class="image-tag">{{ m.imageCount }} 张图片</div>
-          <div v-if="m.imagePaths && m.imagePaths.length" class="msg-images">
-            <template v-for="(p, pi) in m.imagePaths" :key="pi">
-              <div v-if="isImageBroken(i, pi)" class="img-missing" title="原图已清理或仅保存在发送设备">
-                <span>图片不可用</span>
-              </div>
-              <img v-else :src="imageSrc(p)" alt="图片" title="点击放大" @click="emit('preview', imageSrc(p))" @error="markImageBroken(i, pi)" />
-            </template>
-          </div>
-          <div v-if="m.fileNames && m.fileNames.length" class="msg-files">
-            <span v-for="(fn, fi) in m.fileNames" :key="fi" class="file-chip">{{ fn }}</span>
-          </div>
-          <div class="turn-text" v-html="renderText(m)" @click="onTextClick"></div>
-        </div>
-      </template>
-      <template v-else>
-        <div class="turn-gutter gutter-ai"><Icon name="pi" :size="variant === 'classic' ? 13 : 11" :stroke="variant === 'classic' ? 1.8 : 1.9" /></div>
-        <div class="turn-body">
-          <div v-if="m.thinking || (m.tools && m.tools.length)" class="pills">
-            <button v-if="m.thinking" class="pill" :class="{ open: thinkOpen(i) }" @click="toggleThink(i)">
-              <Icon name="chevronDown" :size="10" class="pill-chev" />
-              <span>思考</span>
-              <span v-if="running && isLast(i)" class="pill-live">进行中</span>
-            </button>
-            <button v-if="m.tools && m.tools.length" class="pill" :class="{ open: toolsOpen(i) }" @click="toggleTools(i)">
-              <Icon name="chevronDown" :size="10" class="pill-chev" />
-              <span>{{ toolPillText(m) }}</span>
-            </button>
-          </div>
-          <div v-if="m.thinking && thinkOpen(i)" class="fold-body think-body">{{ m.thinking }}</div>
-          <div v-if="m.tools && m.tools.length && toolsOpen(i)" class="fold-body">
-            <div v-for="(t, k) in m.tools" :key="t.id || k" class="tool-item">
-              <button class="tool-line" @click="toggleTool(i, t, k)">
-                <span class="tool-name">{{ t.name }}</span>
-                <Icon name="chevron" :size="11" class="tool-chev" :class="{ open: toolExpanded(i, t, k) }" />
-              </button>
-              <pre v-if="toolExpanded(i, t, k)" class="tool-detail">{{ t.result ? fmtArgs(t.args) + '\n→ ' + fmtArgs(t.result) : fmtArgs(t.args) }}</pre>
-            </div>
-          </div>
-          <div v-if="m.text" class="turn-text" v-html="renderText(m)" @click="onTextClick"></div>
-          <div v-if="running && isLast(i) && !m.text" class="typing"><span class="typing-dot"></span><span>{{ typingText() }}</span></div>
-          <div v-if="m.aborted" class="aborted">已停止</div>
-          <div v-if="m.error" class="turn-error">{{ m.error }}</div>
-          <div v-if="!running && (m.text || m.error || m.aborted)" class="turn-actions">
-            <button v-if="m.text" class="action-btn" @click="emit('copy', m.text)"><Icon name="copy" :size="11" />复制</button>
-            <button v-if="isLast(i)" class="action-btn" @click="emit('regenerate')"><Icon name="retry" :size="11" />重新生成</button>
-          </div>
-        </div>
-      </template>
-    </div>
+    <TurnItem
+      v-for="(m, i) in visible"
+      :key="`${sessionId || 'new'}:${hiddenCount + i}`"
+      :msg="m"
+      :variant="variant"
+      :running="running"
+      :is-last="hiddenCount + i === total - 1"
+      :run-phase="runPhase"
+      @copy="emit('copy', $event)"
+      @link="emit('link', $event)"
+      @preview="emit('preview', $event)"
+      @regenerate="emit('regenerate')"
+    />
 
     <div v-if="usage" class="usage">{{ usage }}</div>
     <div v-if="error" class="error-box">{{ error }}</div>
@@ -236,114 +110,114 @@ const typingText = () => props.runPhase === 'spawning' ? '正在启动引擎…'
 .thread { max-width: var(--measure); margin: 0 auto; min-height: 100%; display: flex; flex-direction: column; }
 .thread.v-classic { max-width: 880px; }
 
-.turn { display: grid; grid-template-columns: 20px minmax(0, 1fr); column-gap: 12px; margin-bottom: 20px; }
-.thread.v-classic .turn { grid-template-columns: 24px minmax(0, 1fr); column-gap: 10px; margin-bottom: 18px; }
-.thread.v-classic .turn.user { display: flex; justify-content: flex-end; }
-.thread.v-classic .turn.user .turn-gutter { display: none; }
-.thread.v-classic .turn.user .turn-body {
+.thread :deep(.turn) { display: grid; grid-template-columns: 20px minmax(0, 1fr); column-gap: 12px; margin-bottom: 20px; }
+.thread.v-classic :deep(.turn) { grid-template-columns: 24px minmax(0, 1fr); column-gap: 10px; margin-bottom: 18px; }
+.thread.v-classic :deep(.turn.user) { display: flex; justify-content: flex-end; }
+.thread.v-classic :deep(.turn.user .turn-gutter) { display: none; }
+.thread.v-classic :deep(.turn.user .turn-body) {
   max-width: 82%; background: var(--bubble); border: 1px solid var(--line);
   border-radius: 12px 12px 4px 12px; padding: 8px 12px;
 }
-.thread.v-classic .turn.user .turn-text { font-size: 12.5px; line-height: 1.6; }
+.thread.v-classic :deep(.turn.user .turn-text) { font-size: 12.5px; line-height: 1.6; }
 
-.turn-gutter { font-size: 14px; line-height: 1.55; color: var(--accent); font-weight: 500; user-select: none; }
-.turn-gutter.gutter-ai { color: var(--ink-3); display: flex; justify-content: flex-start; padding-top: 5px; }
-.thread.v-classic .turn-gutter.gutter-ai {
+.thread :deep(.turn-gutter) { font-size: 14px; line-height: 1.55; color: var(--accent); font-weight: 500; user-select: none; }
+.thread :deep(.turn-gutter.gutter-ai) { color: var(--ink-3); display: flex; justify-content: flex-start; padding-top: 5px; }
+.thread.v-classic :deep(.turn-gutter.gutter-ai) {
   width: 24px; height: 24px; border-radius: 7px; background: var(--accent-soft);
   color: var(--accent); border: 1px solid var(--accent-soft);
   display: flex; align-items: center; justify-content: center; padding-top: 0;
 }
-.turn-body { min-width: 0; position: relative; }
+.thread :deep(.turn-body) { min-width: 0; position: relative; }
 
-.turn-text { font-size: 13.5px; line-height: 1.72; color: var(--ink); word-break: break-word; }
-.thread.v-classic .turn-text { font-size: 13px; }
-.turn-text :deep(strong) { font-weight: 500; }
-.turn-text :deep(h1), .turn-text :deep(h2), .turn-text :deep(h3) { font-size: 13.5px; font-weight: 500; margin: 14px 0 6px; }
-.turn-text :deep(ul), .turn-text :deep(ol) { margin: 6px 0; padding-left: 20px; }
-.turn-text :deep(li) { margin: 3px 0; }
-.turn-text :deep(code) {
+.thread :deep(.turn-text) { font-size: 13.5px; line-height: 1.72; color: var(--ink); word-break: break-word; }
+.thread.v-classic :deep(.turn-text) { font-size: 13px; }
+.thread :deep(.turn-text strong) { font-weight: 500; }
+.thread :deep(.turn-text h1), .thread :deep(.turn-text h2), .thread :deep(.turn-text h3) { font-size: 13.5px; font-weight: 500; margin: 14px 0 6px; }
+.thread :deep(.turn-text ul), .thread :deep(.turn-text ol) { margin: 6px 0; padding-left: 20px; }
+.thread :deep(.turn-text li) { margin: 3px 0; }
+.thread :deep(.turn-text code) {
   background: var(--surface); border-radius: 4px; padding: 1px 4px; font-size: 12px;
   border: 1px solid var(--line);
 }
-.turn-text :deep(.code-block) { position: relative; margin: 10px 0; }
-.turn-text :deep(pre) {
+.thread :deep(.turn-text .code-block) { position: relative; margin: 10px 0; }
+.thread :deep(.turn-text pre) {
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm);
   padding: 11px 12px; margin: 0; overflow-x: auto; font-size: 12px; line-height: 1.6;
 }
-.thread.v-classic .turn-text :deep(pre) { font-size: 11.5px; }
-.turn-text :deep(pre code) { background: none; border: 0; padding: 0; font-size: inherit; }
-.turn-text :deep(.code-copy-btn) {
+.thread.v-classic :deep(.turn-text pre) { font-size: 11.5px; }
+.thread :deep(.turn-text pre code) { background: none; border: 0; padding: 0; font-size: inherit; }
+.thread :deep(.turn-text .code-copy-btn) {
   position: absolute; top: 6px; right: 8px; z-index: 1;
   font-size: 10.5px; color: var(--ink-2); background: var(--raised);
   border: 1px solid var(--line-2); border-radius: 4px; padding: 2px 7px;
   opacity: 0; transition: opacity .12s var(--ease), color .12s var(--ease), border-color .12s var(--ease);
 }
-.turn-text :deep(.code-block:hover .code-copy-btn),
-.turn-text :deep(.code-copy-btn:focus-visible) { opacity: 1; }
-.turn-text :deep(.code-copy-btn:hover) { color: var(--accent); border-color: var(--accent); }
-.turn-text :deep(.md-link) { color: var(--accent); text-decoration: none; }
-.turn-text :deep(.md-link:hover) { text-decoration: underline; }
+.thread :deep(.turn-text .code-block:hover .code-copy-btn),
+.thread :deep(.turn-text .code-copy-btn:focus-visible) { opacity: 1; }
+.thread :deep(.turn-text .code-copy-btn:hover) { color: var(--accent); border-color: var(--accent); }
+.thread :deep(.turn-text .md-link) { color: var(--accent); text-decoration: none; }
+.thread :deep(.turn-text .md-link:hover) { text-decoration: underline; }
 
-.pills { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px -1px; }
-.thread.v-classic .pills { margin-left: 0; }
-.pill {
+.thread :deep(.pills) { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px -1px; }
+.thread.v-classic :deep(.pills) { margin-left: 0; }
+.thread :deep(.pill) {
   height: 22px; padding: 0 9px; border-radius: 11px; background: var(--surface);
   display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--ink-2);
   transition: background .14s var(--ease), color .14s var(--ease);
 }
-.pill:hover { background: var(--surface-2); color: var(--ink); }
-.pill-chev { transition: transform .16s var(--ease); transform: rotate(-90deg); }
-.pill.open .pill-chev { transform: rotate(0deg); }
-.pill-live { color: var(--accent); }
-.fold-body {
+.thread :deep(.pill:hover) { background: var(--surface-2); color: var(--ink); }
+.thread :deep(.pill-chev) { transition: transform .16s var(--ease); transform: rotate(-90deg); }
+.thread :deep(.pill.open .pill-chev) { transform: rotate(0deg); }
+.thread :deep(.pill-live) { color: var(--accent); }
+.thread :deep(.fold-body) {
   background: var(--surface); border-radius: var(--r-sm); padding: 9px 11px; margin: 0 0 10px;
   font-size: 12px; line-height: 1.65; color: var(--ink-2); white-space: pre-wrap; word-break: break-word;
 }
-.think-body { max-height: 200px; overflow-y: auto; font-size: 11.5px; }
-.tool-item + .tool-item { margin-top: 2px; }
-.tool-line {
+.thread :deep(.think-body) { max-height: 200px; overflow-y: auto; font-size: 11.5px; }
+.thread :deep(.tool-item + .tool-item) { margin-top: 2px; }
+.thread :deep(.tool-line) {
   display: flex; align-items: center; justify-content: space-between; width: 100%;
   padding: 3px 0; font-size: 11.5px; color: var(--ink-2); text-align: left;
 }
-.tool-line:hover { color: var(--accent); }
-.tool-name { font-family: var(--mono); }
-.tool-chev { color: var(--ink-3); transition: transform .16s var(--ease); }
-.tool-chev.open { transform: rotate(90deg); }
-.tool-detail {
+.thread :deep(.tool-line:hover) { color: var(--accent); }
+.thread :deep(.tool-name) { font-family: var(--mono); }
+.thread :deep(.tool-chev) { color: var(--ink-3); transition: transform .16s var(--ease); }
+.thread :deep(.tool-chev.open) { transform: rotate(90deg); }
+.thread :deep(.tool-detail) {
   background: var(--paper); border: 1px solid var(--line); border-radius: 5px; padding: 8px;
   margin: 4px 0 0; font-size: 11px; line-height: 1.55; color: var(--ink-2);
   white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow-y: auto;
 }
 
-.typing { font-size: 12px; color: var(--ink-3); padding: 2px 0; display: inline-flex; align-items: center; gap: 7px; }
-.typing-dot {
+.thread :deep(.typing) { font-size: 12px; color: var(--ink-3); padding: 2px 0; display: inline-flex; align-items: center; gap: 7px; }
+.thread :deep(.typing-dot) {
   width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex: none;
   animation: typing-pulse 1.2s ease-in-out infinite;
 }
 @keyframes typing-pulse { 0%, 100% { opacity: .35; transform: scale(.88) } 50% { opacity: 1; transform: scale(1) } }
-.aborted { font-size: 11.5px; color: var(--ink-3); margin-top: 6px; }
-.turn-error { font-size: 12px; color: var(--danger); margin-top: 8px; white-space: pre-wrap; }
-.turn-actions { display: flex; align-items: center; gap: 6px; height: 20px; margin-top: 6px; opacity: 0; transition: opacity .14s var(--ease); }
-.turn:hover .turn-actions, .turn-actions:focus-within { opacity: 1; }
-.action-btn {
+.thread :deep(.aborted) { font-size: 11.5px; color: var(--ink-3); margin-top: 6px; }
+.thread :deep(.turn-error) { font-size: 12px; color: var(--danger); margin-top: 8px; white-space: pre-wrap; }
+.thread :deep(.turn-actions) { display: flex; align-items: center; gap: 6px; height: 20px; margin-top: 6px; opacity: 0; transition: opacity .14s var(--ease); }
+.thread :deep(.turn:hover .turn-actions), .thread :deep(.turn-actions:focus-within) { opacity: 1; }
+.thread :deep(.action-btn) {
   display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--ink-3);
   padding: 2px 6px; border-radius: 4px;
 }
-.action-btn:hover { background: var(--surface-2); color: var(--ink-2); }
-.image-tag { font-size: 11px; color: var(--ink-3); margin-bottom: 4px; }
-.msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
-.msg-images img {
+.thread :deep(.action-btn:hover) { background: var(--surface-2); color: var(--ink-2); }
+.thread :deep(.image-tag) { font-size: 11px; color: var(--ink-3); margin-bottom: 4px; }
+.thread :deep(.msg-images) { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
+.thread :deep(.msg-images img) {
   width: 72px; height: 72px; object-fit: cover; cursor: zoom-in;
   border: 1px solid var(--line-2); border-radius: 6px;
 }
-.img-missing {
+.thread :deep(.img-missing) {
   width: 72px; height: 72px; border: 1px dashed var(--line-2); border-radius: 6px;
   background: var(--surface); color: var(--ink-3); font-size: 10.5px; line-height: 1.3;
   display: flex; align-items: center; justify-content: center; text-align: center; padding: 6px;
   user-select: none;
 }
-.msg-files { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
-.file-chip {
+.thread :deep(.msg-files) { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 6px; }
+.thread :deep(.file-chip) {
   display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line-2);
   border-radius: 13px; padding: 2px 8px; font-size: 11px; color: var(--ink-2); max-width: 180px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

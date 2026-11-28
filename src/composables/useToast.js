@@ -1,5 +1,5 @@
 // 轻提示与剪贴板
-import { ref } from 'vue'
+import { ref, onUnmounted } from 'vue'
 
 export function useToast() {
   const toast = ref('')
@@ -10,6 +10,11 @@ export function useToast() {
     clearTimeout(timer)
     timer = setTimeout(() => { toast.value = '' }, 2200)
   }
+
+  onUnmounted(() => {
+    clearTimeout(timer)
+    timer = null
+  })
 
   function copyText(text) {
     const str = String(text ?? '')

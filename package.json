@@ -1,6 +1,6 @@
 {
   "name": "pideck",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "PiDeck - uTools 内的 pi 快速对话面板",
   "scripts": {

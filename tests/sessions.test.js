@@ -131,6 +131,31 @@ describe('辅助函数', () => {
     const fitted = fitSessionBudget(bigSession, 3000)
     expect(Buffer.byteLength(JSON.stringify(fitted), 'utf8')).toBeLessThanOrEqual(3000)
     expect(fitted.messages.at(-1).text).toBe('x'.repeat(2000))
+
+    // 单条超大消息也必须裁剪到预算以内，且应尽可能保留最长前缀（二分不破坏原串）
+    const origLong = Array.from({ length: 1000 }, (_, i) => `${i % 10}`).join('')
+    const singleHuge = {
+      id: 's-huge-one',
+      messages: [{ role: 'assistant', text: origLong }],
+    }
+    const fittedOne = fitSessionBudget(singleHuge, 500)
+    expect(Buffer.byteLength(JSON.stringify(fittedOne), 'utf8')).toBeLessThanOrEqual(500)
+    expect(fittedOne.messages).toHaveLength(1)
+    expect(fittedOne.messages[0].text).toContain('已裁剪')
+    expect(fittedOne.messages[0].text.match(/已裁剪/g)).toHaveLength(1)
+    expect(fittedOne.messages[0].text.length).toBeGreaterThan(200)
+
+    // 单条消息含超大 tool.args 时也必须裁剪回预算以内
+    const hugeArgsSession = {
+      id: 's-huge-args',
+      messages: [{
+        role: 'assistant',
+        text: 'ok',
+        tools: [{ id: 't1', name: 'write', args: { content: 'a'.repeat(5000) }, result: 'done' }],
+      }],
+    }
+    const fittedArgs = fitSessionBudget(hugeArgsSession, 400)
+    expect(Buffer.byteLength(JSON.stringify(fittedArgs), 'utf8')).toBeLessThanOrEqual(400)
   })
 
   it('collectSessionImagePaths：提取多轮消息中的有效图片路径并忽略空值', () => {

@@ -4,7 +4,9 @@ export function formatText(text) {
   if (!text) return ''
   const codeBlocks = []
   let s = String(text)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    // 清理内部占位符哨兵字符，防止原文伪造占位符突破 HTML 属性/标签边界
+    .replace(/[\u0000\u0001]/g, '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
     // 代码块先抽成占位符，避免内部内容被后续行内规则改写；若有围栏语言名行则剥离
     .replace(/```(?:[^\n`]*\r?\n)?([\s\S]*?)```/g, (_, code) => {
       codeBlocks.push(code)
@@ -16,9 +18,9 @@ export function formatText(text) {
     inlineCodes.push(code)
     return `\u0001IC${inlineCodes.length - 1}\u0001`
   })
-  // 链接 [text](url)：仅 http/https，URL 内禁止引号以防属性注入
-  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)"]+)\)/g,
-    (_, t, url) => `<a href="${url}" class="md-link" rel="noopener">${t}</a>`)
+  // 链接 [text](url)：仅 http/https，排除空白、括号、引号及控制字符；并拦截已转义的引号实体
+  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)"'\x00-\x1f]+)\)/g,
+    (full, t, url) => (/&(?:quot|#39);/i.test(url) ? full : `<a href="${url}" class="md-link" rel="noopener">${t}</a>`))
   // 无序列表（保留末尾换行边界，避免吞掉紧邻其后的标题行首）
   s = s.replace(/(?:^|\n)((?:[ \t]*[-*+] .*(?:\n|$))+)/g, (_, block) => {
     const items = block.trim().split(/\n/).map(l => `<li>${l.replace(/^[ \t]*[-*+] /, '').trim()}</li>`).join('')

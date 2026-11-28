@@ -1,9 +1,10 @@
 <script setup>
 // 设置 -> 对话默认（界面布局、响应模式、默认工作目录、发送快捷键、清空对话）
+import { computed } from 'vue'
 import { useConfirm } from '../composables/useConfirm.js'
 import Icon from './Icon.vue'
 
-defineProps({
+const props = defineProps({
   layout: { type: String, default: 'classic' },
   engine: { type: String, default: 'json' },
   rpcStatus: { type: String, default: '' },
@@ -11,14 +12,22 @@ defineProps({
   sendKeyMode: { type: String, default: 'ctrl' },
   isMac: { type: Boolean, default: false },
   displayCwd: { type: Function, required: true },
+  workspaceAuthRev: { type: Number, default: 0 },
 })
 
 const emit = defineEmits([
-  'setLayout', 'setEngine', 'commitDefaultCwd', 'setDefaultCwd',
+  'setLayout', 'setEngine', 'setDefaultCwd',
   'pickDefaultCwd', 'setSendKeyMode', 'clearAllSessions',
 ])
 
 const { isConfirming, confirm } = useConfirm()
+
+const defaultCwdApproved = computed(() => {
+  void props.workspaceAuthRev
+  if (!props.defaultCwd) return true
+  if (!window.piBridge || typeof window.piBridge.isWorkspaceApproved !== 'function') return true
+  return window.piBridge.isWorkspaceApproved(props.defaultCwd)
+})
 
 function rpcBadgeText(status) {
   if (status === 'ready') return '后台已预热'
@@ -58,11 +67,12 @@ function rpcBadgeText(status) {
 
     <div class="field-label">默认工作目录</div>
     <div class="cwd-row">
-      <input :value="defaultCwd" type="text" placeholder="留空 = MyPiDeck（用户主目录下）" @change="emit('commitDefaultCwd', $event.target.value)" />
+      <input :value="defaultCwd" type="text" readonly placeholder="留空 = MyPiDeck（用户主目录下）" />
       <button class="mini-btn" @click="emit('pickDefaultCwd')">选择</button>
       <button v-if="defaultCwd" class="mini-btn" @click="emit('setDefaultCwd', '')">清除</button>
     </div>
-    <span class="hint accent">分组未单独设置时使用：{{ displayCwd('') }}</span>
+    <span v-if="!defaultCwdApproved" class="hint warn">该目录尚未在本机授权（可能来自云同步或旧配置），请点击「选择」重新授权后再发送。</span>
+    <span v-else class="hint accent">分组未单独设置时使用：{{ displayCwd('') }}</span>
 
     <div class="field-label">发送快捷键</div>
     <div class="engine-row">

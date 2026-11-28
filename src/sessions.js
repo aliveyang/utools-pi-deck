@@ -6,17 +6,19 @@ import { read, write, remove } from './storage.js'
 const IDX_KEY = 'pideck.sessions.idx'
 const ITEM_PREFIX = 'pideck.session.'
 const MAX_SESSION_BYTES = 850 * 1024   // 留足余量，避免触发 utools.db 单文档 1 MB 上限
+const TEXT_ENCODER = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null
 
 function jsonByteLength(obj) {
   const s = JSON.stringify(obj)
-  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(s).length
+  if (TEXT_ENCODER) return TEXT_ENCODER.encode(s).length
   return s.length * 2
 }
 
 // 超过体积预算时逐级裁剪旧工具结果/思考文本/最早消息，防止单文档超过 1 MB 写入失败
 export function fitSessionBudget(session, maxBytes = MAX_SESSION_BYTES) {
   if (!session || typeof session !== 'object') return session
-  if (jsonByteLength(session) <= maxBytes) return session
+  let bytes = jsonByteLength(session)
+  if (bytes <= maxBytes) return session
   const out = {
     ...session,
     messages: (session.messages || []).map(m => ({
@@ -25,23 +27,69 @@ export function fitSessionBudget(session, maxBytes = MAX_SESSION_BYTES) {
     })),
   }
   const TRIM_MARK = '…（超出同步存储上限已裁剪）'
+  // 先按估算差值批量裁剪工具结果与思考文本，减少反复全量 JSON.stringify 开销
+  let savedEst = 0
+  const needTrim = bytes - maxBytes
   for (const m of out.messages) {
-    if (jsonByteLength(out) <= maxBytes) return out
+    if (savedEst >= needTrim) {
+      bytes = jsonByteLength(out)
+      if (bytes <= maxBytes) return out
+    }
     if (Array.isArray(m.tools)) {
       for (const t of m.tools) {
         if (t && t.result != null && t.result !== TRIM_MARK) {
+          const oldLen = typeof t.result === 'string' ? t.result.length : JSON.stringify(t.result).length
           t.result = TRIM_MARK
-          if (jsonByteLength(out) <= maxBytes) return out
+          savedEst += Math.max(0, oldLen - TRIM_MARK.length)
+          if (savedEst >= needTrim && jsonByteLength(out) <= maxBytes) return out
+        }
+        if (t && t.args != null && t.args !== TRIM_MARK) {
+          const argsLen = typeof t.args === 'string' ? t.args.length : JSON.stringify(t.args).length
+          if (argsLen > 1000) {
+            t.args = TRIM_MARK
+            savedEst += Math.max(0, argsLen - TRIM_MARK.length)
+            if (savedEst >= needTrim && jsonByteLength(out) <= maxBytes) return out
+          }
         }
       }
     }
     if (typeof m.thinking === 'string' && m.thinking.length > 200) {
+      const oldLen = m.thinking.length
       m.thinking = TRIM_MARK
-      if (jsonByteLength(out) <= maxBytes) return out
+      savedEst += Math.max(0, oldLen - TRIM_MARK.length)
+      if (savedEst >= needTrim && jsonByteLength(out) <= maxBytes) return out
     }
   }
   while (out.messages.length > 1 && jsonByteLength(out) > maxBytes) {
     out.messages.shift()
+  }
+  // 兜底：若仅剩最后 1 条消息仍超过 maxBytes，则清理残留工具参数/思考后再二分截断正文
+  if (out.messages.length === 1 && jsonByteLength(out) > maxBytes) {
+    const last = out.messages[0]
+    if (Array.isArray(last.tools)) {
+      for (const t of last.tools) {
+        if (t && t.result != null && t.result !== TRIM_MARK) t.result = TRIM_MARK
+        if (t && t.args != null && t.args !== TRIM_MARK) t.args = TRIM_MARK
+      }
+    }
+    if (typeof last.thinking === 'string' && last.thinking.length > 0 && jsonByteLength(out) > maxBytes) {
+      last.thinking = TRIM_MARK
+    }
+    if (typeof last.text === 'string' && last.text.length > 0 && jsonByteLength(out) > maxBytes) {
+      const origText = last.text
+      let lo = 0, hi = origText.length, best = ''
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1
+        last.text = (mid > 0 ? origText.slice(0, mid) : '') + TRIM_MARK
+        if (jsonByteLength(out) <= maxBytes) {
+          best = last.text
+          lo = mid + 1
+        } else {
+          hi = mid - 1
+        }
+      }
+      last.text = best || TRIM_MARK
+    }
   }
   return out
 }

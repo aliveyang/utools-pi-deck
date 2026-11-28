@@ -20,12 +20,13 @@ defineProps({
   sendKeyMode: { type: String, default: 'ctrl' },
   isMac: { type: Boolean, default: false },
   displayCwd: { type: Function, required: true },
+  workspaceAuthRev: { type: Number, default: 0 },
 })
 
 const emit = defineEmits([
-  'close', 'setLayout', 'setEngine', 'commitDefaultCwd', 'setDefaultCwd', 'pickDefaultCwd', 'setSendKeyMode',
+  'close', 'setLayout', 'setEngine', 'setDefaultCwd', 'pickDefaultCwd', 'setSendKeyMode',
   'saveGroup', 'deleteGroup', 'refreshModels', 'openPath', 'recheckEnv', 'installPi',
-  'clearAllSessions', 'configSaved', 'notify', 'copyCmd', 'openLink',
+  'clearAllSessions', 'configSaved', 'notify', 'copyCmd', 'openLink', 'workspaceAuthorized',
 ])
 
 const SETTINGS_TABS = [
@@ -91,9 +92,9 @@ defineExpose({ handleEsc, openTab })
         :send-key-mode="sendKeyMode"
         :is-mac="isMac"
         :display-cwd="displayCwd"
+        :workspace-auth-rev="workspaceAuthRev"
         @set-layout="emit('setLayout', $event)"
         @set-engine="emit('setEngine', $event)"
-        @commit-default-cwd="emit('commitDefaultCwd', $event)"
         @set-default-cwd="emit('setDefaultCwd', $event)"
         @pick-default-cwd="emit('pickDefaultCwd')"
         @set-send-key-mode="emit('setSendKeyMode', $event)"
@@ -109,10 +110,12 @@ defineExpose({ handleEsc, openTab })
         :defaults="defaults"
         :default-cwd="defaultCwd"
         :display-cwd="displayCwd"
+        :workspace-auth-rev="workspaceAuthRev"
         @editing-change="editingGroup = $event"
         @save-group="emit('saveGroup', $event)"
         @delete-group="emit('deleteGroup', $event)"
         @refresh-models="emit('refreshModels')"
+        @workspace-authorized="emit('workspaceAuthorized')"
       />
 
       <SettingsModelTab

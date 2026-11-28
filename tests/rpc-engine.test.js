@@ -245,6 +245,8 @@ describe('rpc-engine ensure 与 prompt 契约', () => {
 
     const baseListeners = child.listenerCount('exit')
     expect(() => eng.prompt(fixtureDir, { prompt: 'huge', files: [bigFile] }, {})).toThrow('图片过大')
+    const hugeDataUrl = 'data:image/png;base64,' + Buffer.alloc(100, 1).toString('base64')
+    expect(() => eng.prompt(fixtureDir, { prompt: 'huge-data', files: [hugeDataUrl] }, {})).toThrow('图片过大')
     expect(child.listenerCount('exit')).toBe(baseListeners)
   })
 })

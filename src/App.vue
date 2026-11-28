@@ -137,13 +137,17 @@ function effectiveGroupCwd(g) {
 }
 
 const { toast, showToast, copyText } = useToast()
+const workspaceAuthRev = ref(0)
+function bumpWorkspaceAuth() { workspaceAuthRev.value++ }
 const {
-  defaultCwd, setDefaultCwd, commitDefaultCwd, pickDefaultCwd,
+  defaultCwd, setDefaultCwd, pickDefaultCwd,
   sendKeyMode, setSendKeyMode, displayCwd, clearCwdDisplayCache, layout, setLayout,
 } = usePrefs({
   initialPrefs,
   showToast,
   onCwdChange: () => {
+    bumpWorkspaceAuth()
+    if (errorMsg.value && errorMsg.value.includes('尚未在本机授权')) errorMsg.value = ''
     loadSkillsAsync()
     files.value = []
     if (engine.value === 'rpc') maybePrewarmRpc()
@@ -202,10 +206,51 @@ let finalized = false
 let scrollScheduled = false
 let historyFallbackNotified = false
 let pendingConfigRestart = false
+let pendingTextDelta = ''
+let pendingThinkingDelta = ''
+let deltaRafId = 0
+
+function flushStreamDeltas() {
+  if (deltaRafId) {
+    if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(deltaRafId)
+    else clearTimeout(deltaRafId)
+    deltaRafId = 0
+  }
+  if (!currentAssistant) {
+    pendingTextDelta = ''
+    pendingThinkingDelta = ''
+    return
+  }
+  if (pendingTextDelta) {
+    currentAssistant.text += pendingTextDelta
+    pendingTextDelta = ''
+    scrollChatThrottled()
+  }
+  if (pendingThinkingDelta) {
+    currentAssistant.thinking += pendingThinkingDelta
+    pendingThinkingDelta = ''
+  }
+}
+
+function scheduleDeltaFlush() {
+  if (deltaRafId) return
+  if (typeof requestAnimationFrame === 'function') {
+    deltaRafId = requestAnimationFrame(() => {
+      deltaRafId = 0
+      flushStreamDeltas()
+    })
+  } else {
+    deltaRafId = setTimeout(() => {
+      deltaRafId = 0
+      flushStreamDeltas()
+    }, 16)
+  }
+}
 
 function finalize(aborted, error) {
   if (finalized) return
   finalized = true
+  flushStreamDeltas()
   if (currentAssistant) {
     if (aborted) currentAssistant.aborted = true
     else if (error) currentAssistant.error = error
@@ -278,20 +323,16 @@ onMounted(() => {
   }
 
   window.utools && window.utools.onPluginOut && window.utools.onPluginOut(isKill => {
-    clearTimeout(draftTimer)
-    saveCurrentDraft()
+    syncDraftInMemory()
+    flushDraft()
     if (isKill) {
       if (running.value) cancel()
       if (window.piBridge && window.piBridge.stopRpc) {
         try { window.piBridge.stopRpc() } catch (_) {}
       }
       rpcStatus.value = ''
-      return
     }
-    if (!running.value && window.piBridge && window.piBridge.stopRpc) {
-      try { window.piBridge.stopRpc() } catch (_) {}
-      rpcStatus.value = ''
-    }
+    // 窗口失焦隐藏（isKill=false）时保留空闲 RPC 进程，交由 5 分钟 IDLE_TTL 自动回收
   })
 
   window.utools && window.utools.onDbPull && window.utools.onDbPull(() => {
@@ -301,6 +342,8 @@ onMounted(() => {
   composerEl.value && composerEl.value.focusInput()
   requestAnimationFrame(() => { composerEl.value && composerEl.value.focusInput() })
   window.addEventListener('keydown', onGlobalKey)
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  window.addEventListener('beforeunload', onBeforeUnload)
   initialMountDone = true
 
   // T1/T2：首帧绘制后异步水合会话、草稿、缓存与环境，不阻塞 did-finish-load
@@ -338,15 +381,20 @@ onMounted(() => {
       // 仅刷新索引列表，不重置 currentSession，避免用户首帧已开始对话时被清屏
       sessions.value = listSessions(activeId.value)
 
+      const baseDrafts = (drafts && typeof drafts === 'object' && !Array.isArray(drafts)) ? drafts : {}
+      draftCache = draftLoaded ? { ...baseDrafts, ...draftCache } : { ...baseDrafts }
+      draftLoaded = true
+
       if (enteredOnMount) {
         const targetDraftId = enteredGroupId || activeId.value
-        if (drafts && typeof drafts === 'object' && drafts[targetDraftId]) {
-          drafts[targetDraftId] = ''
-          saveDrafts(drafts)
+        if (draftCache[targetDraftId]) {
+          draftCache[targetDraftId] = ''
+          draftDirty = true
+          flushDraft()
         }
-      } else if (!userTouchedInput && !inputText.value && drafts && typeof drafts === 'object' && drafts[activeId.value]) {
+      } else if (!userTouchedInput && !inputText.value && draftCache[activeId.value]) {
         restoringDraft = true
-        inputText.value = drafts[activeId.value]
+        inputText.value = draftCache[activeId.value]
         restoringDraft = false
       }
 
@@ -378,11 +426,33 @@ onMounted(() => {
   })
 })
 
+function onVisibilityChange() {
+  if (document.hidden) {
+    syncDraftInMemory()
+    flushDraft()
+  }
+}
+function onBeforeUnload() {
+  syncDraftInMemory()
+  flushDraft()
+}
+
 onUnmounted(() => {
   unmounted = true
   for (const id of idleTimers) clearTimeout(id)
   idleTimers = []
+  if (deltaRafId) {
+    if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(deltaRafId)
+    else clearTimeout(deltaRafId)
+    deltaRafId = 0
+  }
+  clearTimeout(draftTimer)
+  draftTimer = null
+  syncDraftInMemory()
+  flushDraft()
   window.removeEventListener('keydown', onGlobalKey)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  window.removeEventListener('beforeunload', onBeforeUnload)
   window.removeEventListener('pideck:enter', onEnterEvent)
   resetDeleteConfirm()
 })
@@ -460,10 +530,11 @@ function handleEnter(action, opts) {
 
   inputText.value = ''
   if (!deferIo) {
-    const drafts = loadDrafts()
-    if (drafts[activeId.value]) {
-      drafts[activeId.value] = ''
-      saveDrafts(drafts)
+    const cache = ensureDraftCache()
+    if (cache[activeId.value]) {
+      cache[activeId.value] = ''
+      draftDirty = true
+      flushDraft()
     }
   }
   errorMsg.value = ''
@@ -491,7 +562,10 @@ function selectGroup(id, opts) {
     if (running.value && id !== activeId.value) showToast('先停止当前回答再切换分组')
     return
   }
-  if (!fromEnter) saveCurrentDraft()
+  if (!fromEnter) {
+    syncDraftInMemory()
+    flushDraft()
+  }
   activeId.value = id
   if (fromEnter) return
   sessionRiskConfirmed.value = false
@@ -509,22 +583,47 @@ watch(activeId, id => {
   saveActiveId(id)
 })
 
+const DRAFT_DEBOUNCE_MS = 5000
 let draftTimer = null
+let draftCache = {}
+let draftLoaded = false
+let draftDirty = false
+
+function ensureDraftCache() {
+  if (!draftLoaded) {
+    draftCache = { ...loadDrafts() }
+    draftLoaded = true
+  }
+  return draftCache
+}
+function syncDraftInMemory() {
+  const cache = ensureDraftCache()
+  const nextVal = inputText.value || ''
+  if ((cache[activeId.value] || '') !== nextVal) {
+    cache[activeId.value] = nextVal
+    draftDirty = true
+  }
+}
+function flushDraft() {
+  clearTimeout(draftTimer)
+  draftTimer = null
+  if (!draftDirty) return
+  draftDirty = false
+  saveDrafts({ ...ensureDraftCache() })
+}
+
 watch(inputText, () => {
   if (restoringDraft) return
   if (initialMountDone) userTouchedInput = true
+  syncDraftInMemory()
+  if (!draftDirty) return
   clearTimeout(draftTimer)
-  draftTimer = setTimeout(saveCurrentDraft, 500)
+  draftTimer = setTimeout(flushDraft, DRAFT_DEBOUNCE_MS)
 })
-function saveCurrentDraft() {
-  const d = loadDrafts()
-  d[activeId.value] = inputText.value || ''
-  saveDrafts(d)
-}
 function restoreDraft() {
-  const d = loadDrafts()
+  const cache = ensureDraftCache()
   restoringDraft = true
-  inputText.value = d[activeId.value] || ''
+  inputText.value = cache[activeId.value] || ''
   restoringDraft = false
 }
 
@@ -532,6 +631,8 @@ function loadSession(id) {
   if (running.value) return
   const s = getSession(id)
   if (!s) return
+  syncDraftInMemory()
+  flushDraft()
   currentSession.value = s
   errorMsg.value = ''
   sessionRiskConfirmed.value = false
@@ -553,7 +654,8 @@ function snapshotConfig(g) {
 
 function newChat() {
   if (running.value) return
-  saveCurrentDraft()
+  syncDraftInMemory()
+  flushDraft()
   const kept = !!(inputText.value.trim() || images.value.length || attachedFiles.value.length)
   currentSession.value = null
   resetPaging()
@@ -671,7 +773,7 @@ function buildPromptText(g, userText) {
     : (userText || '请描述这张图片。')
 }
 
-function dispatchRun(session, g, { prompt, promptPreview, sendFiles, hadHistory }) {
+function dispatchRun(session, g, { prompt, promptPreview, sendFiles, hadHistory }, opts) {
   cancelled = false
   finalized = false
   running.value = true
@@ -700,16 +802,18 @@ function dispatchRun(session, g, { prompt, promptPreview, sendFiles, hadHistory 
         onText: delta => {
           if (finalized || !currentAssistant) return
           runPhase.value = 'generating'
-          currentAssistant.text += delta
-          scrollChatThrottled()
+          pendingTextDelta += delta
+          scheduleDeltaFlush()
         },
         onThinking: delta => {
           if (finalized || !currentAssistant) return
           if (runPhase.value !== 'generating') runPhase.value = 'generating'
-          currentAssistant.thinking += delta
+          pendingThinkingDelta += delta
+          scheduleDeltaFlush()
         },
         onTool: (phase, name, payload, id) => {
           if (finalized || !currentAssistant) return
+          flushStreamDeltas()
           if (phase === 'start') {
             currentAssistant.tools.push({ id: id || ('t' + Date.now() + Math.random()), name, args: payload })
           } else {
@@ -730,8 +834,18 @@ function dispatchRun(session, g, { prompt, promptPreview, sendFiles, hadHistory 
         ? '极速模式不跨会话保留上下文，本条作为新对话开始'
         : '历史会话已自动使用标准模式续接上下文')
     }
+    return true
   } catch (e) {
+    if (opts && opts.rollbackOnSyncError) {
+      running.value = false
+      runPhase.value = ''
+      currentAssistant = null
+      runHandle = null
+      errorMsg.value = String(e.message || e)
+      return false
+    }
     finalize(false, String(e.message || e))
+    return false
   }
 }
 
@@ -746,6 +860,12 @@ async function send() {
   if (!inputText.value.trim() && !images.value.length && !attachedFiles.value.length) return
   if (!window.piBridge || !window.piBridge.run) {
     errorMsg.value = 'preload 桥未加载，需在 uTools 中运行'
+    return
+  }
+  const targetCwd = effectiveGroupCwd(activeGroup.value)
+  if (targetCwd && window.piBridge.isWorkspaceApproved && !window.piBridge.isWorkspaceApproved(targetCwd)) {
+    errorMsg.value = `工作目录「${targetCwd}」尚未在本机授权，请点击顶部目录或设置中的「选择」重新授权`
+    showToast('工作目录尚未在本机授权，请重新选择')
     return
   }
   if (isRiskyTool(activeGroup.value && activeGroup.value.tool) && !sessionRiskConfirmed.value) {
@@ -787,8 +907,8 @@ async function send() {
   const fallbackUserText = outImages.length ? '(图片)' : '(附件)'
   session.messages.push({ role: 'user', text: userText || fallbackUserText, ...imageRefs, ...fileRefs })
   if (session.title === '新对话') session.title = titleFromText(userText || fallbackUserText)
-  currentAssistant = { role: 'assistant', text: '', thinking: '', tools: [], error: '', aborted: false }
-  session.messages.push(currentAssistant)
+  session.messages.push({ role: 'assistant', text: '', thinking: '', tools: [], error: '', aborted: false })
+  currentAssistant = session.messages[session.messages.length - 1]
   updateSession(session.id, { config: { ...g }, messages: session.messages, title: session.title })
 
   inputText.value = ''
@@ -796,8 +916,12 @@ async function send() {
   attachedFiles.value = []
   errorMsg.value = ''
   composerEl.value && composerEl.value.closeMenus()
-  const d = loadDrafts()
-  if (d[activeId.value]) { d[activeId.value] = ''; saveDrafts(d) }
+  const cache = ensureDraftCache()
+  if (cache[activeId.value]) {
+    cache[activeId.value] = ''
+    draftDirty = true
+    flushDraft()
+  }
 
   dispatchRun(session, g, {
     prompt,
@@ -810,6 +934,12 @@ async function send() {
 function regenerate() {
   if (running.value || !currentSession.value) return
   if (!window.piBridge || !window.piBridge.run) return
+  const targetCwd = effectiveGroupCwd(activeGroup.value)
+  if (targetCwd && window.piBridge.isWorkspaceApproved && !window.piBridge.isWorkspaceApproved(targetCwd)) {
+    errorMsg.value = `工作目录「${targetCwd}」尚未在本机授权，请点击顶部目录或设置中的「选择」重新授权`
+    showToast('工作目录尚未在本机授权，请重新选择')
+    return
+  }
   const msgs = currentSession.value.messages || []
   let userIdx = -1
   for (let i = msgs.length - 1; i >= 0; i--) {
@@ -829,18 +959,24 @@ function regenerate() {
   ].filter(Boolean))]
   const g = snapshotConfig(activeGroup.value)
 
-  // 移除上一轮末尾的 assistant 回复并新建一条占位
+  // 先尝试启动运行，同步校验失败时恢复原回答，避免误删历史结果
+  const prevTail = currentSession.value.messages.slice(userIdx + 1)
   currentSession.value.messages.splice(userIdx + 1)
-  currentAssistant = { role: 'assistant', text: '', thinking: '', tools: [], error: '', aborted: false }
-  currentSession.value.messages.push(currentAssistant)
-  updateSession(currentSession.value.id, { config: { ...g }, messages: currentSession.value.messages })
+  currentSession.value.messages.push({ role: 'assistant', text: '', thinking: '', tools: [], error: '', aborted: false })
+  currentAssistant = currentSession.value.messages[currentSession.value.messages.length - 1]
 
-  dispatchRun(currentSession.value, g, {
+  const started = dispatchRun(currentSession.value, g, {
     prompt: buildPromptText(g, rawUserText),
     promptPreview: rawUserText.slice(0, 80),
     sendFiles,
     hadHistory: userIdx > 0,
-  })
+  }, { rollbackOnSyncError: true })
+  if (!started) {
+    currentSession.value.messages.splice(userIdx + 1, currentSession.value.messages.length - (userIdx + 1), ...prevTail)
+    showToast('重新生成失败，已保留原回答')
+    return
+  }
+  updateSession(currentSession.value.id, { config: { ...g }, messages: currentSession.value.messages })
 }
 
 function persistCurrent() {
@@ -849,12 +985,7 @@ function persistCurrent() {
   }
 }
 function refreshSessionsKeep() {
-  const id = currentSession.value && currentSession.value.id
   sessions.value = listSessions(activeId.value)
-  if (id) {
-    const fresh = getSession(id)
-    if (fresh) currentSession.value = fresh
-  }
 }
 function cancel() {
   cancelled = true
@@ -899,7 +1030,8 @@ function toolForSend(g) {
   return t
 }
 
-function onSaveGroup(next, silent) {
+function onSaveGroup(next, silent, opts) {
+  const forceRefreshEnv = !!(opts && opts.forceRefreshEnv)
   const idx = groups.value.findIndex(g => g.id === next.id)
   const prev = idx >= 0 ? groups.value[idx] : null
   const prevPerm = prev ? toolSummary(prev.tool) : ''
@@ -911,26 +1043,27 @@ function onSaveGroup(next, silent) {
   else groups.value.push(next)
   saveGroups(groups.value)
   if (!silent) showToast('设置已保存')
-  if (permChanged && window.piBridge && window.piBridge.auditRecord) {
-    try {
-      window.piBridge.auditRecord({ type: 'perm', groupId: next.id, groupName: next.name, perm: nextPerm })
-    } catch (_) {}
-  }
-  if (cwdChanged || permChanged) {
-    if (cwdChanged) clearCwdDisplayCache()
+  if (cwdChanged || permChanged || forceRefreshEnv) {
+    if (cwdChanged || forceRefreshEnv) clearCwdDisplayCache()
     loadSkillsAsync()
     files.value = []
   }
-  if (next.id === activeId.value && (permChanged || cwdChanged)) {
-    sessionRiskConfirmed.value = false
-    pendingRiskConfirm.value = false
-    if (engine.value === 'rpc') maybePrewarmRpc()
+  if (next.id === activeId.value) {
+    const curCwd = effectiveGroupCwd(next)
+    if (errorMsg.value && errorMsg.value.includes('尚未在本机授权') && (!curCwd || !window.piBridge || !window.piBridge.isWorkspaceApproved || window.piBridge.isWorkspaceApproved(curCwd))) {
+      errorMsg.value = ''
+    }
+    if (permChanged || cwdChanged || forceRefreshEnv) {
+      sessionRiskConfirmed.value = false
+      pendingRiskConfirm.value = false
+      if (engine.value === 'rpc') maybePrewarmRpc()
+    }
   }
 }
 
-function onQuickUpdateGroup(patch) {
+function onQuickUpdateGroup(patch, opts) {
   if (!activeGroup.value || running.value) return
-  onSaveGroup({ ...activeGroup.value, ...patch }, true)
+  onSaveGroup({ ...activeGroup.value, ...patch }, true, opts)
   showToast('已更新当前分组配置')
 }
 
@@ -938,7 +1071,10 @@ function pickGroupCwd() {
   if (!activeGroup.value || running.value) return
   if (window.utools && typeof window.utools.showOpenDialog === 'function' && window.piBridge && window.piBridge.pickFolder) {
     const dir = window.piBridge.pickFolder()
-    if (dir) onQuickUpdateGroup({ cwd: dir })
+    if (dir) {
+      bumpWorkspaceAuth()
+      onQuickUpdateGroup({ cwd: dir }, { forceRefreshEnv: true })
+    }
     return
   }
   openSettingsTab('groups', { editGroupId: activeGroup.value.id })
@@ -948,11 +1084,19 @@ function onDeleteGroup(g) {
   if (groups.value.length <= 1) return
   const list = listSessions(g.id)
   const imgPaths = []
+  const piSessionIds = []
   for (const s of list) {
     const removed = deleteSession(s.id)
     if (removed) imgPaths.push(...collectSessionImagePaths(removed))
-    if (s.piSessionId && window.piBridge && window.piBridge.deletePiSession) {
-      try { window.piBridge.deletePiSession(s.piSessionId) } catch (_) {}
+    if (s.piSessionId) piSessionIds.push(s.piSessionId)
+  }
+  if (piSessionIds.length && window.piBridge) {
+    if (window.piBridge.deletePiSessions) {
+      try { window.piBridge.deletePiSessions(piSessionIds) } catch (_) {}
+    } else if (window.piBridge.deletePiSession) {
+      for (const id of piSessionIds) {
+        try { window.piBridge.deletePiSession(id) } catch (_) {}
+      }
     }
   }
   if (imgPaths.length && window.piBridge && window.piBridge.deleteImages) {
@@ -971,17 +1115,19 @@ function clearAllConversations() {
   if (window.piBridge && window.piBridge.clearImages) {
     try { window.piBridge.clearImages() } catch (_) {}
   }
-  for (const s of list) {
-    if (s.piSessionId && window.piBridge && window.piBridge.deletePiSession) {
-      try { window.piBridge.deletePiSession(s.piSessionId) } catch (_) {}
+  const piSessionIds = list.map(s => s && s.piSessionId).filter(Boolean)
+  if (piSessionIds.length && window.piBridge) {
+    if (window.piBridge.deletePiSessions) {
+      try { window.piBridge.deletePiSessions(piSessionIds) } catch (_) {}
+    } else if (window.piBridge.deletePiSession) {
+      for (const id of piSessionIds) {
+        try { window.piBridge.deletePiSession(id) } catch (_) {}
+      }
     }
   }
   currentSession.value = null
   sessions.value = []
   showHistory.value = false
-  if (window.piBridge && window.piBridge.auditRecord) {
-    try { window.piBridge.auditRecord({ type: 'data', action: 'clear-sessions' }) } catch (_) {}
-  }
   showToast(`已清空 ${list.length} 个对话`)
 }
 
@@ -989,7 +1135,6 @@ function restartEngineForConfig() {
   if (window.piBridge && window.piBridge.stopRpc) { try { window.piBridge.stopRpc() } catch (_) {} }
   rpcStatus.value = ''
   refreshModels()
-  loadDefaults(true)
   loadEnvAsync().then(() => {
     setTimeout(() => checkDefaultAuth(true), 250)
     if (engine.value === 'rpc') maybePrewarmRpc()
@@ -1164,15 +1309,16 @@ function onConfigSaved() {
       :send-key-mode="sendKeyMode"
       :is-mac="isMac"
       :display-cwd="displayCwd"
+      :workspace-auth-rev="workspaceAuthRev"
       @close="showSettings = false"
       @set-layout="setLayout"
       @set-engine="setEngine"
-      @commit-default-cwd="commitDefaultCwd"
       @set-default-cwd="setDefaultCwd"
       @pick-default-cwd="pickDefaultCwd"
       @set-send-key-mode="setSendKeyMode"
       @save-group="onSaveGroup"
       @delete-group="onDeleteGroup"
+      @workspace-authorized="bumpWorkspaceAuth"
       @refresh-models="refreshModels"
       @open-path="openPath"
       @recheck-env="recheckEnv"

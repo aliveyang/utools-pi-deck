@@ -28,6 +28,7 @@ const cfgAuth = ref(null)
 const showPathConfig = ref(false)
 const nodeOverride = ref('')
 const piCliOverride = ref('')
+const pathErr = ref('')
 
 const cfgAllProviders = computed(() => {
   const st = cfg.value
@@ -119,11 +120,11 @@ function syncProviderFields() {
   cfgApi.value = (info && info.api) || (preset && preset.api) || 'openai-completions'
 }
 
-async function loadCfgModels() {
+async function loadCfgModels(force = false) {
   if (!window.piBridge || !window.piBridge.listModelsAsync) return
   const requestedId = cfgIsCustomTemplate.value ? cfgCustomId.value.trim() : cfgProvider.value
   try {
-    const all = await window.piBridge.listModelsAsync()
+    const all = await window.piBridge.listModelsAsync(force ? { force: true } : undefined)
     const currentId = cfgIsCustomTemplate.value ? cfgCustomId.value.trim() : cfgProvider.value
     if (requestedId !== currentId) return
     cfgModels.value = currentId ? (all || []).filter(m => m.provider === currentId) : []
@@ -233,19 +234,32 @@ async function removeCfgKey() {
 
 function browseExec(kind) {
   if (!window.piBridge || !window.piBridge.pickExecutable) return
-  const picked = window.piBridge.pickExecutable(kind)
-  if (!picked) return
-  if (kind === 'node') nodeOverride.value = picked
-  else piCliOverride.value = picked
+  pathErr.value = ''
+  const res = window.piBridge.pickExecutable(kind)
+  if (!res || res.canceled) return
+  if (res.ok) {
+    if (kind === 'node') nodeOverride.value = res.path || ''
+    else piCliOverride.value = res.path || ''
+    emit('notify', kind === 'node' ? `已指定 Node ${res.version || ''}`.trim() : '已指定 pi CLI 路径')
+    emit('recheckEnv')
+  } else {
+    pathErr.value = res.error || '路径校验失败'
+    emit('notify', pathErr.value)
+  }
 }
 
-function applyPathOverrides() {
-  if (!window.piBridge || !window.piBridge.setConfig) return
-  window.piBridge.setConfig({
-    nodePath: nodeOverride.value.trim(),
-    piCliPath: piCliOverride.value.trim(),
-  })
-  emit('recheckEnv')
+function resetExec(kind) {
+  if (!window.piBridge || !window.piBridge.clearExecutable) return
+  pathErr.value = ''
+  const res = window.piBridge.clearExecutable(kind)
+  if (res && res.ok) {
+    if (kind === 'node') nodeOverride.value = ''
+    else piCliOverride.value = ''
+    emit('notify', '已恢复自动探测')
+    emit('recheckEnv')
+  } else {
+    pathErr.value = (res && res.error) || '清除失败'
+  }
 }
 
 onMounted(loadCfg)
@@ -321,7 +335,7 @@ onMounted(loadCfg)
         <select v-model="cfgThinking" class="mini-select">
           <option v-for="lv in THINKING_LEVELS" :key="lv" :value="lv">{{ lv ? (THINKING_LABELS[lv] || lv) : '思考：保持默认' }}</option>
         </select>
-        <button class="mini-btn" @click="loadCfgModels"><Icon name="refresh" :size="12" />刷新模型</button>
+        <button class="mini-btn" @click="loadCfgModels(true)"><Icon name="refresh" :size="12" />刷新模型</button>
       </div>
 
       <div class="cfg-actions">
@@ -354,16 +368,17 @@ onMounted(loadCfg)
     </button>
     <div v-if="showPathConfig" class="path-box">
       <div class="cwd-row">
-        <input v-model="nodeOverride" class="mini-input" placeholder="Node 可执行文件路径（留空自动探测）" />
-        <button class="mini-btn" @click="browseExec('node')">浏览</button>
+        <input :value="nodeOverride" readonly class="mini-input" placeholder="Node 路径：自动探测（点击「选择」手动指定）" />
+        <button class="mini-btn" @click="browseExec('node')">选择</button>
+        <button v-if="nodeOverride" class="mini-btn" @click="resetExec('node')">恢复自动</button>
       </div>
       <div class="cwd-row">
-        <input v-model="piCliOverride" class="mini-input" placeholder="pi cli.js 路径（留空自动探测）" />
-        <button class="mini-btn" @click="browseExec('pi')">浏览</button>
+        <input :value="piCliOverride" readonly class="mini-input" placeholder="pi CLI 路径：自动探测（点击「选择」手动指定）" />
+        <button class="mini-btn" @click="browseExec('pi')">选择</button>
+        <button v-if="piCliOverride" class="mini-btn" @click="resetExec('pi')">恢复自动</button>
       </div>
-      <div class="env-actions">
-        <button class="mini-btn" @click="applyPathOverrides">应用并重新检测</button>
-      </div>
+      <span v-if="pathErr" class="hint warn">{{ pathErr }}</span>
+      <span class="hint">仅支持通过系统文件选择器指定：校验 Node ≥ 22.19 与 @earendil-works/pi-coding-agent 包内 cli.js，选定后立即生效。</span>
     </div>
 
     <div class="env-configs">

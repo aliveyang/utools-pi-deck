@@ -17,13 +17,6 @@ export function usePrefs({ showToast, onCwdChange, initialPrefs }) {
     savePrefsPatch({ defaultCwd: defaultCwd.value })
     if (onCwdChange) onCwdChange()
   }
-  function commitDefaultCwd(dir) {
-    const d = (dir || '').trim()
-    if (d && window.piBridge && window.piBridge.validateCwd && !window.piBridge.validateCwd(d)) {
-      showToast('目录不存在，已保留输入但未生效')
-    }
-    setDefaultCwd(d)
-  }
   function pickDefaultCwd() {
     if (!window.piBridge || !window.piBridge.pickFolder) return showToast('当前环境不支持选择文件夹')
     const dir = window.piBridge.pickFolder()
@@ -70,7 +63,7 @@ export function usePrefs({ showToast, onCwdChange, initialPrefs }) {
   }
 
   return {
-    defaultCwd, setDefaultCwd, commitDefaultCwd, pickDefaultCwd,
+    defaultCwd, setDefaultCwd, pickDefaultCwd,
     sendKeyMode, setSendKeyMode, displayCwd, clearCwdDisplayCache,
     layout, setLayout,
   }

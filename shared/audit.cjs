@@ -1,6 +1,7 @@
 // 操作审计：本地 append-only JSONL，按天分片，脱敏后写入
 // 约束：记录失败绝不影响主流程；不记录对话全文、文件内容与密钥
 const fs = require('node:fs')
+const fsp = fs.promises
 const path = require('node:path')
 const os = require('node:os')
 
@@ -13,8 +14,10 @@ const TAIL_READ_BYTES = 4 * 1024 * 1024
 
 const FILE_RE = /^(\d{4}-\d{2}-\d{2})(?:\.(\d+))?\.jsonl$/
 
-// 常见密钥形态：Bearer/JWT、键值对（允许 JSON 引号键）、sk-、GitHub、Slack、Google
+// 常见密钥形态：Bearer/JWT、键值对（允许 JSON 引号键）、sk-、GitHub、Slack、Google、AWS、URL 凭据、PEM 私钥
 const REDACT_PATTERNS = [
+  { re: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*/g, repl: '***[PRIVATE_KEY]***' },
+  { re: /(https?:\/\/[^/\s:@]+:)([^/\s@]+)(@)/gi, repl: '$1***$3' },
   { re: /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, repl: 'Bearer ***' },
   { re: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, repl: '***' },
   {
@@ -25,7 +28,11 @@ const REDACT_PATTERNS = [
   { re: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{10,}\b/g, repl: '***' },
   { re: /\bxox[baprs]-[A-Za-z0-9-]{8,}\b/g, repl: '***' },
   { re: /\bAIza[A-Za-z0-9_-]{20,}\b/g, repl: '***' },
+  { re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, repl: '***' },
 ]
+
+const TOKEN_METRIC_KEY_RE = /^(?:max|input|output|total|prompt|completion|cache|cached|reasoning)[_-]?tokens?$/i
+const SENSITIVE_KEY_RE = /(api[_-]?key|access[_-]?token|refresh[_-]?token|^token$|[_-]token$|secret|password|passwd|authorization|cookie)/i
 
 function redactString(s) {
   let out = s
@@ -46,8 +53,8 @@ function redact(value, depth) {
   if (typeof value === 'object') {
     const out = {}
     for (const [k, v] of Object.entries(value)) {
-      // 键名本身命中敏感词时直接打码，避免值以嵌套对象或数值形式绕过正则
-      out[k] = /(api[_-]?key|token|secret|password|passwd|authorization|cookie)/i.test(k) && v != null
+      // 键名本身命中敏感词时直接打码，避免值以嵌套对象或数值形式绕过正则（排除 token 用量统计字段）
+      out[k] = (!TOKEN_METRIC_KEY_RE.test(k) && SENSITIVE_KEY_RE.test(k) && v != null)
         ? '***' : redact(v, d + 1)
     }
     return out
@@ -115,10 +122,18 @@ function createAudit(options) {
   const retentionDays = opts.retentionDays ?? DEFAULT_RETENTION_DAYS
   const maxFileBytes = opts.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES
   let lastCleanup = 0
+  let dirReady = false
 
   function listFiles() {
     try {
       return fs.readdirSync(root).filter(n => FILE_RE.test(n)).sort(fileOrder)
+    } catch (_) { return [] }
+  }
+
+  async function listFilesAsync() {
+    try {
+      const names = await fsp.readdir(root)
+      return names.filter(n => FILE_RE.test(n)).sort(fileOrder)
     } catch (_) { return [] }
   }
 
@@ -148,13 +163,19 @@ function createAudit(options) {
       const ts = now()
       const rec = redact({ ...entry, ts })
       const line = JSON.stringify(rec) + '\n'
-      fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+      if (!dirReady) {
+        fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+        dirReady = true
+      }
       const file = pickFile(dayKey(ts))
       if (!file) return false
       fs.appendFileSync(file, line, { mode: 0o600 })
       if (ts - lastCleanup > CLEAN_INTERVAL) { lastCleanup = ts; cleanup() }
       return true
-    } catch (_) { return false }
+    } catch (_) {
+      dirReady = false
+      return false
+    }
   }
 
   function readTailLines(file) {
@@ -164,8 +185,8 @@ function createAudit(options) {
       const fd = fs.openSync(file, 'r')
       try {
         const buf = Buffer.alloc(st.size - start)
-        fs.readSync(fd, buf, 0, buf.length, start)
-        let text = buf.toString('utf8')
+        const bytesRead = fs.readSync(fd, buf, 0, buf.length, start)
+        let text = buf.subarray(0, bytesRead).toString('utf8')
         if (start > 0) {
           const nl = text.indexOf('\n')
           text = nl >= 0 ? text.slice(nl + 1) : ''
@@ -173,6 +194,41 @@ function createAudit(options) {
         return text.split(/\r?\n/).filter(Boolean)
       } finally { fs.closeSync(fd) }
     } catch (_) { return [] }
+  }
+
+  async function readTailLinesAsync(file) {
+    try {
+      const st = await fsp.stat(file)
+      const start = Math.max(0, st.size - TAIL_READ_BYTES)
+      const fh = await fsp.open(file, 'r')
+      try {
+        const len = st.size - start
+        const buf = Buffer.alloc(len)
+        const { bytesRead } = await fh.read(buf, 0, len, start)
+        let text = buf.subarray(0, bytesRead).toString('utf8')
+        if (start > 0) {
+          const nl = text.indexOf('\n')
+          text = nl >= 0 ? text.slice(nl + 1) : ''
+        }
+        return text.split(/\r?\n/).filter(Boolean)
+      } finally { await fh.close() }
+    } catch (_) { return [] }
+  }
+
+  function formatExportRows(rows, span) {
+    const lines = [
+      `# PiDeck 操作记录（最近 ${span} 天）`,
+      '',
+      '> 仅保存在本机；不包含对话全文、文件内容与密钥。',
+      '',
+      '| 时间 | 分组 | 类型 | 内容 |',
+      '|---|---|---|---|',
+    ]
+    for (const r of rows) {
+      const kind = r.type === 'tool' ? (r.tool && r.tool.name) || 'tool' : r.type || ''
+      lines.push(`| ${fmtTime(r.ts)} | ${esc(r.groupName || '')} | ${esc(kind)} | ${esc(r.summary || '')} |`)
+    }
+    return lines.join('\n')
   }
 
   function tail(limit) {
@@ -192,23 +248,35 @@ function createAudit(options) {
     return out
   }
 
+  async function tailAsync(limit) {
+    const max = Math.max(1, Math.min(5000, limit || 200))
+    const files = (await listFilesAsync()).reverse()
+    const out = []
+    for (const f of files) {
+      const lines = await readTailLinesAsync(path.join(root, f))
+      for (let i = lines.length - 1; i >= 0 && out.length < max; i--) {
+        try {
+          const rec = JSON.parse(lines[i])
+          if (rec && typeof rec === 'object') out.push({ ...rec, summary: describe(rec) })
+        } catch (_) {}
+      }
+      if (out.length >= max) break
+    }
+    return out
+  }
+
   function exportMd(days) {
     const span = Math.max(1, Math.min(365, days || retentionDays))
     const since = now() - span * 86400000
     const rows = tail(5000).filter(r => (r.ts || 0) >= since)
-    const lines = [
-      `# PiDeck 操作记录（最近 ${span} 天）`,
-      '',
-      '> 仅保存在本机；不包含对话全文、文件内容与密钥。',
-      '',
-      '| 时间 | 分组 | 类型 | 内容 |',
-      '|---|---|---|---|',
-    ]
-    for (const r of rows) {
-      const kind = r.type === 'tool' ? (r.tool && r.tool.name) || 'tool' : r.type || ''
-      lines.push(`| ${fmtTime(r.ts)} | ${esc(r.groupName || '')} | ${esc(kind)} | ${esc(r.summary || '')} |`)
-    }
-    return lines.join('\n')
+    return formatExportRows(rows, span)
+  }
+
+  async function exportMdAsync(days) {
+    const span = Math.max(1, Math.min(365, days || retentionDays))
+    const since = now() - span * 86400000
+    const rows = (await tailAsync(5000)).filter(r => (r.ts || 0) >= since)
+    return formatExportRows(rows, span)
   }
 
   function clear() {
@@ -221,7 +289,7 @@ function createAudit(options) {
 
   function setNow(fn) { now = fn || Date.now }
 
-  return { record, tail, exportMd, clear, dir: () => root, cleanup, setNow }
+  return { record, tail, tailAsync, exportMd, exportMdAsync, clear, dir: () => root, cleanup, setNow }
 }
 
 function esc(v) { return String(v == null ? '' : v).replace(/\|/g, '\\|').replace(/\n/g, ' ') }

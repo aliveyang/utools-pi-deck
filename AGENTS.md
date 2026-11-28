@@ -106,10 +106,14 @@ PiDeck/
    - 渲染层**绝对不能**直接或间接写入允许打开的白名单根目录（严禁在 `run()` / `prewarmRpc()` 中记录渲染层传入的 `cwd`）。`preload.js` 仅信任 Node 侧固定目录及用户原生选择目录：`agentDir()`（`~/.pi/agent`）、`audit.dir()`（`getPluginLocalDataPath()/audit`）、默认工作区（`~/MyPiDeck`），以及通过原生系统对话框 `pickFolder()`（`utools.showOpenDialog`）由用户亲自选取的有效工作区目录。
    - 使用 `shared/local-store.cjs` 的 `resolveSafeOpenTarget()` 对目标与根目录均做 `fs.realpathSync()` 解析（防 `..` 穿越、兄弟前缀碰撞如 `C:\foo` vs `C:\foobar` 以及符号链接逃逸）。
    - **文件夹**调用 `Promise.resolve(utools.shellOpenPath(res.path)).catch(() => {})`；**文件**仅调用 `utools.shellShowItemInFolder(res.path)`（绝不对文件调 `shellOpenPath`，杜绝诱导执行本地可执行文件）。
-3. **凭证与参数安全**：
-   - `shared/config.cjs` 仅向渲染层回传 `hasKey` / `keyKind`，绝不回传 `apiKey` 原文。
-   - `shared/pi-core.cjs` 拼装 CLI 参数时，选项值禁止以 `-` 开头，所有用户输入置于 `--` 之后。
-4. **高风险工具最小默认权限与确认**：
+3. **运行时路径、目录白名单与审计边界**：
+   - `setConfig` 仅允许修改 `engine` 等安全偏好，严禁接受渲染层传入的 `nodePath` / `piCliPath` 字符串；Node 与 pi CLI 覆盖路径只能通过原生对话框 `pickExecutable` 选取，并在 `preload.js` 内完成常规文件校验、Node `--version`（`^v\d+` 且 `≥ 22.19`）校验及 `@earendil-works/pi-coding-agent` 包目录校验，失败保留旧值。
+   - `listFilesAsync`、`detectContextFiles`、`listSkillsAsync`、`run()`、`prewarmRpc()`、`getDefaults()` 在 `preload.js` 内限制只允许访问默认工作区（`~/MyPiDeck`）或经 `pickFolder` 登记并持久化到本机 `config.json` 的目录，**严禁信任可由渲染层写入的 `utools.dbStorage`**；`run()` 的 `opts.files` 仅放行 `images/` 临时图、已授权工作区内文件及经 `pickFiles()`/`onPluginEnter` 登记的文件。
+   - `auditRecord` 仅在 `preload.js` 内部向 `runner.cjs` 注入，不向 `window.piBridge` 暴露；`writeLocal` 仅限 `pideck.drafts.v1`。
+4. **凭证与参数安全**：
+   - `shared/config.cjs` 仅向渲染层回传 `hasKey` / `keyKind`，绝不回传 `apiKey` 原文，并禁止在界面配置中保存 `!` 开头的命令型凭证。
+   - `shared/pi-core.cjs` 拼装 CLI 参数时，选项值禁止以 `-` 开头，`sessionId` / `mcpServers` / `skillPaths` 做严格白名单校验，所有用户输入置于 `--` 之后。
+5. **高风险工具最小默认权限与确认**：
    - 默认分组均为「纯文本」或「只读」，`tool.trust` 默认为 `false`（默认传 `--no-approve`，不自动批准项目级 `.pi` 配置）。
    - 分组设置页新增开启 `edit`/`write`/`bash`/`powershell` 或 `trust` 时需两步确认，并在 UI 标红提示；会话首次触发含高风险权限的发送前，须在输入区上方弹出确认条让用户确认生效权限与工作区目录。
 
@@ -143,7 +147,7 @@ PiDeck/
 - **`utools.onPluginEnter(action)`**：每次进入插件触发，参数 `{ code, type, payload, from, option }`。
   - **关键约定**：由于 Vue 挂载晚于 `preload.js` 执行，`preload.js` 必须在顶层尽早注册 `onPluginEnter`，将事件推入 `window.__pideckEnterQueue` 并派发 `pideck:enter`，渲染层 `onMounted` 后补放队列。
   - 区分 `action.type`：`type === 'text'` 时 `payload` 是触发词本身（如 `"pi"`）；仅 `over` / `regex` 时 `payload` 是用户选中/输入的文本；`img` 为 Base64 Data URL；`files` 为 `MatchFile[]`。
-- **`utools.onPluginOut(isKill)`**：插件隐藏到后台（`isKill === false`）或彻底退出进程（`isKill === true`）时触发。`isKill === false` 时立即保存草稿并在非运行态清理空闲长驻子进程；`isKill === true` 时须强制取消运行中任务并停止所有常驻 RPC 子进程，避免遗留孤儿进程。
+- **`utools.onPluginOut(isKill)`**：插件隐藏到后台（`isKill === false`）或彻底退出进程（`isKill === true`）时触发。`isKill === false` 时立即保存草稿，保留空闲常驻 RPC 进程交由 5 分钟 `IDLE_TTL` 自动回收；`isKill === true` 时须强制取消运行中任务并停止所有常驻 RPC 子进程，避免遗留孤儿进程。
 - **`utools.onPluginDetach()`**：用户分离插件为独立窗口时触发。
 - **`utools.onDbPull(docs)`**：云同步数据拉取到本机时触发。
 

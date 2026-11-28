@@ -106,6 +106,10 @@ describe('local-store 配置读写与本地状态', () => {
 
     expect(store.removeLocal('drafts')).toBe(true)
     expect(store.readLocal('drafts', null)).toBeNull()
+
+    expect(store.writeLocal('__proto__', { polluted: true })).toBe(false)
+    expect(store.writeLocal('constructor', { polluted: true })).toBe(false)
+    expect(store.readLocal('__proto__', 'safe')).toBe('safe')
   })
 
   it('loadConfigAsync 含 legacy 回退与 mtime 缓存复用；readLocalAsync 正确读取并回退', async () => {
@@ -267,6 +271,19 @@ describe('local-store 图片落盘、过期与容量淘汰、安全清理', () =
     expect(existsSync(outsideFile)).toBe(true)
     if (linked) expect(existsSync(linkFile)).toBe(true)
   })
+
+  it('cleanupImagesAsync 可异步按过期时间清理图片', async () => {
+    const imgDir = join(tmpRoot, 'async-images')
+    const asyncStore = createLocalStore({
+      imageDir: imgDir,
+      imageMaxAgeMs: 1000,
+      now: () => clock,
+    })
+    const f = asyncStore.saveImage(`data:image/png;base64,${Buffer.from('a').toString('base64')}`)
+    utimesSync(f, new Date(clock - 5000), new Date(clock - 5000))
+    expect(await asyncStore.cleanupImagesAsync()).toBe(1)
+    expect(existsSync(f)).toBe(false)
+  })
 })
 
 describe('isAllowedExternalUrl 协议白名单', () => {
@@ -318,5 +335,26 @@ describe('isPathWithinRoot 与 resolveSafeOpenTarget 路径白名单', () => {
     if (linked) {
       expect(resolveSafeOpenTarget(escapeLink, [ws]).ok).toBe(false)
     }
+  })
+
+  it('matchAllowedDir 精确匹配允许目录，拒绝子/父/兄弟目录、普通文件与未授权目录', async () => {
+    const { matchAllowedDir } = await import('../shared/local-store.cjs')
+    const ws = join(tmpRoot, 'allowed-ws')
+    const sub = join(ws, 'sub')
+    const sibling = join(tmpRoot, 'allowed-ws-other')
+    const outside = join(tmpRoot, 'unlisted')
+    mkdirSync(sub, { recursive: true })
+    mkdirSync(sibling, { recursive: true })
+    mkdirSync(outside, { recursive: true })
+    const fileInWs = join(ws, 'a.txt')
+    writeFileSync(fileInWs, 'x')
+
+    expect(matchAllowedDir(ws, [ws])).toBeTruthy()
+    expect(matchAllowedDir(sub, [ws])).toBe('')
+    expect(matchAllowedDir(tmpRoot, [ws])).toBe('')
+    expect(matchAllowedDir(sibling, [ws])).toBe('')
+    expect(matchAllowedDir(outside, [ws])).toBe('')
+    expect(matchAllowedDir(fileInWs, [ws])).toBe('')
+    expect(matchAllowedDir('', [ws])).toBe('')
   })
 })

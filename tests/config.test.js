@@ -219,4 +219,15 @@ describe('config', () => {
     expect(quoteForShell("/opt/it's/node", 'darwin')).toBe("'/opt/it'\\''s/node'")
     expect(quoteForShell('/bad\nnode', 'darwin')).toBe('')
   })
+
+  it('禁止保存以 ! 开头的命令型 apiKey，并拦截原型保留字段作为 provider ID', () => {
+    const cfg = createConfig({ agentDir: dir })
+    const r = cfg.save({ provider: 'deepseek', apiKey: '!calc.exe', modelId: 'deepseek-chat', setDefault: true })
+    expect(r.ok).toBe(false)
+    expect(r.error).toContain('!')
+    expect(cfg.save({ provider: 'constructor', apiKey: 'k', modelId: 'm', baseUrl: 'https://a.com', api: 'openai-completions' }).ok).toBe(false)
+    expect(cfg.removeKey('prototype').ok).toBe(false)
+    expect(cfg.loginCommand('__proto__')).toBe('')
+    expect(fs.existsSync(modelsPath)).toBe(false)
+  })
 })

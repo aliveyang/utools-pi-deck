@@ -26,6 +26,15 @@ describe('formatText XSS 防护', () => {
       '<a href="https://x.com" class="md-link" rel="noopener">官网</a>',
     )
   })
+
+  it('拦截占位符注入 + 引号属性逃逸攻击', () => {
+    const payload = '`" autofocus onfocus="alert(1)` [x](https://a.com/\u0001IC0\u0001)'
+    const out = formatText(payload)
+    expect(out).not.toContain('onfocus="')
+    expect(out).not.toContain('" autofocus')
+    const urlQuote = formatText('[x](https://a.com"onfocus="alert(1))')
+    expect(urlQuote).not.toContain('<a ')
+  })
 })
 
 describe('formatText 渲染规则', () => {
